@@ -19,7 +19,7 @@ The workflow this supports:
 3. Hunks that are good get **staged** — staging is the accept signal.
 4. Hunks that need work get a **comment** anchored to the code.
 5. Comments land in `COMMENTS.md` at the repo root.
-6. Human clicks **Copy Comments & Clear** in the extension UI. All comments, including their code context, go to the clipboard; after a successful copy, `COMMENTS.md` is deleted.
+6. Human clicks **Copy Comments & Clear** in the extension UI. Saved feedback, including captured code context, goes to the clipboard; after a successful copy and snapshot checks, `COMMENTS.md` is deleted. Unsubmitted input is not exported (§8 Input UI).
 7. Human pastes the feedback into their AI tool. The agent addresses it; it does not read or reply in `COMMENTS.md`.
 8. Repeat from 2. Adding the first comment of the next pass creates a fresh `COMMENTS.md`.
 
@@ -138,10 +138,12 @@ Note the third comment: it is anchored to code the reviewer is **happy with**, a
 
 | Origin | Blob | Diff it appears in | Goes stale on |
 |---|---|---|---|
-| `changed` | working-tree file | right pane of unstaged diff | nothing (always current) |
-| `staged` | index | right pane of staged diff, left pane of unstaged diff | `git add`, `git reset` |
-| `head` | `HEAD` blob | left pane of staged diff | commit |
+| `changed` | working-tree file or open buffer | usually right pane of unstaged diff; either pane of file comparisons | edits or deletion can invalidate the captured anchor |
+| `staged` | index | right pane of staged diff; unstaged original when Git's `~` baseline selects the index | index changes or review-base movement |
+| `head` | `HEAD` blob | left pane of staged diff; unstaged original when Git's `~` baseline selects HEAD | commit or unavailable blob |
 | `commit:<full-sha>` | immutable commit blob | either pane of a historical comparison | blob unavailable locally |
+
+Git URI refs map as follows: `''` means index, `HEAD`/`head` means HEAD, and `~` means index only when the queried file URI occurs in `repo.state.indexChanges`; otherwise it means HEAD. Other supported refs resolve through `getCommit` to a full commit SHA. Origin describes the resource, not a fixed pane.
 
 `changed` will dominate in practice. `staged` identifies context captured from the index, not an acceptance or rejection state: a staged snippet may still receive a correction or a request to propagate a good pattern. `head` covers commenting on untouched existing code ("this is the pattern to follow").
 
@@ -170,6 +172,7 @@ Copy-and-clear ends the pass by deleting the file after clipboard success (§8.1
 5. **Unparseable blocks are preserved, not dropped.** See §7.4.
 6. Header matching is a single regex; keep it tolerant of extra whitespace around `;` and `:`, and case-insensitive on the `Origin` and `Side` values. Require `Side` on every comment; there is no previously shipped format to migrate.
 7. Parse the comparison line separately, validate both endpoints, and keep its original bytes on body edits. Never treat a later `Comparison:` line inside body prose or a fence as metadata.
+8. UI-created or edited bodies must have balanced fences and no unfenced `##` headings. Use `###` for body headings; `##` is reserved for block boundaries. The writer rejects bodies that occupy the reserved anchor or comparison-metadata position.
 
 Suggested header regex:
 
@@ -188,9 +191,9 @@ On comment creation, store:
 - `path`, `startLine`, `endLine`, `origin`, `side`, and both comparison endpoints when applicable
 - `anchorText` - the selected lines, verbatim, including original indentation; expand partial-line selections to whole lines for line-based anchoring
 
-With no selection, capture the current line. An exclusive selection end at column zero does not include that final line. Capture the source editor, side-local range, comparison endpoints, and text before opening the comment composer; changing focus must not retarget the comment. Unsaved working-tree text may be captured from the editor without saving or modifying code. Re-anchor against the open buffer when available; the stored snippet remains the original capture.
+With no selection, capture the current line. An exclusive selection end at column zero does not include that final line; native thread ranges instead include their end line. Keyboard/menu entry captures the source editor, side-local range, comparison endpoints, and text before opening the comment composer; changing focus must not retarget that draft. Native gutter entry cannot expose its creation context through stable APIs: at submission, confirm context and capture current source text before the picker (§5.1). Unsaved working-tree text may be captured from the editor without saving or modifying code. Re-anchor against the open buffer when available; the stored snippet remains the original capture.
 
-Cap the anchor at 20 lines. If the selection is longer, store the first 10 and last 5 lines separated by a `// ...` elision marker line and record the true range in `Lines:`. Rationale: a 400-line selection produces an unreadable `COMMENTS.md` and a useless anchor.
+Capture up to 20 lines verbatim, a fixed limit with no setting. If the selection is longer, store the first 10 and last 5 lines separated by a bare `...` marker line (16 stored lines) and record the true range in `Lines:`. Re-anchoring recognizes this exact shape only for ranges longer than 20 lines and matches both ends, allowing the omitted length to change. Rationale: a 400-line selection produces an unreadable `COMMENTS.md` and a useless anchor.
 
 ### 4.2 Re-anchoring
 
@@ -200,7 +203,7 @@ Run on every parse, per comment, against the resource named by `path` and `origi
 2. **Local search.** Search ±50 lines around `startLine` for an exact occurrence of `anchorText`. Single hit → resolved, update line numbers in memory (do not rewrite the file for this).
 3. **Whole-file search.** Exact occurrence anywhere in the file. Single hit → resolved.
 4. **Ambiguous.** More than one hit in step 2 or 3 → pick the one nearest `startLine`, mark `confidence: 'low'`.
-5. **Not found.** No anchor, or no match → `stale`.
+5. **Not found.** An anchor with no match becomes `stale`.
 
 Whitespace: compare with trailing whitespace stripped per line and with a leading-indentation-insensitive fallback (strip the common indent prefix from both sides) before giving up. Reformatters change indentation constantly.
 
@@ -232,7 +235,7 @@ Support all text languages in normal editors, split editor groups, and both pane
 
 The native comment API provides the gutter/input UI but not persistence. Contribute explicit submit, edit, and delete commands. This uses a thread as a single-comment display container, not a conversation: disable replies after submission. No agent reply, resolution workflow, or separate thread store.
 
-The API does not supply comparison provenance on `CommentReply`. Validate draft-context capture in M1; if native gutter creation cannot be associated reliably with its original comparison, require an explicit context confirmation before saving. Do not reconstruct provenance from whichever tab is active after typing.
+**v0.1 API deviation:** stable APIs expose neither a native gutter draft-creation event with source context nor an enumeration of those unsubmitted drafts. `CommentReply` supplies the thread URI/range, not its initial comparison or source snapshot. Native submission therefore always asks for context confirmation and captures current source text at submission, before the picker. It cannot recover the text from the initial gutter click. Keyboard/menu entry captures before typing and is recommended. Never reconstruct provenance from whichever tab is active after typing; unobservable drafts also affect handoff (§8 Input UI).
 
 ### 5.2 Trigger — keybinding and menus
 
@@ -240,16 +243,18 @@ The API does not supply comparison provenance on `CommentReply`. Validate draft-
 - `editor/context` menu item **Add Review Comment**, group `loopReview`, in regular and diff text editors, including read-only panes. Do not require `!editorReadonly`.
 - Command palette: **Add Review Comment**, with the same behavior. Capture the last focused text editor context before opening UI; if the source is ambiguous, ask the user to choose it.
 
-All entry paths open the same native multiline composer. Its label shows the captured path, side-local line range, and **Left / Original**, **Right / Modified**, or **Document**, plus the origin. Submission uses this captured context, not whichever pane is active afterward. A toolbar action must not default to the right pane when neither pane has focus; the gutter and keyboard are the primary paths.
+There is no CodeActionProvider or lightbulb entry; these commands and the native gutter are the supported entry points.
+
+All entry paths use the native multiline composer. Keyboard/menu-created drafts have a label showing the captured path, side-local line range, and **Left / Original**, **Right / Modified**, or **Document**, plus the origin. Their submission uses this captured context, not whichever pane is active afterward. Native gutter drafts obtain confirmed context only at submission. A toolbar action must not default to the right pane when neither pane has focus; the gutter and keyboard are the primary paths.
 
 ### 5.3 Resource and comparison-side resolution
 
 Resolve origin and comparison side separately:
 
-1. Capture the invoking document URI and range. For a native draft, use its thread URI/range and the captured entry context; for editor commands, use the invoking text editor. Never infer source from the active editor at submission time.
+1. Capture the invoking document URI and range. For editor commands, use the invoking or last focused text editor and freeze source text before asynchronous work. For native gutter submission, use the thread URI/range and current source text, then require explicit context confirmation; no initial entry snapshot is available. Never infer source from the active editor at submission time.
 2. Inspect the relevant tab's `TabInputTextDiff`, which exposes `original` and `modified` URIs. Match the captured document's full URI, including query, against these endpoints: unique original match means `left`; unique modified match means `right`. A normal text tab means `document`.
 3. If the tab/editor association is uncertain, both endpoints have the same URI, or neither matches, ask which comparison/side the user intends. Public APIs do not expose a direct focused-diff-side property. Do not use `viewColumn`, scheme, or file name as a substitute.
-4. Resolve each endpoint into a repo-relative path and origin. `file:` means `changed`, regardless of side. For `git:`, validate the JSON query and resolve its ref through the Git integration: index means `staged`, HEAD means `head`, and other commit refs resolve to `commit:<full-sha>`. Reject unsupported/unavailable refs rather than calling them working-tree code.
+4. Resolve each endpoint into a repo-relative path and origin. `file:` means `changed`, regardless of side. For `git:`, validate the JSON query and resolve its ref through the Git integration: empty ref means `staged`, HEAD means `head`, and `~` conditionally selects index or HEAD (§3.4). Other commit refs resolve to `commit:<full-sha>`. Reject unsupported/unavailable refs rather than calling them working-tree code.
 5. Require comparison endpoints to belong to the same selected repository in v1. Persist the ordered pair and selected side with the comment.
 
 The bundled Git extension's URI query is an implementation detail, not a stable API. Verify actual refs for staged, unstaged, deleted, renamed, and historical files during development; handle malformed queries without throwing. Side resolution must also work for `vscode.diff` comparisons where both endpoints are `file:` URIs.
@@ -261,60 +266,55 @@ Native gutter markers and expandable comment boxes are the primary display. Supp
 ```ts
 vscode.window.createTextEditorDecorationType({
   after: {
-    contentText: ' 💬',
-    margin: '0 0 0 2em',
+    contentText: ' [review]',
+    margin: '0 0 0 1em',
     color: new vscode.ThemeColor('editorInfo.foreground'),
   },
-  backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
   overviewRulerColor: new vscode.ThemeColor('editorInfo.foreground'),
   overviewRulerLane: vscode.OverviewRulerLane.Right,
   rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
 });
 ```
 
-Badge variants by state: `💬` normal, `⚠️` low confidence. There is no replied or resolved state.
+v0.1 uses the same `[review]` badge for high- and low-confidence anchors; there is no separate low-confidence badge, replied state, or resolved state.
 
-The overview-ruler mark helps locate comments in long files. A badge may show a count when several comments share a line; do not hide duplicates.
+The overview-ruler mark helps locate comments in long files. Duplicate comments retain separate threads and tree entries; badges are not aggregated into counts.
 
 The `after` badge attaches after the line text, not to the viewport's right edge. Full text is available in the hover and expanded native comment box. Apply decorations to every matching `window.visibleTextEditors` entry, not only the active editor, and refresh on visibility, document, Git, and review-file changes.
 
 ### 5.5 Comment display — hover
 
-`DecorationOptions.hoverMessage`, a `MarkdownString` with `isTrusted = true`:
+`DecorationOptions.hoverMessage` uses an untrusted `MarkdownString` (`isTrusted = false`, `supportHtml = false`). The same untrusted content is used for tree tooltips:
 
 ```
 **Review comment** · Right / Modified · working tree · L42-43
 Comparison: src/auth/login.ts (index) -> src/auth/login.ts (working tree)
 
 Missing error handling on the await — ...
-
-[Edit](command:loopReview.editComment?%5B3%5D) ·
-[Delete](command:loopReview.deleteComment?%5B3%5D) ·
-[Reveal in COMMENTS.md](command:loopReview.reveal?%5B3%5D)
 ```
 
-Command arguments are URI-encoded JSON arrays. The argument is the comment's **index in the parsed file**, valid only for the current parse generation — see §7.3.
+Do not add executable command links to user-editable Markdown. Edit/delete/reveal use native comment actions; the tree also offers reveal/delete. Native comment bodies are untrusted as well. Actions carry an entry snapshot rather than a hover command URI (§7.3).
 
 ### 5.6 Editor placement and comparison labels
 
 Create native threads against the selected resource's URI and resolved range. They and decorations are projections of the same parsed file, disposed or refreshed after edits/deletion. New comments open expanded; restored comments may start collapsed but must retain visible gutter markers. Editing uses the native multiline editor, and deleting removes the corresponding markdown block.
 
-In the captured comparison, a left comment appears only on Original and a right comment only on Modified. Match resources by repository, path, and origin, not path alone: identical paths and identical snippets on opposite Git revisions must not produce duplicate or misplaced comments. Never put a deleted-line comment on a nearby right-side line.
+In comparisons with distinct resource URIs, a comment is projected onto its matching resource/revision, not onto the opposite revision. Match resources by repository, path, and origin, not path alone: identical paths and identical snippets on opposite Git revisions must not produce duplicate or misplaced comments. Never put a deleted-line comment on a nearby right-side line. Same-URI comparisons have the placement limitation below.
 
 Comments also appear in other editors displaying the same resource/revision. A working-tree comment is visible in the normal file editor and its matching diff pane. A staged or HEAD comment does not decorate the working tree merely because its text matches. Always label capture provenance explicitly, for example **Captured: Left / Original (index)**; that index resource can later appear on the right in a staged comparison without changing the stored side. Include the ordered comparison pair in the expanded box/hover and clipboard text.
 
-**Public API limits:** native threads are URI/range-scoped, not tab- or pane-scoped. If a comparison uses exactly the same URI on both sides, VS Code may show the thread on both; preserve the explicitly chosen capture side and label it rather than promising independent placement. In inline diff mode, native original-side threads are not reliably displayed. Offer **Open Side-by-Side Comparison** using the recorded pair for original-side review, with the tree/markdown as an always-available fallback. Do not silently create a modified-side comment instead. Validate these behaviors in the extension host before claiming support.
+**Public API limits:** native threads are URI/range-scoped, not tab- or pane-scoped. If a comparison uses exactly the same URI on both sides, VS Code may show the thread on both; preserve the explicitly chosen capture side and label it rather than promising independent placement. In inline diff mode, native original-side threads are not reliably displayed. **Open Side-by-Side Comparison** opens the recorded pair and invokes `toggle.diff.renderSideBySide` only when explicitly requested and the diff is inline. Ordinary tree navigation does not toggle the layout. Keep tree/markdown navigation and the offer to open the selected revision separately as fallbacks; never create a modified-side comment instead. Visual placement and toggle behavior remain pending manual UI validation.
 
 ### 5.7 Tree view
 
 View container in the activity bar, `Loop Review`. Groups:
 
-- **Comments** — by file, then by resolved position
+- **Comments** - by file, retaining parsed file order within each file
 - **Stale** — unresolvable anchors
 
 Tree items show the capture-side label and origin alongside the comment preview. Clicking a comparison comment reopens its recorded pair with `vscode.diff`, preserving Original/Modified ordering and revealing the selected resource/range where the public API allows. Never focus the other pane as a substitute; offer opening the selected revision directly if precise diff-side navigation is unavailable. Clicking a regular-editor comment opens its resource at the resolved range. Clicking a stale comment reveals its block in `COMMENTS.md`.
 
-The tree view title exposes a prominent **Copy Comments & Clear** action (`loopReview.copyForAgent`, copy icon). Its tooltip explicitly says it copies all feedback and deletes `COMMENTS.md`. This is the primary end-of-pass action, not a palette-only utility. After successful deletion, the tree and decorations clear and the empty view invites the user to add comments for the next pass.
+The tree view title exposes a prominent **Copy Comments & Clear (Deletes COMMENTS.md)** action (`loopReview.copyForAgent`, copy icon). This is the primary end-of-pass action, not a palette-only utility. After successful deletion, saved threads, tree entries, and decorations clear and the empty view invites the user to add comments for the next pass. Unobservable native gutter drafts remain available (§8 Input UI).
 
 ### 5.8 Status bar
 
@@ -333,7 +333,7 @@ const git = vscode.extensions.getExtension<GitExtension>('vscode.git')!.exports.
 // Select a repository using the rules below before accessing its review file.
 ```
 
-Handle `git.state !== 'initialized'` by awaiting `onDidChangeState`. Handle zero repositories (extension stays dormant) and multiple repositories (use the one containing the active editor; if ambiguous, ask the user to select a repository). Scope the tree and copy-and-clear action to that selected repository and show its name in the view. Never silently choose a repository for file deletion or combine feedback from different repositories.
+Handle `git.state !== 'initialized'` by awaiting `onDidChangeState`. With zero repositories the review UI has no selected store. Initially choose the repository containing the active editor, or the sole open repository; otherwise leave selection unset. **Select Review Repository** offers an explicit picker, and copy-and-clear asks for selection if none exists. Adding a comment selects its source repository; ordinary editor focus changes do not switch an existing selection. Known drafts/edits and active mutations block repository switching. Scope the tree and copy-and-clear action to that selected repository and show its name in the view. Never combine feedback from different repositories. Only local `file:` repository roots and supported `file:`/`git:` text resources are in v0.1 scope.
 
 Needed operations:
 
@@ -341,11 +341,13 @@ Needed operations:
 |---|---|
 | base SHA | `repo.state.HEAD?.commit` |
 | blob content for re-anchoring | `repo.show(ref, path)` |
+| immutable commit origin | `repo.getCommit(ref)` |
+| conditional `~` baseline | `repo.state.indexChanges` file URI membership |
 | change notifications | `repo.state.onDidChange` |
 
 No diff/hunk parsing is required. Git integration is read-only: repository discovery, origin blobs for diff comments, and the optional base SHA. The extension does not mutate the index or working-tree code.
 
-`repo.state.onDidChange` fires frequently; debounce at 300ms and coalesce.
+`repo.state.onDidChange` fires frequently; debounce and coalesce refresh requests. This is scheduling, not a UI latency guarantee.
 
 ### Guardrails
 
@@ -367,19 +369,19 @@ Full re-parse on every change. No incremental updates, no reconciliation against
 
 ### 7.2 Watching
 
-`vscode.workspace.createFileSystemWatcher` scoped to the selected repository's root `COMMENTS.md` plus `onDidSaveTextDocument`. Handle create, change, and delete events. Debounce 300ms. A missing file means an empty saved review: clear the parsed model, diagnostics, saved native threads, decorations, tree, and status bar without recreating it. Do not silently discard unsaved composers during a watcher refresh.
+`vscode.workspace.createFileSystemWatcher` is scoped to the selected repository's root `COMMENTS.md`, alongside `onDidSaveTextDocument`. Handle create, change, and delete events with debounced notifications and refresh scheduling. Save events and explicit refresh keep ignored review files usable even when watcher delivery is suppressed. Unsaved `COMMENTS.md` edits are not parsed until saved; other open source-buffer changes can trigger re-anchoring. A missing file means an empty saved review: clear parsed entries, diagnostics, saved preview threads, decorations, tree, and status bar without recreating it. Preserve drafts and open native edits during refresh.
 
-**Loop prevention:** keep the exact string last written by the extension. On a change event, read the file; if the content equals `lastWritten`, ignore the event entirely. Without this, write→parse→write oscillates the first time an `await` lands in the wrong order.
+**Loop prevention:** there is no `lastWritten` suppression. Explicit mutation commands refresh after writes, while store notifications and watcher/save events schedule debounced refreshes. Duplicate reads are harmless: parsing, re-anchoring, and rendering never write feedback. Only explicit create/edit/delete/reanchor/handoff actions mutate it, so there is no parse-to-write feedback loop and no exactly-one-parse promise.
 
-After file deletion, reset `lastWritten` and advance the generation to invalidate old comment actions. Cancel or discard in-flight reads from the previous generation so they cannot repopulate the cleared UI. The first new comment creates a fresh preamble using the current base SHA.
+Refresh, repository switching, and successful handoff advance a generation token; outdated asynchronous refreshes cannot publish UI. Comment mutations separately recheck current disk content (§7.3). The first submitted comment after deletion creates a fresh preamble using the current base SHA. Native gutter drafts remain on the live controller, not in the saved model.
 
 ### 7.3 Parse generations
 
-Every successful parse increments a generation counter. Command arguments embedded in hover markdown carry `(generation, index)`. A command invoked with a stale generation:
+The extension uses a generation counter to reject obsolete asynchronous refresh results, not as a persisted comment ID. Native/tree action arguments carry the parsed entry, repository, and exact file snapshot. Before saving, deleting, rewriting lines, or revealing a Markdown block, read or mutate against current saved text:
 
-1. re-parses
-2. attempts to re-resolve by `(file, lines, origin, side, comparison)` plus anchor text; if several comments match, fails rather than choosing one
-3. on success, proceeds; on failure, shows "This comment has changed on disk" and refreshes the UI
+1. Re-parse current text. If it equals the entry snapshot, use the index only when the raw block also matches.
+2. Otherwise, require the exact raw block to occur uniquely in both the old snapshot and the current parse. Changed bodies/headers and ambiguous duplicates are not guessed by semantic fields.
+3. Proceed only on a match and in the same selected repository; otherwise report that the comment changed on disk and ask the user to refresh/select it again. Failed saves preserve open edit input.
 
 This is the price of dropping stable IDs. It is worth paying — no IDs means new comments are a pure append with no splice-offset bugs — but it must be handled explicitly, not ignored.
 
@@ -406,40 +408,46 @@ This guard also applies before copy-and-clear: never silently copy only the save
 
 | Command | Title | Context |
 |---|---|---|
-| `loopReview.addComment` | Add review comment | comment gutter, current line or selection in file/git editor, palette |
+| `loopReview.addComment` | Add review comment | current line or selection in file/git editor, editor menu, palette; gutter uses the native provider |
 | `loopReview.submitComment` | Add Comment | native draft comment composer |
-| `loopReview.editComment` | Edit comment | hover, tree view |
-| `loopReview.deleteComment` | Delete comment | hover, tree view |
-| `loopReview.reveal` | Reveal in COMMENTS.md | hover, tree view |
+| `loopReview.editComment` | Edit comment | native comment title |
+| `loopReview.saveComment` | Save | native comment edit |
+| `loopReview.cancelEdit` | Cancel | native comment edit |
+| `loopReview.cancelDraft` | Cancel | native draft composer |
+| `loopReview.deleteComment` | Delete comment | native comment title, tree view |
+| `loopReview.reveal` | Reveal in COMMENTS.md | native comment title, tree view |
 | `loopReview.gotoCode` | Go to code | tree view |
 | `loopReview.openComparison` | Open Side-by-Side Comparison | comparison comment, original-side inline-diff fallback |
-| `loopReview.copyForAgent` | Copy Comments & Clear | tree view title, palette |
+| `loopReview.copyForAgent` | Copy Comments & Clear (Deletes COMMENTS.md) | tree view title, palette |
 | `loopReview.reanchorAll` | Rewrite line numbers from anchors | palette |
 | `loopReview.refresh` | Re-parse and refresh | palette, tree view title |
-| `loopReview.suggestGitignore` | Add COMMENTS.md to .gitignore | one-time prompt |
+| `loopReview.selectRepository` | Select Review Repository | palette, tree view title |
+| `loopReview.suggestGitignore` | Add COMMENTS.md to .gitignore | palette, one-time prompt per repository |
 
 ### 8.1 Copy Comments & Clear
 
 `copyForAgent` is the primary handoff command:
 
-1. Resolve the selected repository explicitly (§6). Require any open draft or comment edit to be submitted, explicitly discarded, or cancel the handoff (§8 Input UI). If its `COMMENTS.md` is open and dirty, offer **Save and retry** / **Cancel** before copying anything. Prevent new composers or comment edits until the handoff finishes.
+1. Use the selected repository, asking for selection if none exists (§6). For known keyboard/menu drafts or open comment edits, offer **Finish comments first** or **Copy and discard drafts**, or cancel (§8 Input UI). Native gutter drafts cannot be enumerated and are preserved, not exported. If `COMMENTS.md` is open and dirty, offer **Save and retry** / **Cancel** before copying anything. Guard new command-created composers, submissions, and comment edits while copying, and return no new commenting ranges.
 2. Read the complete saved file into a snapshot. If the file is missing or whitespace-only, show "No review comments to copy", leave the clipboard untouched, and do not delete anything.
 3. Prepend the instruction below and copy the snapshot with `vscode.env.clipboard.writeText`. Preserve all raw content, including paths, side-local ranges, origins, explicit sides, comparison pairs, captured code snippets, stale comments, malformed blocks, and hand-written notes. Do not export only successfully parsed comments or substitute current code for the captured context.
-4. Await successful clipboard completion. If copying fails, show an error and leave the file and UI intact.
-5. Verify that the saved file still matches the snapshot and no dirty editor buffer exists, then delete only that repository's `COMMENTS.md`. Never delete any other file or change the git index. If the file changed, retain it and report "Feedback copied, but COMMENTS.md changed and was not cleared. Retry to copy the latest feedback."
-6. After successful deletion, clear the review UI and invalidate old actions (§7.2). Show "Review feedback copied; COMMENTS.md deleted. Paste it into your AI tool."
+4. Await successful clipboard completion. If copying fails, report the failure and leave the file and UI intact.
+5. Verify that the saved file still matches the snapshot and no dirty editor buffer exists, then delete only that repository's `COMMENTS.md`. Never delete any other file or change the git index. If the file changed, retain it and report "Feedback copied, but COMMENTS.md was not cleared." with a request to save and retry.
+6. After successful deletion, clear saved review projections and any known drafts/edits explicitly authorized for discard; retain the controller and unobservable native gutter drafts (§7.2). Show "Review feedback copied; COMMENTS.md deleted. Paste it into your AI tool."
 
 Handoff instruction:
 
 > Review feedback follows. Address the comments using the included file paths and captured code snippets as context; line numbers and snippets may be stale. Side: left refers to Original, Side: right to Modified, and Side: document to a regular editor. Each comparison records both resources; lines and snippets belong to the selected side, not necessarily the current working-tree file. Staging remains under the human's control. This feedback was copied from a completed review pass; do not read, recreate, or reply in COMMENTS.md. Summarize your changes in this conversation.
 
-If deletion fails after copying succeeds, retain the file/UI and report "Feedback copied, but COMMENTS.md could not be deleted" with the error. The user can retry; copying the same feedback again is safer than losing it. Do not clear or restore the clipboard on failure. Clipboard content is a point-in-time snapshot, not a persistent review archive.
+If deletion fails after copying succeeds, retain the file/UI and report "Feedback copied, but COMMENTS.md was not cleared." with the error. The user can retry; copying the same feedback again is safer than losing it. Do not clear or restore the clipboard on failure. Clipboard content is a point-in-time snapshot, not a persistent review archive.
 
 The deliberately named action needs no additional confirmation in the normal success path. Keep it available when the file contains only malformed blocks or free-form notes, since those must remain exportable. Disable it while a copy-and-clear operation is running.
 
 ### Input UI
 
-Use the native comment composer for multiline creation and editing (§5.1), with **Add Comment**, **Save**, and **Cancel** actions as appropriate. No single-line input box, escaped-newline convention, or custom webview. Hand-editing `COMMENTS.md` remains supported. Unsubmitted drafts are transient; copy-and-clear must offer to finish or discard them, or cancel the handoff, before proceeding so clearing the UI cannot silently lose draft feedback.
+Use the native comment composer for multiline creation and editing (§5.1), with **Add Comment**, **Save**, and **Cancel** actions as appropriate. No single-line input box, escaped-newline convention, or custom webview. Hand-editing and saving `COMMENTS.md` remains supported; bodies require balanced fences and no unfenced `##` headings (use `###`).
+
+**Implemented v0.1 deviation:** copy exports only submitted, saved comments and other raw content already saved in `COMMENTS.md`, never unsubmitted composer text or unsaved edits. Known keyboard/menu drafts and open saved-comment edits trigger a finish/discard/cancel prompt; authorized discard happens only after successful copy-and-clear. Stable APIs cannot enumerate native gutter-created drafts, so the extension cannot include them in that prompt or guarantee an all-drafts-finished pass boundary. It keeps the controller alive and does not silently destroy them: those unsubmitted native drafts remain available for the next pass. They are transient, not persisted across reloads. Their eventual submission requires context confirmation and captures then-current source text, not initial gutter-click text. Recommend keyboard entry when pre-typing capture matters.
 
 ---
 
@@ -447,9 +455,10 @@ Use the native comment composer for multiline creation and editing (§5.1), with
 
 | Setting | Default | Description |
 |---|---|---|
-| `loopReview.anchorMaxLines` | `20` | Lines captured before eliding |
 | `loopReview.decorationStyle` | `badge` | `badge` \| `none` |
-| `loopReview.searchRadius` | `50` | Lines searched around recorded position when re-anchoring |
+| `loopReview.searchRadius` | `50` | Lines searched around recorded position when re-anchoring; range 0-10000 |
+
+The 20-line anchor threshold and first-10 / `...` / last-5 elision format are fixed, not configurable.
 
 ---
 
@@ -506,26 +515,29 @@ The sketch omits native comment contributions: register submit/edit/save/delete/
 
 ```
 src/
-  extension.ts        activate/deactivate, wiring, disposables
-  model.ts            Comment, ResolvedComment, Origin, Side, Comparison types
-  parser.ts           parse() → { comments, rawBlocks, diagnostics }
-  writer.ts           append(), spliceBody(), remove() — byte-preserving
+  extension.ts        activation/disposal, commands, native drafts/threads,
+                      decorations/hover, tree/status, refresh generations/debounce
+  model.ts            ReviewComment, ParsedComment, ResolvedAnchor, Resource,
+                      Origin, Side, Comparison types and validation
+  parser.ts           parse() -> { comments, diagnostics, base }, scanMarkdown()
+  writer.ts           appendComment(), editComment(), deleteComment(), rewriteLines()
   anchor.ts           re-anchoring algorithm (§4.2)
   git.ts              repository discovery, git extension API wrapper, origin blobs
-  handoff.ts          clipboard snapshot, guarded file deletion, result notification
-  ui/comments.ts      CommentController, multiline input, thread projection
-  editorContext.ts    capture document/range, comparison pair, side and origin
-  ui/decorations.ts   decoration + hover rendering
-  ui/tree.ts          TreeDataProvider
-  ui/status.ts        status bar item
-  sync.ts             watcher, debounce, loop prevention, generations
+  handoff.ts          pure copyAndClear() port, instruction and result types
+  editorContext.ts    freeze source/range, context picker, pair/side/origin, elision
+  store.ts            ReviewStore: saved-file reads, watcher/save events, debounce,
+                      serialized mutations, dirty/snapshot/symlink guards, handoff I/O
 ```
 
-`parser.ts` and `anchor.ts` are pure functions over strings. They should carry the bulk of the test suite and require no VS Code host to run.
+UI remains in the single `extension.ts`; there are no `ui/` or `sync.ts` modules. `parser.ts`, `writer.ts`, `anchor.ts`, and the port-based `handoff.ts` run without a VS Code host. Runtime npm dependencies are zero; build, package, and test tools are development dependencies. The current `npm audit` reports low-severity transitive development-tool warnings, including age/license-policy findings, not an audit-clean development tree.
 
 ---
 
 ## 12. Test cases
+
+This is a validation checklist, not a claim that every UI scenario has been manually verified. `npm test` compiles and runs `test/core.test.ts` and `test/handoff.test.ts`. `npm run test:integration` compiles and runs the extension-host suite in `test/integration/` through `test/runIntegration.ts`.
+
+The integration runner uses `/Applications/Visual Studio Code.app/Contents/MacOS/Code` by default; set `VSCODE_EXECUTABLE_PATH` to the actual executable for another installation. It creates an isolated disposable Git fixture, user-data directory, and extensions directory, isolates Git configuration, and restores prior clipboard text in cleanup (not other clipboard formats). Command/API assertions cover resource capture, persisted projections, editing/deletion, watcher refresh, re-anchoring, and real clipboard handoff. Visual gutter clicks, physical shortcut dispatch, modal prompt interactions, reload UX, and inline/same-URI placement remain pending manual validation.
 
 Parser:
 - `## ` inside a fenced block is content
@@ -533,7 +545,7 @@ Parser:
 - two comments with identical headers survive as two comments
 - unknown H2 sections round-trip verbatim
 - CRLF input round-trips as CRLF
-- missing anchor, missing `Origin`, malformed `Lines:` each produce a diagnostic and preserve the block
+- a missing anchor is valid and uses low-confidence line hints; missing `Origin` or malformed `Lines:` produces a diagnostic and preserves the block
 - missing/invalid Side or inconsistent comparison endpoints produce a diagnostic without dropping feedback
 - left/right comments on the same file/range remain distinct; comparison metadata survives body edits
 
@@ -551,11 +563,11 @@ Anchor:
 - deleted → stale
 
 Sync:
-- extension write does not retrigger parse
-- external edit triggers exactly one parse after debounce
-- command with stale generation re-resolves or fails cleanly
+- explicit extension writes refresh saved projections; subsequent watcher reads never write feedback
+- external edits refresh after debounced notifications; save events and explicit refresh cover ignored files without promising exact parse counts or latency
+- obsolete refresh generations cannot publish; stale entry snapshots re-resolve uniquely by raw block or fail cleanly
 - write blocked while `COMMENTS.md` is dirty
-- deletion clears UI and invalidates old actions, including pending reads
+- deletion clears saved projections while preserving open input; obsolete reads cannot publish and stale mutations fail safely
 - first comment after a handoff recreates the file with a fresh base SHA
 
 Clipboard handoff:
@@ -570,16 +582,16 @@ Clipboard handoff:
 - only the explicitly selected repository's COMMENTS.md is copied and deleted
 - successful handoff never stages, unstages, or modifies code
 - copied feedback unambiguously identifies the selected comparison side and both resources
-- unsubmitted drafts must be finished, explicitly discarded, or cancel the handoff
+- known shortcut drafts/open edits prompt to finish, explicitly discard on success, or cancel; native gutter unsubmitted drafts are not exported and remain available for the next pass
 
 Editor integration (extension-host/manual tests):
 - gutter entry, current-line shortcut, range shortcut, and context menu work in regular editors for all text languages
 - existing comments remain visible after reload and in all matching split editor groups, not just the active editor
 - native multiline create/edit/delete round-trip through COMMENTS.md without reply controls
-- unstaged diff: index/original left and working-tree/modified right comments render on their respective resources
+- unstaged diff: conditional HEAD-or-index/original left and working-tree/modified right comments target their respective resources
 - staged diff: HEAD/original left and index/modified right comments remain distinct even with identical text and paths
 - deleted lines on the left retain original line numbers/snippets; added lines on the right use modified coordinates
-- switching focus while composing does not change the captured side, path, range, or snippet
+- switching focus while composing a keyboard/menu draft does not change captured side, path, range, or snippet; native gutter submission confirms context and captures current source text instead
 - file-versus-file comparison with two file URIs records the correct ordered paths and selected side
 - historical comparisons resolve immutable commit origins; renamed-file comparisons preserve each endpoint's path
 - identical-URI or uncertain comparison context asks for a side and labels the known placement limitation
@@ -630,12 +642,16 @@ The git index is the human's review signal, not yours.
 
 **M5 - polish.** `reanchorAll`, settings, stale-base warning, and repository-selection UX.
 
-M1 must establish the actual editor API behavior before estimating the remaining UI work.
+### Implementation status (v0.1)
+
+The M1-M5 implementation paths are present in the modules above, including persistence, UI projections, guarded handoff, repository selection, settings, and explicit re-anchoring. Automated pure and extension-host suites exist; their command/API coverage is distinct from manual interaction validation (§12). Native gutter creation-time capture and all-draft enumeration are unavailable through stable APIs; the implemented confirmation/preservation deviations are recorded in §5.1 and §8 Input UI.
+
+Manual validation remains pending for visual gutter/composer actions, keyboard dispatch, context and dirty/draft prompts, reload/split-editor UX, and inline/same-URI comparison placement. These milestones are not visual acceptance results or timing promises.
 
 ---
 
 ## 15. Open questions
 
-1. **Elision marker** in long anchors (§4.1) - `// ...` is language-specific and will look wrong in Python or YAML. A bare `...` line, or a language-aware marker? Re-anchoring must also account for elision rather than searching for the marker as literal source text.
+The elision decision is implemented: a bare `...` between the first 10 and last 5 lines for selections longer than 20 (§4.1); re-anchoring matches both ends rather than searching for literal marker text. Remaining validation questions concern native UI behavior listed in §12 and §14.
 
 Scope decisions: selections may span hunks without splitting; v1 does not parse hunks. Each repository has its own root `COMMENTS.md`, with one explicitly selected repository in the UI at a time. Agent replies and acceptance tracking are out of scope.

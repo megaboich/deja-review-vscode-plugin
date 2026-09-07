@@ -370,7 +370,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
         await this.refresh();
         const latest = [...this.threads].reverse().find(thread => (thread.comments[0] as Note | undefined)?.entry.comment.body.trim() === reply.text.trim());
         if (latest) { latest.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded; }
-        void this.offerGitignore();
+        void this.offerGitignore().catch(error => this.error(error));
       }
     } finally { this.submitting.delete(thread); }
   }
@@ -513,11 +513,16 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
 
   private async offerGitignore(): Promise<void> {
     if (!this.repo) { return; }
+    const repoUri = this.repo.rootUri.toString();
     const key = `gitignore:${this.repo.rootUri.toString()}`;
     if (this.context.globalState.get(key)) { return; }
     await this.context.globalState.update(key, true);
     const choice = await vscode.window.showInformationMessage('COMMENTS.md is scratch review feedback. Add it to .gitignore?', 'Add', 'Not now');
-    if (choice === 'Add') { await this.gitignore(); }
+    if (choice === 'Add') {
+      if (this.repo?.rootUri.toString() !== repoUri) {
+        void vscode.window.showInformationMessage('Repository selection changed. Run Add COMMENTS.md to .gitignore in the intended repository.');
+      } else { await this.gitignore(); }
+    }
   }
 
   private async gitignore(): Promise<void> {

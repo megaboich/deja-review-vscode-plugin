@@ -147,6 +147,36 @@ export async function run(): Promise<void> {
 
     await test('native ranges and conditional Git baselines', () => testResourceEdges(git, repo, working, head, staged));
 
+    await test('deny unsupported, outside-repository, and malformed resource URIs', async () => {
+      const outside = vscode.Uri.file(path.join(path.dirname(root), 'outside.ts'));
+      for (const uri of [
+        vscode.Uri.parse('untitled:review.ts'),
+        vscode.Uri.parse('https://example.invalid/sample.ts'),
+        outside,
+        head.with({ path: outside.path, query: JSON.stringify({ path: outside.fsPath, ref: 'HEAD' }) }),
+      ]) {
+        assert.equal(await git.repositoryFor(uri), undefined, uri.toString());
+        assert.equal(await git.resource(uri, repo), undefined, uri.toString());
+      }
+      for (const [uri, error] of [
+        [working.with({ query: 'unexpected=true' }), /query or fragment/],
+        [working.with({ fragment: 'unexpected' }), /query or fragment/],
+        [head.with({ query: '{' }), /Malformed Git URI/],
+        [head.with({ query: JSON.stringify({ path: working.fsPath }) }), /path and ref must be strings/],
+        [head.with({ query: JSON.stringify({ path: working.fsPath, ref: 1 }) }), /path and ref must be strings/],
+        [head.with({ query: JSON.stringify({ path: 'sample.ts', ref: 'HEAD' }) }), /must be absolute/],
+        [head.with({ authority: 'unexpected-host' }), /authority does not match/],
+        [head.with({ query: JSON.stringify({ path: working.fsPath, ref: 'HEAD', submoduleOf: root }) }), /Submodule summary/],
+      ] as const) {
+        await assert.rejects(() => git.repositoryFor(uri), error);
+        await assert.rejects(() => git.resource(uri, repo), error);
+      }
+      for (const ref of ['~1', ':1', '-HEAD', 'HEAD\n']) {
+        const uri = head.with({ query: JSON.stringify({ path: working.fsPath, ref }) });
+        await assert.rejects(() => git.resource(uri, repo), /Unsupported Git ref/);
+      }
+    });
+
     const savedThread = (uri: vscode.Uri, body: string): vscode.CommentThread => {
       const thread = api.getThreads().find(item => item.uri.toString() === uri.toString()
         && item.comments.some(comment => (typeof comment.body === 'string' ? comment.body : comment.body.value).includes(body)));
@@ -201,6 +231,41 @@ export async function run(): Promise<void> {
       }
       assert.equal(api.getState().comments, captured.length);
       assert.equal(await fs.readFile(feedback, 'utf8'), before, 'Display restoration must not rewrite feedback');
+    });
+
+    await test('open saved comparisons side by side through live thread commands', async () => {
+      const configuration = vscode.workspace.getConfiguration('diffEditor');
+      const previous = configuration.inspect<boolean>('renderSideBySide')?.workspaceValue;
+      const before = await fs.readFile(feedback, 'utf8');
+      const comparisons = parse(before).comments.filter(comment => comment.side === 'right' && comment.comparison);
+      assert.equal(comparisons.length, 2, 'Exercise the saved Git and file/file comparisons');
+      assert.ok((await vscode.commands.getCommands()).includes('toggle.diff.renderSideBySide'));
+      try {
+        for (const comment of comparisons) {
+          const pair = comment.comparison!;
+          const original = git.uri(pair.left, repo);
+          const modified = git.uri(pair.right, repo);
+          await configuration.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace);
+          await openDiff(original, modified);
+          await api.refresh();
+          const thread = savedThread(modified, comment.body);
+          assert.equal(thread.contextValue, 'comparison');
+          assert.equal(vscode.workspace.getConfiguration('diffEditor').get('renderSideBySide'), false);
+          await within('openComparison live thread command', () =>
+            vscode.commands.executeCommand('loopReview.openComparison', thread), 5_000);
+          await waitFor('side-by-side comparison setting', () =>
+            vscode.workspace.getConfiguration('diffEditor').get('renderSideBySide') === true);
+          const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+          assert.ok(input instanceof vscode.TabInputTextDiff);
+          assert.equal(input.original.toString(), original.toString());
+          assert.equal(input.modified.toString(), modified.toString());
+          assert.equal(vscode.workspace.getConfiguration('diffEditor').get('renderSideBySide'), true);
+        }
+        assert.equal(await fs.readFile(feedback, 'utf8'), before, 'Opening comparisons must not rewrite feedback');
+      } finally {
+        await configuration.update('renderSideBySide', previous, vscode.ConfigurationTarget.Workspace);
+        assert.equal(vscode.workspace.getConfiguration('diffEditor').inspect<boolean>('renderSideBySide')?.workspaceValue, previous);
+      }
     });
 
     await test('saving an unchanged editor comment returns to preview without rewriting feedback', async () => {
