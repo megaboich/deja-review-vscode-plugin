@@ -28,7 +28,7 @@
   "contributes": {
     "commands": [
       { "command": "loopReview.addComment", "title": "Add Review Comment", "category": "Loop Review" },
-      { "command": "loopReview.submitComment", "title": "Add Comment", "category": "Loop Review" },
+      { "command": "loopReview.submitComment", "title": "Add Comment", "category": "Loop Review", "enablement": "!commentIsEmpty && !loopReview.copyInProgress" },
       { "command": "loopReview.editComment", "title": "Edit Comment", "icon": "$(edit)", "category": "Loop Review" },
       { "command": "loopReview.saveComment", "title": "Save", "category": "Loop Review" },
       { "command": "loopReview.cancelEdit", "title": "Cancel", "category": "Loop Review" },
@@ -60,7 +60,7 @@
         { "command": "loopReview.deleteComment", "when": "view == loopReview.tree && viewItem == reviewComment", "group": "inline@2" }
       ],
       "comments/commentThread/context": [
-        { "command": "loopReview.submitComment", "when": "commentController == loopReview && !commentThreadIsEmpty == false", "group": "inline@1" },
+        { "command": "loopReview.submitComment", "when": "commentController == loopReview && commentThreadIsEmpty", "group": "inline@1" },
         { "command": "loopReview.cancelDraft", "when": "commentController == loopReview && commentThreadIsEmpty", "group": "inline@2" }
       ],
       "comments/comment/title": [
@@ -71,6 +71,9 @@
       "comments/comment/context": [
         { "command": "loopReview.saveComment", "when": "commentController == loopReview && comment == editing", "group": "inline@1" },
         { "command": "loopReview.cancelEdit", "when": "commentController == loopReview && comment == editing", "group": "inline@2" }
+      ],
+      "comments/commentThread/title": [
+        { "command": "loopReview.openComparison", "when": "commentController == loopReview && commentThread == comparison", "group": "navigation@1" }
       ],
       "commandPalette": [
         { "command": "loopReview.submitComment", "when": "false" },

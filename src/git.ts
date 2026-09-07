@@ -4,7 +4,11 @@ import { normalizeResource, Resource } from './model';
 
 export interface Repository {
   rootUri: vscode.Uri;
-  state: { HEAD?: { commit?: string }; onDidChange: vscode.Event<void> };
+  state: {
+    HEAD?: { commit?: string };
+    indexChanges?: readonly { readonly uri: vscode.Uri }[];
+    onDidChange: vscode.Event<void>;
+  };
   show(ref: string, path: string): Promise<string>;
   getCommit(ref: string): Promise<{ hash: string }>;
 }
@@ -134,9 +138,12 @@ export class GitResources implements vscode.Disposable {
     const resource = normalizeResource({ path: filePath, origin: 'changed' });
     const ref = value.ref;
     if (ref === undefined) { return resource; }
-    // Git's '~' is the unstaged baseline: index, or HEAD when no index change exists.
-    // Persist the logical index origin; use '' when reopening to avoid that fallback.
-    if (ref === '' || ref === '~') { return { ...resource, origin: 'staged' }; }
+    if (ref === '~') {
+      // Match bundled Git's sanitizeRef: public change.uri is resourceUri, including renames.
+      const indexed = repo.state.indexChanges?.some(change => change.uri.toString() === value.file.toString());
+      return { ...resource, origin: indexed ? 'staged' : 'head' };
+    }
+    if (ref === '') { return { ...resource, origin: 'staged' }; }
     if (ref === 'HEAD' || ref === 'head') { return { ...resource, origin: 'head' }; }
     if (/^(?:~\d|:)/.test(ref) || ref.startsWith('-') || /[\x00-\x20\x7f]/.test(ref)) {
       throw new Error(`Unsupported Git ref ${JSON.stringify(ref)}: merge stages and non-commit revisions cannot be reviewed.`);

@@ -21,7 +21,7 @@ function describe(uri: vscode.Uri): string {
       const query: unknown = JSON.parse(uri.query);
       if (query && typeof query === 'object' && 'path' in query && 'ref' in query
         && typeof query.path === 'string' && typeof query.ref === 'string') {
-        const origin = query.ref === '' || query.ref === '~' ? 'staged'
+        const origin = query.ref === '~' ? 'baseline' : query.ref === '' ? 'staged'
           : query.ref === 'HEAD' || query.ref === 'head' ? 'head' : `ref: ${query.ref}`;
         return `${query.path} (${origin})`;
       }
@@ -34,14 +34,20 @@ export async function captureContext(
   git: GitResources,
   uri: vscode.Uri,
   range: vscode.Range,
-  options: { forceSidePrompt?: boolean; tabInput?: vscode.TabInputText | vscode.TabInputTextDiff } = {},
+  options: {
+    forceSidePrompt?: boolean;
+    tabInput?: vscode.TabInputText | vscode.TabInputTextDiff;
+    rangeSemantics?: 'selection' | 'thread';
+  } = {},
 ): Promise<CapturedContext | undefined> {
   // Freeze all editor-derived state before Git initialization or any picker changes focus.
+  // Native threads reach capture only at submission; draft-creation text cannot be recovered here.
   const key = uri.toString();
   const document = vscode.workspace.textDocuments.find(doc => !doc.isClosed && doc.uri.toString() === key);
   const text = document?.getText();
   const start = range.start.line;
-  const end = !range.isEmpty && range.end.character === 0 ? range.end.line - 1 : range.end.line;
+  const end = options.rangeSemantics !== 'thread' && !range.isEmpty && range.end.character === 0
+    ? range.end.line - 1 : range.end.line;
   const input = options.tabInput ?? vscode.window.tabGroups.activeTabGroup.activeTab?.input;
   const forcePrompt = options.forceSidePrompt === true;
   const tabs = vscode.window.tabGroups.all.flatMap(group => group.tabs.map(tab => ({
