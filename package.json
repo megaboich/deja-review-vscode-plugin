@@ -1,0 +1,102 @@
+{
+  "name": "simple-loop-review",
+  "displayName": "Simple Loop-Review Comments",
+  "description": "Review code locally, then copy contextual feedback into any AI tool.",
+  "version": "0.1.0",
+  "publisher": "local-review",
+  "license": "UNLICENSED",
+  "engines": { "vscode": "^1.96.0" },
+  "categories": ["Other"],
+  "main": "./out/src/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "extensionDependencies": ["vscode.git"],
+  "scripts": {
+    "compile": "tsc -p .",
+    "check": "tsc -p . --noEmit",
+    "test": "npm run compile && node --test out/test/*.test.js",
+    "test:integration": "npm run compile && node out/test/runIntegration.js",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.0",
+    "typescript": "^5.9.2"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "loopReview.addComment", "title": "Add Review Comment", "category": "Loop Review" },
+      { "command": "loopReview.submitComment", "title": "Add Comment", "category": "Loop Review" },
+      { "command": "loopReview.editComment", "title": "Edit Comment", "icon": "$(edit)", "category": "Loop Review" },
+      { "command": "loopReview.saveComment", "title": "Save", "category": "Loop Review" },
+      { "command": "loopReview.cancelEdit", "title": "Cancel", "category": "Loop Review" },
+      { "command": "loopReview.deleteComment", "title": "Delete Comment", "icon": "$(trash)", "category": "Loop Review" },
+      { "command": "loopReview.cancelDraft", "title": "Cancel", "category": "Loop Review" },
+      { "command": "loopReview.reveal", "title": "Reveal in COMMENTS.md", "icon": "$(go-to-file)", "category": "Loop Review" },
+      { "command": "loopReview.gotoCode", "title": "Go to Code", "category": "Loop Review" },
+      { "command": "loopReview.openComparison", "title": "Open Side-by-Side Comparison", "icon": "$(diff)", "category": "Loop Review" },
+      { "command": "loopReview.copyForAgent", "title": "Copy Comments & Clear (Deletes COMMENTS.md)", "icon": "$(copy)", "category": "Loop Review", "enablement": "loopReview.hasFeedback && !loopReview.copyInProgress" },
+      { "command": "loopReview.refresh", "title": "Refresh Comments", "icon": "$(refresh)", "category": "Loop Review" },
+      { "command": "loopReview.selectRepository", "title": "Select Review Repository", "icon": "$(repo)", "category": "Loop Review" },
+      { "command": "loopReview.reanchorAll", "title": "Rewrite Line Numbers from Anchors", "category": "Loop Review" },
+      { "command": "loopReview.suggestGitignore", "title": "Add COMMENTS.md to .gitignore", "category": "Loop Review" }
+    ],
+    "keybindings": [
+      { "command": "loopReview.addComment", "key": "ctrl+alt+m", "mac": "cmd+alt+m", "when": "editorTextFocus" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "loopReview.addComment", "when": "resourceScheme == file || resourceScheme == git", "group": "loopReview@1" }
+      ],
+      "view/title": [
+        { "command": "loopReview.copyForAgent", "when": "view == loopReview.tree", "group": "navigation@1" },
+        { "command": "loopReview.refresh", "when": "view == loopReview.tree", "group": "navigation@2" },
+        { "command": "loopReview.selectRepository", "when": "view == loopReview.tree", "group": "navigation@3" }
+      ],
+      "view/item/context": [
+        { "command": "loopReview.reveal", "when": "view == loopReview.tree && viewItem == reviewComment", "group": "inline@1" },
+        { "command": "loopReview.deleteComment", "when": "view == loopReview.tree && viewItem == reviewComment", "group": "inline@2" }
+      ],
+      "comments/commentThread/context": [
+        { "command": "loopReview.submitComment", "when": "commentController == loopReview && !commentThreadIsEmpty == false", "group": "inline@1" },
+        { "command": "loopReview.cancelDraft", "when": "commentController == loopReview && commentThreadIsEmpty", "group": "inline@2" }
+      ],
+      "comments/comment/title": [
+        { "command": "loopReview.editComment", "when": "commentController == loopReview && comment == saved", "group": "inline@1" },
+        { "command": "loopReview.deleteComment", "when": "commentController == loopReview && comment == saved", "group": "inline@2" },
+        { "command": "loopReview.reveal", "when": "commentController == loopReview", "group": "inline@3" }
+      ],
+      "comments/comment/context": [
+        { "command": "loopReview.saveComment", "when": "commentController == loopReview && comment == editing", "group": "inline@1" },
+        { "command": "loopReview.cancelEdit", "when": "commentController == loopReview && comment == editing", "group": "inline@2" }
+      ],
+      "commandPalette": [
+        { "command": "loopReview.submitComment", "when": "false" },
+        { "command": "loopReview.saveComment", "when": "false" },
+        { "command": "loopReview.cancelEdit", "when": "false" },
+        { "command": "loopReview.cancelDraft", "when": "false" },
+        { "command": "loopReview.editComment", "when": "false" },
+        { "command": "loopReview.deleteComment", "when": "false" },
+        { "command": "loopReview.reveal", "when": "false" },
+        { "command": "loopReview.gotoCode", "when": "false" },
+        { "command": "loopReview.openComparison", "when": "false" }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [{ "id": "loopReview", "title": "Loop Review", "icon": "resources/icon.svg" }]
+    },
+    "views": { "loopReview": [{ "id": "loopReview.tree", "name": "Review Comments" }] },
+    "viewsWelcome": [
+      { "view": "loopReview.tree", "contents": "Add feedback using the comment gutter or [Add Review Comment](command:loopReview.addComment).\nWhen ready, use Copy Comments & Clear and paste into your AI tool.", "when": "!loopReview.hasFeedback" }
+    ],
+    "configuration": {
+      "title": "Loop Review",
+      "properties": {
+        "loopReview.decorationStyle": { "type": "string", "enum": ["badge", "none"], "default": "badge", "description": "Supplement native comment gutters with compact badges." },
+        "loopReview.searchRadius": { "type": "number", "default": 50, "minimum": 0, "maximum": 10000, "description": "Local search radius when relocating comment anchors." }
+      }
+    }
+  }
+}
