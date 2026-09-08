@@ -3,7 +3,7 @@
 ## Working Rules
 
 - Keep user installation, workflow, recovery, privacy, and limitations in `README.md`; keep implementation and contributor guidance here.
-- The reviewer alone manages staging. Do not stage, unstage, stash, or commit project changes. Preserve existing staged and unstaged work. Read-only `git diff HEAD` shows changes that plain `git diff` hides in the index.
+- The reviewer alone manages staging. Do not stage, unstage, or stash project changes. Commit only when the user explicitly requests it, and include only changes already staged by the reviewer; never include unstaged changes or stage files to prepare a commit. Before committing, inspect status, the staged diff, and recent commit history. Preserve existing staged and unstaged work. Read-only `git diff HEAD` shows changes that plain `git diff` hides in the index.
 - Treat pasted review feedback as the task input. Do not read, recreate, migrate, edit, or reply in the project's `REVIEW-NOTES.md`, legacy `COMMENTS.md`, or user-local review archives. Exclude these data files from searches. Recovery belongs to the reviewer.
 - Tests may use synthetic in-memory feedback or disposable fixtures, never the user's review data. If the current task prohibits even fixture review-file/archive reads, skip the extension-host suite and report that limitation.
 - Keep changes focused; add no compatibility layer without a concrete shipped or persisted contract. Existing archive records are such a contract. Do not introduce legacy scratch-file migration.
