@@ -20,8 +20,9 @@ export function scanMarkdown(text: string): { lines: MarkdownLine[]; openFence: 
   let fence: string | undefined;
   for (const match of text.matchAll(/[^\n]*(?:\n|$)/g)) {
     if (!match[0]) { continue; }
-    const value = match[0].replace(/\r?\n$/, '');
-    const start = match.index!;
+    const bomLength = match.index === 0 && match[0].startsWith('\uFEFF') ? 1 : 0;
+    const value = match[0].slice(bomLength).replace(/\r?\n$/, '');
+    const start = match.index! + bomLength;
     const outsideFence = !fence;
     let fenceOpen: string | undefined;
     let fenceClose = false;
@@ -37,7 +38,7 @@ export function scanMarkdown(text: string): { lines: MarkdownLine[]; openFence: 
         fence = fenceOpen = open[1];
       }
     }
-    lines.push({ text: value, start, end: start + value.length, next: start + match[0].length,
+    lines.push({ text: value, start, end: start + value.length, next: match.index! + match[0].length,
       heading: outsideFence && /^##\s/.test(value), outsideFence, fenceOpen, fenceClose });
   }
   return { lines, openFence: !!fence };

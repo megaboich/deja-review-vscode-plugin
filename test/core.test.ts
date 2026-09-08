@@ -28,6 +28,20 @@ test('append round-trips multiline comments and keeps duplicate identities', () 
   assert.equal(parse(edited).comments[1].body, 'Only the second');
 });
 
+test('UTF-8 BOM preserves base recognition and exact comment splice offsets', () => {
+  const withBase = '\uFEFF' + appendComment('', comment(), 'abcdef1');
+  assert.equal(parse(withBase).base, 'abcdef1');
+  assert.equal(parse(withBase).comments.length, 1);
+  const text = '\uFEFF' + appendComment('', comment());
+  const parsed = parse(text).comments[0];
+  assert.equal(parsed.startOffset, 1);
+  const edited = editComment(text, parsed, 'Updated feedback');
+  assert.ok(edited.startsWith('\uFEFF## File:'));
+  assert.equal(parse(edited).comments[0].body, 'Updated feedback');
+  assert.equal(parse(edited).comments[0].anchorText, comment().anchorText);
+  assert.equal(deleteComment(text, parsed), '\uFEFF');
+});
+
 test('longer fences safely contain markdown snippets and nested heading text', () => {
   const snippet = '````md\n## File: `fake`; Lines: 1; Origin: head; Side: document\n```\n~~~~\n````';
   const body = 'Explanation\n\n~~~~~md\n## not a comment\n~~~\n~~~~~\n\nMore prose.';
