@@ -17,6 +17,8 @@ interface GitAPI {
   readonly repositories: readonly Repository[];
   readonly state?: string;
   readonly onDidChangeState?: vscode.Event<string>;
+  readonly onDidOpenRepository?: vscode.Event<Repository>;
+  readonly onDidCloseRepository?: vscode.Event<Repository>;
 }
 
 interface GitExtension {
@@ -65,10 +67,14 @@ function relative(file: vscode.Uri, repo: Repository): string | undefined {
 }
 
 export class GitResources implements vscode.Disposable {
+  private readonly repositoryChanges = new vscode.EventEmitter<void>();
+  readonly onDidChangeRepositories = this.repositoryChanges.event;
+  private readonly subscriptions: vscode.Disposable[] = [];
   private api: GitAPI | undefined;
   private initialization: Promise<void> | undefined;
   private stopWaiting: (() => void) | undefined;
   private disposed = false;
+  private readonly workspaceAdapters = new Map<string, Repository>();
 
   async initialize(): Promise<void> {
     if (this.disposed) { throw new Error('Git resources have been disposed.'); }
@@ -97,6 +103,8 @@ export class GitResources implements vscode.Disposable {
         }
         if (this.disposed) { throw new Error('Git resources have been disposed.'); }
         this.api = api;
+        if (api.onDidOpenRepository) { this.subscriptions.push(api.onDidOpenRepository(() => this.repositoryChanges.fire())); }
+        if (api.onDidCloseRepository) { this.subscriptions.push(api.onDidCloseRepository(() => this.repositoryChanges.fire())); }
       })();
     }
     try { await this.initialization; }
@@ -107,24 +115,42 @@ export class GitResources implements vscode.Disposable {
     return this.disposed ? [] : this.api?.repositories ?? [];
   }
 
-  async repositoryFor(uri?: vscode.Uri, ask = false): Promise<Repository | undefined> {
-    const candidate = uri ?? vscode.window.activeTextEditor?.document.uri;
-    const file = candidate ? source(candidate)?.file : undefined;
+  private containingRepository(file: vscode.Uri): Repository | undefined {
+    return this.repositories.filter(repo => relative(file, repo) !== undefined)
+      .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length)[0];
+  }
+
+  async workspaceRepository(): Promise<Repository | undefined> {
     await this.initialize();
-    const repositories = this.repositories;
-    if (file) {
-      const matches = repositories.filter(repo => relative(file, repo) !== undefined)
-        .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length);
-      if (matches.length) { return matches[0]; }
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!folder || folder.scheme !== 'file') { return undefined; }
+    const repository = this.containingRepository(folder);
+    if (!repository) { return undefined; }
+    const root = repository.rootUri.toString();
+    const key = JSON.stringify([root, folder.toString()]);
+    let adapter = this.workspaceAdapters.get(key);
+    if (!adapter) {
+      // Git can return fresh wrappers. Keep folder identity stable, but metadata live.
+      const actual = (): Repository => this.repositories.find(repo => repo.rootUri.toString() === root) ?? repository;
+      adapter = {
+        rootUri: folder,
+        get state() { return actual().state; },
+        show: (ref, filePath) => actual().show(ref, filePath),
+        getCommit: ref => actual().getCommit(ref),
+      };
+      this.workspaceAdapters.set(key, adapter);
     }
-    // Explicit resources must never be attached to an unrelated repository.
-    if (uri) { return undefined; }
-    if (repositories.length === 1) { return repositories[0]; }
-    if (!ask || !repositories.length) { return undefined; }
-    const selected = await vscode.window.showQuickPick(repositories.map(repo => ({
-      label: path.basename(repo.rootUri.fsPath), description: repo.rootUri.fsPath, repo,
-    })), { placeHolder: 'Choose the repository for review comments', ignoreFocusOut: true });
-    return selected?.repo;
+    return adapter;
+  }
+
+  async repositoryFor(uri?: vscode.Uri): Promise<Repository | undefined> {
+    const file = uri ? source(uri)?.file : undefined;
+    const repo = await this.workspaceRepository();
+    if (!uri) { return repo; }
+    if (!repo || !file || relative(file, repo) === undefined) { return undefined; }
+    const owner = this.containingRepository(file);
+    const actual = this.containingRepository(repo.rootUri);
+    return owner?.rootUri.toString() === actual?.rootUri.toString() ? repo : undefined;
   }
 
   async resource(uri: vscode.Uri, repo: Repository): Promise<Resource | undefined> {
@@ -132,9 +158,9 @@ export class GitResources implements vscode.Disposable {
     if (!value) { return undefined; }
     const filePath = relative(value.file, repo);
     if (!filePath) { return undefined; }
-    const owner = this.repositories.filter(item => relative(value.file, item) !== undefined)
-      .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length)[0];
-    if (owner && owner.rootUri.toString() !== repo.rootUri.toString()) { return undefined; }
+    const owner = this.containingRepository(value.file);
+    const actual = this.containingRepository(repo.rootUri) ?? repo;
+    if (owner && owner.rootUri.toString() !== actual.rootUri.toString()) { return undefined; }
     const resource = normalizeResource({ path: filePath, origin: 'changed' });
     const ref = value.ref;
     if (ref === undefined) { return resource; }
@@ -160,9 +186,9 @@ export class GitResources implements vscode.Disposable {
     const normalized = normalizeResource(resource);
     if (repo.rootUri.scheme !== 'file') { throw new Error('Only local Git repository resources are supported.'); }
     const file = vscode.Uri.joinPath(repo.rootUri, normalized.path);
-    const owner = this.repositories.filter(item => relative(file, item) !== undefined)
-      .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length)[0];
-    if (owner && owner.rootUri.toString() !== repo.rootUri.toString()) {
+    const owner = this.containingRepository(file);
+    const actual = this.containingRepository(repo.rootUri) ?? repo;
+    if (owner && owner.rootUri.toString() !== actual.rootUri.toString()) {
       throw new Error('The resource belongs to a nested repository, not the selected repository.');
     }
     if (normalized.origin === 'changed') { return file; }
@@ -190,5 +216,8 @@ export class GitResources implements vscode.Disposable {
     this.disposed = true;
     this.stopWaiting?.();
     this.api = undefined;
+    this.workspaceAdapters.clear();
+    this.subscriptions.forEach(item => item.dispose());
+    this.repositoryChanges.dispose();
   }
 }

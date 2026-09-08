@@ -2,4 +2,4 @@ node_modules/
 out/
 *.vsix
 .vscode-test/
-COMMENTS.md
+REVIEW-NOTES.md

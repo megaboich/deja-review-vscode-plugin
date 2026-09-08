@@ -37,18 +37,18 @@
     "commands": [
       {
         "command": "dejareview.addComment",
-        "title": "Add Review Comment",
+        "title": "Add Review Note",
         "category": "DejaReview"
       },
       {
         "command": "dejareview.submitComment",
-        "title": "Add Comment",
+        "title": "Add Review Note",
         "category": "DejaReview",
         "enablement": "!commentIsEmpty && !dejareview.copyInProgress"
       },
       {
         "command": "dejareview.editComment",
-        "title": "Edit Comment",
+        "title": "Edit Review Note",
         "icon": "$(edit)",
         "category": "DejaReview"
       },
@@ -64,7 +64,7 @@
       },
       {
         "command": "dejareview.deleteComment",
-        "title": "Delete Comment",
+        "title": "Delete Review Note",
         "icon": "$(trash)",
         "category": "DejaReview"
       },
@@ -75,7 +75,7 @@
       },
       {
         "command": "dejareview.reveal",
-        "title": "Reveal in COMMENTS.md",
+        "title": "Reveal in REVIEW-NOTES.md",
         "icon": "$(go-to-file)",
         "category": "DejaReview"
       },
@@ -92,7 +92,7 @@
       },
       {
         "command": "dejareview.copyForAgent",
-        "title": "Copy Comments & Clear",
+        "title": "Copy Review Notes & Clear",
         "icon": "$(copy)",
         "category": "DejaReview",
         "enablement": "dejareview.hasFeedback && !dejareview.copyInProgress"
@@ -104,14 +104,8 @@
       },
       {
         "command": "dejareview.refresh",
-        "title": "Refresh Comments",
+        "title": "Refresh Review Notes",
         "icon": "$(refresh)",
-        "category": "DejaReview"
-      },
-      {
-        "command": "dejareview.selectRepository",
-        "title": "Select Review Repository",
-        "icon": "$(repo)",
         "category": "DejaReview"
       },
       {
@@ -121,7 +115,7 @@
       },
       {
         "command": "dejareview.suggestGitignore",
-        "title": "Add COMMENTS.md to .gitignore",
+        "title": "Add REVIEW-NOTES.md to .gitignore",
         "category": "DejaReview"
       }
     ],
@@ -144,18 +138,13 @@
       "view/title": [
         {
           "command": "dejareview.copyForAgent",
-          "when": "view == dejareview.tree",
+          "when": "view == dejareview.tree && dejareview.hasFeedback",
           "group": "navigation@1"
         },
         {
           "command": "dejareview.refresh",
           "when": "view == dejareview.tree",
           "group": "navigation@2"
-        },
-        {
-          "command": "dejareview.selectRepository",
-          "when": "view == dejareview.tree",
-          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -281,7 +270,7 @@
         },
         {
           "id": "dejareview.tree",
-          "name": "Review Comments",
+          "name": "Review Notes",
           "initialSize": 3
         }
       ]
@@ -289,7 +278,7 @@
     "viewsWelcome": [
       {
         "view": "dejareview.tree",
-        "contents": "Add feedback using the comment gutter or [Add Review Comment](command:dejareview.addComment).\nWhen ready, use Copy Comments & Clear and paste into your AI tool.",
+        "contents": "Add review notes using the gutter or [Add Review Note](command:dejareview.addComment).\nWhen ready, use Copy Review Notes & Clear and paste into your AI tool.",
         "when": "!dejareview.hasFeedback"
       }
     ],
@@ -303,14 +292,14 @@
             "none"
           ],
           "default": "badge",
-          "description": "Supplement native comment gutters with compact badges."
+          "description": "Supplement native review note gutters with compact badges."
         },
         "dejareview.searchRadius": {
           "type": "number",
           "default": 50,
           "minimum": 0,
           "maximum": 10000,
-          "description": "Local search radius when relocating comment anchors."
+          "description": "Local search radius when relocating review note anchors."
         }
       }
     }

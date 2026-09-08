@@ -7,21 +7,21 @@ function newline(text: string): string {
 
 function checkSnapshot(text: string, comment: ParsedComment): void {
   if (text.slice(comment.startOffset, comment.endOffset) !== comment.rawBlock) {
-    throw new Error('This comment has changed on disk; re-parse before writing');
+    throw new Error('This review note has changed on disk; re-parse before writing');
   }
 }
 
 function checkBody(body: string): void {
   const scanned = scanMarkdown(body);
   if (scanned.openFence || scanned.lines.some(line => line.heading)) {
-    throw new Error('Comment body must have balanced fences and no unfenced ## headings');
+    throw new Error('Review note body must have balanced fences and no unfenced ## headings');
   }
 }
 
 export function appendComment(text: string, input: ReviewComment, base?: string): string {
   const comment = normalizeComment(input);
   if (scanMarkdown(text).openFence) {
-    throw new Error('Cannot append after an unterminated fence; repair COMMENTS.md first');
+    throw new Error('Cannot append after an unterminated fence; repair REVIEW-NOTES.md first');
   }
   checkBody(comment.body);
   const eol = newline(text);

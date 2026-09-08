@@ -69,7 +69,12 @@ test("static shell has nonce-only CSP, accessible full-text copy button and resp
   assert.match(html, /base-uri 'none'; form-action 'none'/);
   assert.equal((html.match(/nonce="test-nonce"/g) || []).length, 2);
   assert.doesNotMatch(html, /https?:|<script[^>]+src=|<link|unsafe-inline|innerHTML|outerHTML|eval\(/i);
-  assert.match(html, /<button id="copy"[^>]+disabled>Copy Comments &amp; Clear<\/button>/);
+  assert.match(html, /<button id="copy"[^>]+hidden disabled>Copy Review Notes &amp; Clear<\/button>/);
+  assert.match(html, /<p id="explanation"[^>]+hidden>/);
+  assert.doesNotMatch(html, /select-repository|<header\b|<h1\b|id="repository"|repoName/);
+  assert.doesNotMatch(html, /choose|select/i);
+  assert.match(html, /<p id="count"[^>]*>0 review notes<\/p>\s*<button id="copy"/);
+  assert.match(html, /<p id="empty" class="muted">Open a local project folder in VS Code to start reviewing\.<\/p>/);
   assert.match(html, /#copy\s*\{[^}]*justify-content: center;[^}]*width: 100%;[^}]*min-height: 48px;/);
   assert.match(html, /white-space: normal/);
   assert.match(html, /overflow-wrap: anywhere/);
@@ -131,7 +136,6 @@ test("provider validates action schema, repository, feedback mode, archive membe
     { type: "copy", repoKey: "/repo", extra: true },
     { type: "copy", repoKey: "/repo", archiveId: "batch" },
     { type: "restore", repoKey: "/repo", archiveId: "batch" },
-    { type: "selectRepository", repoKey: "/old" },
   ]) fixture.send(message);
   assert.equal(actions.length, 0);
   fixture.send({ type: "copy", repoKey: "/repo" });
@@ -151,15 +155,16 @@ test("provider validates action schema, repository, feedback mode, archive membe
   assert.deepEqual(actions[1], { type: "restore", repoKey: "/repo", archiveId: "batch" });
   dashboard.update(state({ busy: true, hasFeedback: false }));
   fixture.send({ type: "restore", repoKey: "/repo", archiveId: "batch" });
-  fixture.send({ type: "selectRepository", repoKey: "/repo" });
   dashboard.update(state({ busy: true }));
   fixture.send({ type: "copy", repoKey: "/repo" });
   assert.equal(actions.length, 2);
   dashboard.update(state({ repoKey: undefined, hasFeedback: false }));
   fixture.send({ type: "restore", archiveId: "batch" });
-  fixture.send({ type: "selectRepository" });
+  fixture.send({ type: "copy" });
+  dashboard.update(state({ repoKey: undefined }));
+  fixture.send({ type: "copy" });
   await settle();
-  assert.deepEqual(actions[2], { type: "selectRepository", repoKey: undefined });
+  assert.equal(actions.length, 2);
   dashboard.dispose();
 });
 
@@ -280,10 +285,13 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   const current = state({ repoName: unsafe, error: unsafe });
   const update = (next: DashboardState) => receive({ data: { type: "state", state: next } });
   update(current);
-  assert.equal(element("repository").textContent, unsafe);
-  assert.equal(element("repository").children.length, 0);
+  assert.equal(elements.has("repository"), false);
+  assert.equal(elements.has("select-repository"), false);
+  assert.equal([...elements.values()].some((node) => node.tagName === "h1"), false);
   assert.equal(element("error").textContent, unsafe);
-  assert.equal(element("count").textContent, "2 comments");
+  assert.equal(element("count").textContent, "2 review notes");
+  assert.equal(element("copy").hidden, false);
+  assert.equal(element("explanation").hidden, false);
   assert.equal(element("copy").disabled, false);
   assert.equal(element("history").hidden, true);
   element("copy").click();
@@ -293,6 +301,8 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   const empty = state({ hasFeedback: false, commentCount: 0 });
   update(empty);
   assert.equal(element("copy").disabled, true);
+  assert.equal(element("copy").hidden, true);
+  assert.equal(element("explanation").hidden, true);
   assert.equal(element("history").hidden, false);
   assert.equal(element("error").hidden, true);
   const row = element("archives").children[0];
@@ -301,6 +311,7 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   assert.equal(date.tagName, "time");
   assert.equal(date.dateTime, new Date(empty.archives[0].createdAt).toISOString());
   assert.equal(date.textContent, new Date(empty.archives[0].createdAt).toLocaleString());
+  assert.equal(row.children[0].children[1].textContent, "3 review notes");
   assert.equal(recover.textContent, "Recover");
   recover.click();
   assert.equal(messages.at(-1)!.type, "restore");
@@ -310,7 +321,14 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   assert.equal(row.children[1], recover);
   assert.equal(recover.disabled, true);
   assert.equal(element("dashboard").attributes.get("aria-busy"), "true");
-  assert.equal(element("select-repository").disabled, true);
+  update(state({ commentCount: 1, busy: true }));
+  assert.equal(element("count").textContent, "1 review note");
+  assert.equal(element("copy").hidden, false);
+  assert.equal(element("copy").disabled, true);
+  update(state({ commentCount: 0, hasFeedback: true }));
+  assert.equal(element("copy").hidden, false, "raw notes must remain exportable without parsed blocks");
+  assert.equal(element("copy").disabled, false);
+  assert.equal(element("explanation").hidden, false);
   update({ ...empty, archives: Array.from({ length: 12 }, (_, index) => ({
     id: unsafe + index, createdAt: "invalid", commentCount: 1,
   })) });
@@ -319,7 +337,11 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   update({ ...empty, repoKey: undefined, repoName: undefined });
   assert.equal(element("archives").children.length, 0);
   assert.equal(element("history").hidden, true);
-  assert.equal(element("repository").textContent, "No repository selected");
-  element("select-repository").click();
-  assert.equal(messages.at(-1)!.type, "selectRepository");
+  assert.equal(element("empty").hidden, false);
+  assert.equal(element("empty").textContent, "Open a local project folder in VS Code to start reviewing.");
+  assert.equal(element("copy").disabled, true);
+  assert.equal(element("copy").hidden, true);
+  assert.equal(element("explanation").hidden, true);
+  element("copy").click();
+  assert.deepEqual(messages.map((message) => message.type), ["ready", "copy", "restore"]);
 });

@@ -61,7 +61,7 @@ export async function testArchives(
       await assert.rejects(() => archives.read(separate.id));
       assert.equal(await other.read(separate.id), 'Other repository feedback');
       await assert.rejects(() => archives.read(randomUUID()));
-      for (const id of ['../COMMENTS.md', '%2e%2e%2fCOMMENTS.md', '', `${records[0].id}\n`]) {
+      for (const id of ['../REVIEW-NOTES.md', '%2e%2e%2fREVIEW-NOTES.md', '', `${records[0].id}\n`]) {
         await assert.rejects(() => archives.read(id), /Invalid review archive ID/);
       }
       await assert.rejects(() => archives.save(' \r\n\t'), /empty review feedback/);

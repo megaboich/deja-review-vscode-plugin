@@ -14,6 +14,7 @@ import { ReviewStore } from '../../src/store';
 import { appendComment, deleteComment, editComment } from '../../src/writer';
 import { testResourceEdges } from './resources';
 import { testArchives } from './archives';
+import { testWorkspaceScope } from './workspace';
 
 // Activation must expose live snapshots; CommentController has no public threads property.
 export interface ReviewTestAPI {
@@ -23,7 +24,7 @@ export interface ReviewTestAPI {
   getThreads(): readonly vscode.CommentThread[];
 }
 
-async function within<T>(label: string, operation: () => PromiseLike<T>, milliseconds = 20_000): Promise<T> {
+export async function within<T>(label: string, operation: () => PromiseLike<T>, milliseconds = 20_000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([operation(), new Promise<never>((_, reject) => {
@@ -34,7 +35,7 @@ async function within<T>(label: string, operation: () => PromiseLike<T>, millise
   }
 }
 
-async function waitFor(label: string, predicate: () => boolean): Promise<void> {
+export async function waitFor(label: string, predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (!predicate()) {
     assert.ok(Date.now() < deadline, `Timed out waiting for ${label}`);
@@ -65,17 +66,23 @@ async function openDiff(original: vscode.Uri, modified: vscode.Uri): Promise<vsc
   return input;
 }
 
-export async function run(): Promise<void> {
+export async function fixtureRoot(): Promise<string> {
   // Refuse manual launches against any workspace other than the runner's disposable fixture.
   const fixture = process.env.DEJAREVIEW_TEST_WORKSPACE;
   assert.ok(fixture, 'Launch this suite through test/runIntegration.ts');
-  const root = await fs.realpath(fixture);
-  assert.equal(path.dirname(path.dirname(root)), await fs.realpath(os.tmpdir()));
-  assert.ok(path.basename(path.dirname(root)).startsWith('lr-'));
-  assert.equal(path.basename(root), 'workspace');
+  const repositoryRoot = await fs.realpath(fixture);
+  assert.equal(path.dirname(path.dirname(repositoryRoot)), await fs.realpath(os.tmpdir()));
+  assert.ok(path.basename(path.dirname(repositoryRoot)).startsWith('lr-'));
+  assert.equal(path.basename(repositoryRoot), 'workspace');
+  const root = process.env.DEJAREVIEW_TEST_SUBFOLDER === '1' ? path.join(repositoryRoot, 'project') : repositoryRoot;
   assert.equal(vscode.workspace.workspaceFolders?.length, 1);
   assert.equal(await fs.realpath(vscode.workspace.workspaceFolders![0].uri.fsPath), root);
+  await vscode.workspace.getConfiguration('git').update('openRepositoryInParentFolders', 'always', vscode.ConfigurationTarget.Global);
+  return root;
+}
 
+export async function run(): Promise<void> {
+  const root = await fixtureRoot();
   const git = new GitResources();
   let store: ReviewStore | undefined;
   const test = async (name: string, operation: () => Promise<void>): Promise<void> => {
@@ -107,6 +114,9 @@ export async function run(): Promise<void> {
     const working = git.uri({ path: 'sample.ts', origin: 'changed' }, repo);
     const other = git.uri({ path: 'other.ts', origin: 'changed' }, repo);
     const captured: { uri: vscode.Uri; comment: ReviewComment }[] = [];
+
+    await test('review scope and notes belong to the first workspace folder', () =>
+      testWorkspaceScope(git, repo.rootUri, api, reviewStore));
 
     await test('real HEAD, index, and working-tree resources and documents', async () => {
       for (const [origin, version] of [['head', 'head'], ['staged', 'staged'], ['changed', 'working']] as const) {

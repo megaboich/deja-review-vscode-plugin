@@ -6,8 +6,8 @@ out/test/**
 out/**/*.map
 node_modules/**
 tsconfig.json
-SPECIFICATION.md
-COMMENTS.md
+AGENTS.md
+REVIEW-NOTES.md
 .gitignore
 package-lock.json
 *.vsix

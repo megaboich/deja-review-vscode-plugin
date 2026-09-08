@@ -7,7 +7,7 @@ export function renderDashboard(nonce: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none';">
-  <title>Review Dashboard</title>
+  <title>Review Notes</title>
   <style nonce="${nonce}">
     * { box-sizing: border-box; }
     body {
@@ -20,9 +20,7 @@ export function renderDashboard(nonce: string): string {
       overflow-wrap: anywhere;
     }
     [hidden] { display: none !important; }
-    main, header, section { min-width: 0; }
-    header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-    h1 { flex: 1 1 120px; font-size: 1em; margin: 0; }
+    main, section { min-width: 0; }
     h2 { font-size: 1em; margin: 16px 0 8px; }
     p { line-height: 1.5; margin: 8px 0; }
     .muted { color: var(--vscode-descriptionForeground); }
@@ -79,20 +77,16 @@ export function renderDashboard(nonce: string): string {
 </head>
 <body>
   <main id="dashboard" aria-busy="false">
-    <header>
-      <h1 id="repository">No repository selected</h1>
-      <button id="select-repository" type="button" disabled>Select Repository</button>
-    </header>
-    <p id="count" role="status" aria-live="polite">0 comments</p>
-    <button id="copy" type="button" aria-describedby="explanation" disabled>Copy Comments &amp; Clear</button>
-    <p id="explanation" class="muted">Copies your feedback to the clipboard, archives this batch, and clears the current comments.</p>
-    <p id="empty" class="muted">Select a repository to review its comments.</p>
+    <p id="count" role="status" aria-live="polite">0 review notes</p>
+    <button id="copy" type="button" aria-describedby="explanation" hidden disabled>Copy Review Notes &amp; Clear</button>
+    <p id="explanation" class="muted" hidden>Copies your review notes to the clipboard, archives this batch, and clears the current review notes.</p>
+    <p id="empty" class="muted">Open a local project folder in VS Code to start reviewing.</p>
     <p id="error" role="alert" hidden></p>
     <section id="history" aria-labelledby="history-title" hidden>
       <h2 id="history-title">Recent Archives</h2>
-      <p class="muted">Recover a batch to make its comments active again.</p>
+      <p class="muted">Recover a batch to make its review notes active again.</p>
       <p id="no-archives" class="muted">No archived batches yet.</p>
-      <ul id="archives" aria-label="Archived feedback batches"></ul>
+      <ul id="archives" aria-label="Archived review note batches"></ul>
     </section>
   </main>
   <script nonce="${nonce}">
@@ -100,12 +94,11 @@ export function renderDashboard(nonce: string): string {
       const vscode = acquireVsCodeApi();
       const byId = (id) => document.getElementById(id);
       const copy = byId('copy');
-      const select = byId('select-repository');
       const list = byId('archives');
       const rows = new Map();
       let state;
       let renderedRepoKey;
-      const countLabel = (count) => count + (count === 1 ? ' comment' : ' comments');
+      const countLabel = (count) => count + (count === 1 ? ' review note' : ' review notes');
       const send = (type, archiveId) => {
         if (!state || state.busy) return;
         vscode.postMessage({ type, repoKey: state.repoKey, ...(archiveId === undefined ? {} : { archiveId }) });
@@ -113,19 +106,18 @@ export function renderDashboard(nonce: string): string {
       copy.addEventListener('click', () => {
         if (state && state.repoKey && state.hasFeedback) send('copy');
       });
-      select.addEventListener('click', () => send('selectRepository'));
       window.addEventListener('message', (event) => {
         if (!event.data || event.data.type !== 'state') return;
         state = event.data.state;
         byId('dashboard').setAttribute('aria-busy', String(state.busy));
-        byId('repository').textContent = state.repoName || state.repoKey || 'No repository selected';
         byId('count').textContent = countLabel(state.commentCount);
+        copy.hidden = !state.repoKey || !state.hasFeedback;
+        byId('explanation').hidden = copy.hidden;
         copy.disabled = state.busy || !state.repoKey || !state.hasFeedback;
-        select.disabled = state.busy;
         byId('empty').hidden = state.hasFeedback;
         byId('empty').textContent = state.repoKey
-          ? 'No current feedback. Add comments in the editor or recover an archived batch.'
-          : 'Select a repository to review its comments.';
+          ? 'No current review notes. Add review notes in the editor or recover an archived batch.'
+          : 'Open a local project folder in VS Code to start reviewing.';
         byId('error').textContent = state.error || '';
         byId('error').hidden = !state.error;
         byId('history').hidden = state.hasFeedback || !state.repoKey;

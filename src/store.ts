@@ -22,8 +22,8 @@ export class ReviewStore implements vscode.Disposable {
   private disposed = false;
 
   constructor(repo: Repository, public readonly archives: ReviewArchives) {
-    this.uri = vscode.Uri.joinPath(repo.rootUri, 'COMMENTS.md');
-    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repo.rootUri, 'COMMENTS.md'));
+    this.uri = vscode.Uri.joinPath(repo.rootUri, 'REVIEW-NOTES.md');
+    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repo.rootUri, 'REVIEW-NOTES.md'));
     this.subscriptions = [watcher,
       watcher.onDidCreate(() => this.scheduleChange()),
       watcher.onDidChange(() => this.scheduleChange()),
@@ -57,10 +57,10 @@ export class ReviewStore implements vscode.Disposable {
     }
     this.assertActive();
     if (stat.type & vscode.FileType.SymbolicLink) {
-      throw new Error('Refusing to access COMMENTS.md because it is a symbolic link.');
+      throw new Error('Refusing to access REVIEW-NOTES.md because it is a symbolic link.');
     }
     if (!(stat.type & vscode.FileType.File)) {
-      throw new Error('COMMENTS.md is not a regular file.');
+      throw new Error('REVIEW-NOTES.md is not a regular file.');
     }
     return true;
   }
@@ -88,7 +88,7 @@ export class ReviewStore implements vscode.Disposable {
     this.assertActive();
     while (this.dirtyDocuments().length) {
       const choice = await vscode.window.showWarningMessage(
-        'COMMENTS.md has unsaved changes. Save it before continuing.',
+        'REVIEW-NOTES.md has unsaved changes. Save it before continuing.',
         { modal: true }, 'Save and retry', 'Cancel');
       this.assertActive();
       if (choice !== 'Save and retry') { return false; }
@@ -125,12 +125,12 @@ export class ReviewStore implements vscode.Disposable {
         const current = await this.read();
         if (this.dirtyDocuments().length) { continue; }
         if (current !== snapshot) {
-          throw new Error('COMMENTS.md changed on disk; retry the operation.');
+          throw new Error('REVIEW-NOTES.md changed on disk; retry the operation.');
         }
         const exists = await this.stat();
         if (this.dirtyDocuments().length) { continue; }
         if (exists !== (snapshot !== undefined)) {
-          throw new Error('COMMENTS.md was created or deleted on disk; retry the operation.');
+          throw new Error('REVIEW-NOTES.md was created or deleted on disk; retry the operation.');
         }
         // workspace.fs has no atomic compare-and-write; external filesystem races remain possible.
         await vscode.workspace.fs.writeFile(this.uri, new TextEncoder().encode(next));
@@ -146,7 +146,7 @@ export class ReviewStore implements vscode.Disposable {
       const assertClean = (): void => {
         this.assertActive();
         if (this.dirtyDocuments().length) {
-          throw new Error('COMMENTS.md has unsaved changes; save or discard them before recovering an archive.');
+          throw new Error('REVIEW-NOTES.md has unsaved changes; save or discard them before recovering an archive.');
         }
       };
       assertClean();
@@ -172,8 +172,8 @@ export class ReviewStore implements vscode.Disposable {
     return this.serialize(async () => {
       if (!await this.ensureSaved()) { return { status: 'cancelled', clipboardCopied: false }; }
       let clipboardCopied = false;
-      const dirtyBeforeDelete = new Error('COMMENTS.md has unsaved changes; retry the handoff.');
-      const changedBeforeDelete = new Error('COMMENTS.md changed on disk; retry the handoff.');
+      const dirtyBeforeDelete = new Error('REVIEW-NOTES.md has unsaved changes; retry the handoff.');
+      const changedBeforeDelete = new Error('REVIEW-NOTES.md changed on disk; retry the handoff.');
       const result = await copyAndClear({
         read: () => this.read(),
         isDirty: () => this.dirtyDocuments().length > 0,

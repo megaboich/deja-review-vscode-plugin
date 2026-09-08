@@ -1,6 +1,6 @@
-export const HANDOFF_INSTRUCTION = "Review feedback follows. Address the comments using the included file paths and captured code snippets as context; line numbers and snippets may be stale. Side: left refers to Original, Side: right to Modified, and Side: document to a regular editor. Each comparison records both resources; lines and snippets belong to the selected side, not necessarily the current working-tree file. Staging remains under the human's control. This feedback was copied from a completed review pass; do not read, recreate, or reply in COMMENTS.md. Summarize your changes in this conversation.";
+export const HANDOFF_INSTRUCTION = "Address the review feedback below using the file paths, captured snippets, and Original/Modified comparison context. Paths are relative to the opened project folder; locations and snippets may be stale. All explicitly approved changes are already staged. Never stage or unstage anything; only the reviewer manages staging. Summarize your changes in this conversation.";
 
-/** Bound to the selected repository's saved COMMENTS.md and its editor buffer. */
+/** Bound to the selected repository's saved REVIEW-NOTES.md and its editor buffer. */
 export interface HandoffPort {
   /** Return undefined only when the file is absent; reject other read failures. */
   read(): Promise<string | undefined>;

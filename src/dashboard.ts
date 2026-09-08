@@ -23,7 +23,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
   private handlingAction = false;
 
   constructor(private readonly onAction: (action: {
-    type: "copy" | "restore" | "selectRepository";
+    type: "copy" | "restore";
     repoKey?: string;
     archiveId?: string;
   }) => void | Promise<void>) {}
@@ -79,7 +79,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
       return;
     }
     if (!this.ready || this.state.busy || this.handlingAction) return;
-    if (data.type !== "copy" && data.type !== "restore" && data.type !== "selectRepository") return;
+    if (data.type !== "copy" && data.type !== "restore") return;
     if (keys.some((key) => !["type", "repoKey", "archiveId"].includes(key))) return;
     if (data.repoKey !== undefined && (typeof data.repoKey !== "string" || !data.repoKey)) return;
     if (data.repoKey !== this.state.repoKey) return;
@@ -88,7 +88,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
         || !this.state.archives.some((archive) => archive.id === data.archiveId)) return;
     } else {
       if ("archiveId" in data) return;
-      if (data.type === "copy" && (!this.state.repoKey || !this.state.hasFeedback)) return;
+      if (!this.state.repoKey || !this.state.hasFeedback) return;
     }
 
     this.handlingAction = true;

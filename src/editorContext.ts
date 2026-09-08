@@ -56,7 +56,7 @@ export async function captureContext(
 
   try {
     if (uri.scheme !== 'file' && uri.scheme !== 'git') {
-      throw new Error('Review comments support only file and Git text documents inside a repository.');
+      throw new Error('Review notes support only file and Git text documents inside a repository.');
     }
     if (input !== undefined && !(input instanceof vscode.TabInputText) && !(input instanceof vscode.TabInputTextDiff)
       && !forcePrompt) {
@@ -104,7 +104,7 @@ export async function captureContext(
         }
       }
       choice = await vscode.window.showQuickPick(choices, {
-        title: 'Confirm review comment context',
+        title: 'Confirm review note context',
         placeHolder: 'Choose the original capture context; the current tab is not assumed to be the source',
         ignoreFocusOut: true, matchOnDescription: true, matchOnDetail: true,
       });
@@ -125,13 +125,13 @@ export async function captureContext(
       if (!left || !right) { throw new Error('This comparison contains an unsupported resource. Only file and Git text documents are supported.'); }
       comparison = { left, right };
       if (original.toString() === modified.toString()) {
-        void vscode.window.showInformationMessage('Both comparison sides use the same URI. The chosen capture side is preserved, but VS Code may display the comment on both sides.');
+        void vscode.window.showInformationMessage('Both comparison sides use the same URI. The chosen capture side is preserved, but VS Code may display the review note on both sides.');
       }
     }
     return { repo, uri, comment: normalizeComment({ ...resource, startLine: start + 1, endLine: end + 1,
       side: choice.side, comparison, anchorText, body: '' }) };
   } catch (error) {
-    await vscode.window.showWarningMessage(`Cannot capture review comment: ${error instanceof Error ? error.message : String(error)}`);
+    await vscode.window.showWarningMessage(`Cannot capture review note: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
   }
 }

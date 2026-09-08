@@ -9,22 +9,25 @@ async function main(): Promise<void> {
   const vscodeExecutablePath = process.env.VSCODE_EXECUTABLE_PATH ?? '/Applications/Visual Studio Code.app/Contents/MacOS/Code';
   const extensionDevelopmentPath = path.resolve(__dirname, '../..');
   const extensionTestsPath = path.resolve(__dirname, 'integration/index.js');
+  const workspaceTestsPath = path.resolve(__dirname, 'integration/workspace.js');
   await fs.access(vscodeExecutablePath);
   await fs.access(path.join(extensionDevelopmentPath, 'out/src/extension.js'));
   await fs.access(extensionTestsPath);
+  await fs.access(workspaceTestsPath);
 
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'lr-'));
   try {
     // realpath avoids /var versus /private/var URI mismatches on macOS.
     const root = await fs.realpath(temporary);
     const workspace = path.join(root, 'workspace');
+    const project = path.join(workspace, 'project');
     const userData = path.join(root, 'u');
     const extensions = path.join(root, 'extensions');
-    await Promise.all([workspace, extensions, path.join(userData, 'User')].map(dir => fs.mkdir(dir, { recursive: true })));
+    await Promise.all([project, extensions, path.join(userData, 'User')].map(dir => fs.mkdir(dir, { recursive: true })));
     await fs.writeFile(path.join(userData, 'User/settings.json'), JSON.stringify({
       'git.enabled': true,
       'git.autoRepositoryDetection': true,
-      'git.openRepositoryInParentFolders': 'never',
+      'git.openRepositoryInParentFolders': 'always',
       'git.autofetch': false,
       'extensions.autoCheckUpdates': false,
       'extensions.autoUpdate': false,
@@ -40,6 +43,7 @@ async function main(): Promise<void> {
     const env = { ...process.env };
     const extensionTestsEnv: Record<string, string | undefined> = {
       DEJAREVIEW_TEST_WORKSPACE: workspace,
+      DEJAREVIEW_TEST_SUBFOLDER: undefined,
       ELECTRON_RUN_AS_NODE: undefined,
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: os.devNull,
@@ -58,7 +62,9 @@ async function main(): Promise<void> {
     const sample = path.join(workspace, 'sample.ts');
     await fs.writeFile(sample, "export const version = 'head';\nexport const stable = true;\n");
     await fs.writeFile(path.join(workspace, 'other.ts'), 'export const alternate = true;\n');
-    await git('add', '--', 'sample.ts', 'other.ts');
+    await fs.copyFile(sample, path.join(project, 'sample.ts'));
+    await fs.copyFile(path.join(workspace, 'other.ts'), path.join(project, 'other.ts'));
+    await git('add', '--', 'sample.ts', 'other.ts', 'project/sample.ts', 'project/other.ts');
     await git('-c', 'user.name=DejaReview Integration', '-c', 'user.email=integration@example.invalid',
       '-c', 'commit.gpgsign=false', '-c', `core.hooksPath=${os.devNull}`, 'commit', '-m', 'Initial fixture');
     await fs.writeFile(sample, "export const version = 'staged';\nexport const stable = true;\n");
@@ -72,6 +78,14 @@ async function main(): Promise<void> {
       extensionTestsPath,
       extensionTestsEnv,
       launchArgs: [workspace, '--new-window', `--user-data-dir=${userData}`, `--extensions-dir=${extensions}`,
+        '--disable-extensions', '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes'],
+    });
+    await runTests({
+      vscodeExecutablePath,
+      extensionDevelopmentPath,
+      extensionTestsPath: workspaceTestsPath,
+      extensionTestsEnv: { ...extensionTestsEnv, DEJAREVIEW_TEST_SUBFOLDER: '1' },
+      launchArgs: [project, '--new-window', `--user-data-dir=${userData}`, `--extensions-dir=${extensions}`,
         '--disable-extensions', '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes'],
     });
   } finally {
