@@ -11,11 +11,13 @@ function fixture(initial: string | undefined = "Review notes") {
     saved: string | undefined;
     dirty: boolean;
     clipboard: string;
+    archives: string[];
     events: string[];
   } = {
     saved: initial,
     dirty: false,
     clipboard: "previous clipboard",
+    archives: [],
     events: [],
   };
   const port: HandoffPort = {
@@ -31,8 +33,13 @@ function fixture(initial: string | undefined = "Review notes") {
       state.events.push("copy");
       state.clipboard = text;
     },
-    async remove() {
+    async archive(snapshot) {
+      state.events.push("archive");
+      state.archives.push(snapshot);
+    },
+    async remove(snapshot) {
       state.events.push("remove");
+      assert.equal(snapshot, state.saved);
       state.saved = undefined;
     },
   };
@@ -49,7 +56,7 @@ test("exports the exact self-contained specification instruction", () => {
   assert.equal(HANDOFF_INSTRUCTION, "Review feedback follows. Address the comments using the included file paths and captured code snippets as context; line numbers and snippets may be stale. Side: left refers to Original, Side: right to Modified, and Side: document to a regular editor. Each comparison records both resources; lines and snippets belong to the selected side, not necessarily the current working-tree file. Staging remains under the human's control. This feedback was copied from a completed review pass; do not read, recreate, or reply in COMMENTS.md. Summarize your changes in this conversation.");
 });
 
-test("awaits clipboard success before rereading and deleting the exact snapshot", async () => {
+test("awaits clipboard and durable archive success before rereading and deleting the exact snapshot", async () => {
   const snapshot = "\uFEFF# Review\r\n\r\n"
     + "## File: `old.ts`; Lines: 2-3; Origin: head; Side: left\r\n"
     + "```ts\r\n  oldCode();  \r\n```\r\n"
@@ -62,6 +69,8 @@ test("awaits clipboard success before rereading and deleting the exact snapshot"
   const { state, port } = fixture(snapshot);
   const started = deferred();
   const finish = deferred();
+  const archiveStarted = deferred();
+  const archiveFinish = deferred();
   port.copy = async (text) => {
     state.events.push("copy:start");
     started.resolve();
@@ -69,19 +78,35 @@ test("awaits clipboard success before rereading and deleting the exact snapshot"
     state.clipboard = text;
     state.events.push("copy:done");
   };
+  port.archive = async (text) => {
+    state.events.push("archive:start");
+    archiveStarted.resolve();
+    await archiveFinish.promise;
+    state.archives.push(text);
+    state.events.push("archive:done");
+  };
 
   const result = copyAndClear(port);
   await started.promise;
   assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy:start"]);
   assert.equal(state.saved, snapshot);
   assert.equal(state.clipboard, "previous clipboard");
+  assert.deepEqual(state.archives, []);
   finish.resolve();
+  await archiveStarted.promise;
+  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy:start", "copy:done", "archive:start"]);
+  assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\n${snapshot}`);
+  assert.equal(state.saved, snapshot);
+  assert.deepEqual(state.archives, []);
+  archiveFinish.resolve();
 
   assert.deepEqual(await result, { status: "copied" });
   assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\n${snapshot}`);
   assert.equal(state.saved, undefined);
+  assert.deepEqual(state.archives, [snapshot]);
   assert.deepEqual(state.events, [
     "dirty", "read", "dirty", "copy:start", "copy:done",
+    "archive:start", "archive:done",
     "dirty", "read", "dirty", "remove",
   ]);
 });
@@ -96,6 +121,7 @@ for (const snapshot of [
     assert.deepEqual(await copyAndClear(port), { status: "copied" });
     assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\n${snapshot}`);
     assert.equal(state.saved, undefined);
+    assert.deepEqual(state.archives, [snapshot]);
   });
 }
 
@@ -106,6 +132,7 @@ for (const snapshot of [undefined, "", " \t\r\n\n", "\uFEFF\u00A0"]) {
     assert.deepEqual(await copyAndClear(port), { status: "empty" });
     assert.equal(state.saved, snapshot);
     assert.equal(state.clipboard, "previous clipboard");
+    assert.deepEqual(state.archives, []);
     assert.deepEqual(state.events, ["dirty", "read", "dirty"]);
   });
 }
@@ -133,7 +160,7 @@ test("a buffer becoming dirty during the initial read prevents copying", async (
   assert.deepEqual(state.events, ["dirty", "read", "dirty"]);
 });
 
-test("a buffer becoming dirty during copying prevents even the second read", async () => {
+test("a buffer becoming dirty during copying still archives but prevents even the second read", async () => {
   const { state, port } = fixture();
   const copy = port.copy;
   port.copy = async (text) => {
@@ -143,7 +170,8 @@ test("a buffer becoming dirty during copying prevents even the second read", asy
   assert.deepEqual(await copyAndClear(port), { status: "dirty" });
   assert.equal(state.saved, "Review notes");
   assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
-  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "dirty"]);
+  assert.deepEqual(state.archives, ["Review notes"]);
+  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "archive", "dirty"]);
 });
 
 for (const saved of ["Review notes", undefined]) {
@@ -163,7 +191,8 @@ for (const saved of ["Review notes", undefined]) {
     assert.deepEqual(await copyAndClear(port), { status: "dirty" });
     assert.equal(state.saved, saved);
     assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
-    assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "dirty", "read", "dirty"]);
+    assert.deepEqual(state.archives, ["Review notes"]);
+    assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "archive", "dirty", "read", "dirty"]);
   });
 }
 
@@ -179,6 +208,7 @@ for (const newer of ["New saved feedback", "Review notes\n", "", " \n"]) {
     assert.equal(state.saved, newer);
     assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
     assert.equal(state.events.includes("remove"), false);
+    assert.deepEqual(state.archives, ["Review notes"]);
   });
 }
 
@@ -192,6 +222,8 @@ test("external deletion after copying returns copied without removing again", as
   assert.deepEqual(await copyAndClear(port), { status: "copied" });
   assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
   assert.equal(state.events.includes("remove"), false);
+  assert.deepEqual(state.archives, ["Review notes"]);
+  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "archive", "dirty", "read", "dirty"]);
 });
 
 test("clipboard rejection retains the file without rereading or deleting", async () => {
@@ -205,6 +237,79 @@ test("clipboard rejection retains the file without rereading or deleting", async
   assert.equal(state.saved, "Review notes");
   assert.equal(state.clipboard, "previous clipboard");
   assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy"]);
+  assert.deepEqual(state.archives, []);
+});
+
+test("archive rejection retains the file and copied clipboard without rereading or deleting", async () => {
+  const { state, port } = fixture();
+  const error = new Error("archive unavailable");
+  port.archive = async (snapshot) => {
+    state.events.push("archive");
+    assert.equal(snapshot, "Review notes");
+    throw error;
+  };
+  assert.deepEqual(await copyAndClear(port), { status: "archiveFailed", error });
+  assert.equal(state.saved, "Review notes");
+  assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
+  assert.deepEqual(state.archives, []);
+  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "archive"]);
+});
+
+test("external deletion cannot report copied when archiving fails", async () => {
+  const { state, port } = fixture();
+  const error = new Error("archive rename failed");
+  port.archive = async () => {
+    state.saved = undefined;
+    throw error;
+  };
+  assert.deepEqual(await copyAndClear(port), { status: "archiveFailed", error });
+  assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
+  assert.deepEqual(state.archives, []);
+  assert.equal(state.events.includes("remove"), false);
+});
+
+for (const newer of ["New feedback", "", " \n", undefined]) {
+  test(`changes during archiving preserve live content: ${JSON.stringify(newer)}`, async () => {
+    const { state, port } = fixture();
+    const started = deferred();
+    const finish = deferred();
+    const archive = port.archive;
+    port.archive = async (snapshot) => {
+      started.resolve();
+      await finish.promise;
+      await archive(snapshot);
+    };
+    const result = copyAndClear(port);
+    await started.promise;
+    state.saved = newer;
+    finish.resolve();
+    assert.deepEqual(await result, { status: newer === undefined ? "copied" : "changed" });
+    assert.equal(state.saved, newer);
+    assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
+    assert.deepEqual(state.archives, ["Review notes"]);
+    assert.equal(state.events.includes("remove"), false);
+  });
+}
+
+test("a buffer becoming dirty during archiving retains the file and recoverable snapshot", async () => {
+  const { state, port } = fixture();
+  const started = deferred();
+  const finish = deferred();
+  const archive = port.archive;
+  port.archive = async (snapshot) => {
+    started.resolve();
+    await finish.promise;
+    await archive(snapshot);
+  };
+  const result = copyAndClear(port);
+  await started.promise;
+  state.dirty = true;
+  finish.resolve();
+  assert.deepEqual(await result, { status: "dirty" });
+  assert.equal(state.saved, "Review notes");
+  assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
+  assert.deepEqual(state.archives, ["Review notes"]);
+  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "archive", "dirty"]);
 });
 
 for (const failureOnRead of [1, 2]) {
@@ -224,6 +329,7 @@ for (const failureOnRead of [1, 2]) {
     assert.equal(state.clipboard, failureOnRead === 1
       ? "previous clipboard" : `${HANDOFF_INSTRUCTION}\n\nReview notes`);
     assert.equal(state.events.includes("remove"), false);
+    assert.deepEqual(state.archives, failureOnRead === 1 ? [] : ["Review notes"]);
   });
 }
 
@@ -237,5 +343,6 @@ test("deletion failure reports partial success and leaves the copied snapshot in
   assert.deepEqual(await copyAndClear(port), { status: "deleteFailed", error });
   assert.equal(state.saved, "Review notes");
   assert.equal(state.clipboard, `${HANDOFF_INSTRUCTION}\n\nReview notes`);
-  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "dirty", "read", "dirty", "remove"]);
+  assert.deepEqual(state.archives, ["Review notes"]);
+  assert.deepEqual(state.events, ["dirty", "read", "dirty", "copy", "archive", "dirty", "read", "dirty", "remove"]);
 });

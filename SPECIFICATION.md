@@ -1,10 +1,12 @@
-# Simple Loop-Review Comments — Specification
+# DejaReview — Specification
 
-**Extension ID:** `simple-loop-review`
-**Display name:** Simple loop-review comments
-**Command prefix:** `loopReview.`
+**Extension ID:** `local-review.dejareview`
+**Display name:** DejaReview
+**Command prefix:** `dejareview.`
 **Target:** vanilla VS Code (no dependency on Copilot, Windsurf, or any bundled AI feature)
 **Language:** TypeScript
+
+The package name is `dejareview`; the v0.1 installation artifact is `dejareview-0.1.0.vsix`. Changing the extension ID does not automatically update an existing `local-review.simple-loop-review` installation. If both are installed, disable or uninstall the previous extension to avoid duplicate review providers.
 
 ---
 
@@ -19,15 +21,15 @@ The workflow this supports:
 3. Hunks that are good get **staged** — staging is the accept signal.
 4. Hunks that need work get a **comment** anchored to the code.
 5. Comments land in `COMMENTS.md` at the repo root.
-6. Human clicks **Copy Comments & Clear** in the extension UI. Saved feedback, including captured code context, goes to the clipboard; after a successful copy and snapshot checks, `COMMENTS.md` is deleted. Unsubmitted input is not exported (§8 Input UI).
+6. Human clicks **Copy Comments & Clear** in the dashboard. Saved feedback, including captured code context, goes to the clipboard, then into a persistent local batch archive; only after archive success and snapshot/dirty-buffer checks is `COMMENTS.md` deleted. Unsubmitted input is not exported (§8 Input UI).
 7. Human pastes the feedback into their AI tool. The agent addresses it; it does not read or reply in `COMMENTS.md`.
 8. Repeat from 2. Adding the first comment of the next pass creates a fresh `COMMENTS.md`.
 
 ### Design principles
 
-- **`COMMENTS.md` is the single source of truth for the current review pass.** The extension holds no authoritative state. Every read is a full re-parse of the file. The file is a scratch buffer, not a conversation history.
+- **Root `COMMENTS.md` is the single source of truth for the current review pass.** Current UI state is a projection of a full re-parse of that file, not an archive. Recoverable batch archives are separate snapshots and never become current feedback until explicitly restored. The file is a scratch buffer, not a conversation history.
 - **Staging stays in VS Code's SCM UI.** The human stages accepted changes; the extension neither stages code nor tracks acceptance or review completion.
-- **Clipboard handoff is explicit and self-contained.** The human chooses when a pass is ready. Copy the feedback with paths, ranges, origins, and captured snippets before deleting the scratch file.
+- **Clipboard handoff is explicit and self-contained.** The human chooses when a pass is ready. Copy the feedback with paths, ranges, origins, and captured snippets, then archive the exact raw snapshot before clearing the scratch file.
 - **The file must stay hand-editable.** Editing `COMMENTS.md` in the editor is a first-class input path, equal to using the UI.
 - **Markdown must stay readable as markdown.** No HTML comments, no hidden metadata, nothing that looks like noise in a rendered preview.
 - **Anchor by content, not by line number.** Line numbers are a hint; the code snippet is the anchor.
@@ -36,11 +38,11 @@ The workflow this supports:
 
 ### Non-goals
 
-- No revert / discard / restore actions. VS Code's built-in SCM view already does this and it is explicitly not wanted here.
+- No source-code revert / discard / restore actions. VS Code's built-in SCM view already does this. Restoring an archived feedback batch to `COMMENTS.md` is supported; it never changes code or the index.
 - No LLM calls, no API keys, no model configuration. The extension never talks to an AI service.
 - No GitHub/GitLab/PR integration. Local repository resources only.
 - No MCP server, no IPC, no background daemon. The human pastes clipboard feedback into any AI tool.
-- No agent replies in the file, threaded conversations, resolved states, or review history.
+- No agent replies in the file, threaded conversations, resolved states, or conversation history. Recoverable feedback batches are supported, not an agent conversation log.
 - No hunk inventory, unreviewed counters, stale-acceptance detection, or automatic completion inference.
 
 ---
@@ -55,7 +57,8 @@ The workflow this supports:
 | **Side** | Capture location: `document` for a regular editor, `left` for Original, or `right` for Modified in a comparison. Not an acceptance state. |
 | **Stale comment** | A comment whose anchor snippet can no longer be found in its origin blob. |
 | **Review pass** | Comments collected since the previous successful copy-and-clear handoff. |
-| **Copy and clear** | Copy the current review feedback with context to the clipboard, then delete that repo's `COMMENTS.md`. |
+| **Copy and clear** | Copy current feedback with context to the clipboard, archive its exact raw snapshot, then guardedly delete that repo's `COMMENTS.md`. |
+| **Archive** | A user-local, repository-scoped batch snapshot with raw text, creation/copy date, and parsed comment count; not current feedback until restored. |
 
 ---
 
@@ -63,9 +66,9 @@ The workflow this supports:
 
 ### 3.1 Location
 
-Repo root, next to `.git` (a directory or worktree metadata file). Not configurable in v1. Create the file lazily on the first comment; do not create an empty file on activation or recreate it after copy-and-clear until the user adds another comment.
+Repo root, next to `.git` (a directory or worktree metadata file). Not configurable in v1. Create the file lazily on the first comment or explicit archive recovery; do not create an empty file on activation or automatically recreate it after copy-and-clear.
 
-Recommended `.gitignore` entry — this is scratch review state, not history. The extension does **not** write to `.gitignore` automatically; it offers a one-time prompt (see §8, `loopReview.suggestGitignore`).
+Recommended `.gitignore` entry — this is scratch review state, not history. The extension does **not** write to `.gitignore` automatically; it offers a one-time prompt (see §8, `dejareview.suggestGitignore`).
 
 ### 3.2 Structure
 
@@ -161,7 +164,7 @@ One SHA for the whole file, not per comment — a staleness check is then a sing
 
 Comments remain in `COMMENTS.md` across editor reloads and restarts until the human edits/deletes them or runs **Copy Comments & Clear**. Staging code never deletes a comment.
 
-Copy-and-clear ends the pass by deleting the file after clipboard success (§8.1). Agent responses live in the AI tool, not in the file. Blockquotes are ordinary body content with no special state or UI treatment.
+Copy-and-clear ends the pass by deleting the file only after clipboard and archive success (§8.1). The archived batch persists across reloads and restarts and can be explicitly recovered (§8.2); clearing is not permanent deletion of that feedback. Agent responses live in the AI tool, not in the file. Blockquotes are ordinary body content with no special state or UI treatment.
 
 ### 3.7 Parse rules and gotchas
 
@@ -221,7 +224,7 @@ Explicit comment deletion and copy-and-clear apply to stale comments too.
 
 ### 4.4 Line-number rewriting
 
-The extension rewrites `Lines:` in the file **only** when the user explicitly runs `loopReview.reanchorAll`. Automatic rewriting on every drift would cause constant `COMMENTS.md` churn and fight the sync loop. In-memory resolved positions are used for all UI.
+The extension rewrites `Lines:` in the file **only** when the user explicitly runs `dejareview.reanchorAll`. Automatic rewriting on every drift would cause constant `COMMENTS.md` churn and fight the sync loop. In-memory resolved positions are used for all UI.
 
 ---
 
@@ -240,7 +243,7 @@ The native comment API provides the gutter/input UI but not persistence. Contrib
 ### 5.2 Trigger — keybinding and menus
 
 - Keybinding: `ctrl+alt+m` / `cmd+alt+m`, `when: "editorTextFocus"`. Comment on the selection, or current line if none.
-- `editor/context` menu item **Add Review Comment**, group `loopReview`, in regular and diff text editors, including read-only panes. Do not require `!editorReadonly`.
+- `editor/context` menu item **Add Review Comment**, group `dejareview`, in regular and diff text editors, including read-only panes. Do not require `!editorReadonly`.
 - Command palette: **Add Review Comment**, with the same behavior. Capture the last focused text editor context before opening UI; if the source is ambiguous, ask the user to choose it.
 
 There is no CodeActionProvider or lightbulb entry; these commands and the native gutter are the supported entry points.
@@ -307,14 +310,22 @@ Comments also appear in other editors displaying the same resource/revision. A w
 
 ### 5.7 Tree view
 
-View container in the activity bar, `Loop Review`. Groups:
+View container in the activity bar, `DejaReview`. Groups:
 
 - **Comments** - by file, retaining parsed file order within each file
 - **Stale** — unresolvable anchors
 
 Tree items show the capture-side label and origin alongside the comment preview. Clicking a comparison comment reopens its recorded pair with `vscode.diff`, preserving Original/Modified ordering and revealing the selected resource/range where the public API allows. Never focus the other pane as a substitute; offer opening the selected revision directly if precise diff-side navigation is unavailable. Clicking a regular-editor comment opens its resource at the resolved range. Clicking a stale comment reveals its block in `COMMENTS.md`.
 
-The tree view title exposes a prominent **Copy Comments & Clear (Deletes COMMENTS.md)** action (`loopReview.copyForAgent`, copy icon). This is the primary end-of-pass action, not a palette-only utility. After successful deletion, saved threads, tree entries, and decorations clear and the empty view invites the user to add comments for the next pass. Unobservable native gutter drafts remain available (§8 Input UI).
+The tree view title retains **Copy Comments & Clear** (`dejareview.copyForAgent`, copy icon) as a secondary entry point alongside the palette. After successful copy/archive/deletion, saved threads, tree entries, and decorations clear; the dashboard offers recent archives or a new pass. Unobservable native gutter drafts remain available (§8 Input UI).
+
+### 5.7.1 Review dashboard
+
+A **Review** webview (`dejareview.dashboard`) sits above the native **Review Comments** tree in the DejaReview activity-bar container. Its central primary action is a full-width, centered **Copy Comments & Clear** button with a minimum height of 48px. Explain that it copies, archives the batch, and clears current comments. Use VS Code sidebar, foreground, button, font, focus, and high-contrast theme tokens, responsive wrapping for narrow sidebars, and keyboard-accessible controls. The comments tree and multiline composer remain native; the webview is only the dashboard.
+
+Show the selected repository and current parsed comment count. Availability and history visibility use saved raw feedback, not that count: any non-whitespace `COMMENTS.md` text is meaningful feedback. Malformed/free-form-only feedback can show **0 comments** but must still enable copy and hide archives. When the file is missing or whitespace-only, show the latest 10 valid archives for the selected repository, newest first, with localized creation/copy dates, parsed comment counts, and **Recover** actions. Dates describe batch archive creation during copying, not the original comment dates or recovery time. Do not show history while current raw feedback exists, or mix repositories. Disable mutation controls while busy and revalidate requests in the extension host.
+
+Use a restrictive nonce-based CSP, no remote resources, and validated messages scoped to the selected repository. Send only display metadata to the webview, not raw feedback/code; render metadata as text rather than executable HTML.
 
 ### 5.8 Status bar
 
@@ -333,7 +344,7 @@ const git = vscode.extensions.getExtension<GitExtension>('vscode.git')!.exports.
 // Select a repository using the rules below before accessing its review file.
 ```
 
-Handle `git.state !== 'initialized'` by awaiting `onDidChangeState`. With zero repositories the review UI has no selected store. Initially choose the repository containing the active editor, or the sole open repository; otherwise leave selection unset. **Select Review Repository** offers an explicit picker, and copy-and-clear asks for selection if none exists. Adding a comment selects its source repository; ordinary editor focus changes do not switch an existing selection. Known drafts/edits and active mutations block repository switching. Scope the tree and copy-and-clear action to that selected repository and show its name in the view. Never combine feedback from different repositories. Only local `file:` repository roots and supported `file:`/`git:` text resources are in v0.1 scope.
+Handle `git.state !== 'initialized'` by awaiting `onDidChangeState`. With zero repositories the review UI has no selected store. Initially choose the repository containing the active editor, or the sole open repository; otherwise leave selection unset. **Select Review Repository** offers an explicit picker, and copy-and-clear asks for selection if none exists. Adding a comment selects its source repository; ordinary editor focus changes do not switch an existing selection. Known drafts/edits and active mutations block repository switching. Scope the tree, dashboard, archives, recovery, and copy-and-clear action to that selected repository and show its name in the view. Never combine feedback from different repositories. Only local `file:` repository roots and supported `file:`/`git:` text resources are in v0.1 scope.
 
 Needed operations:
 
@@ -371,9 +382,9 @@ Full re-parse on every change. No incremental updates, no reconciliation against
 
 `vscode.workspace.createFileSystemWatcher` is scoped to the selected repository's root `COMMENTS.md`, alongside `onDidSaveTextDocument`. Handle create, change, and delete events with debounced notifications and refresh scheduling. Save events and explicit refresh keep ignored review files usable even when watcher delivery is suppressed. Unsaved `COMMENTS.md` edits are not parsed until saved; other open source-buffer changes can trigger re-anchoring. A missing file means an empty saved review: clear parsed entries, diagnostics, saved preview threads, decorations, tree, and status bar without recreating it. Preserve drafts and open native edits during refresh.
 
-**Loop prevention:** there is no `lastWritten` suppression. Explicit mutation commands refresh after writes, while store notifications and watcher/save events schedule debounced refreshes. Duplicate reads are harmless: parsing, re-anchoring, and rendering never write feedback. Only explicit create/edit/delete/reanchor/handoff actions mutate it, so there is no parse-to-write feedback loop and no exactly-one-parse promise.
+**Loop prevention:** there is no `lastWritten` suppression. Explicit mutation commands refresh after writes, while store notifications and watcher/save events schedule debounced refreshes. Duplicate reads are harmless: parsing, re-anchoring, and rendering never write feedback. Only explicit create/edit/delete/reanchor/handoff/restore actions mutate it, so there is no parse-to-write feedback loop and no exactly-one-parse promise. A missing root file never causes automatic recovery from archives; only the dashboard's empty-state archive list changes.
 
-Refresh, repository switching, and successful handoff advance a generation token; outdated asynchronous refreshes cannot publish UI. Comment mutations separately recheck current disk content (§7.3). The first submitted comment after deletion creates a fresh preamble using the current base SHA. Native gutter drafts remain on the live controller, not in the saved model.
+Refresh, repository switching, and successful handoff advance a generation token; outdated asynchronous refreshes cannot publish UI. Comment mutations separately recheck current disk content (§7.3). The first submitted comment after deletion creates a fresh preamble using the current base SHA unless a batch was explicitly recovered first; recovery preserves its original base. Native gutter drafts remain on the live controller, not in the saved model.
 
 ### 7.3 Parse generations
 
@@ -390,7 +401,8 @@ This is the price of dropping stable IDs. It is worth paying — no IDs means ne
 - **Create** → append to end of file. Never a mid-file insert. This is the entire reason the comment list is flat.
 - **Edit body** → splice that block only; every other byte is preserved verbatim, including user formatting, blank lines, and unknown sections.
 - **Delete** → remove the block and exactly one following blank-line separator.
-- **Copy and clear** → copy the complete file snapshot, then delete the file itself (§8.1), not one block at a time.
+- **Copy and clear** -> copy the complete file snapshot, atomically archive it via temporary-file rename, then guardedly delete the file itself (§8.1), not one block at a time.
+- **Restore archive** -> write exact archived raw text, including the original base preamble, only into an absent or unchanged whitespace-only file with no dirty buffer or known active input (§8.2). Never merge or regenerate it from parsed comments; retain the archive.
 
 Never regenerate the whole file from the model. That is how the "just edit the markdown" property dies in week one.
 
@@ -400,7 +412,9 @@ Never regenerate the whole file from the model. That is how the "just edit the m
 
 If `COMMENTS.md` is open and dirty in an editor when the extension wants to write, do not write. Show a warning offering *Save and retry* / *Cancel*. Writing under a dirty buffer loses the user's in-flight edit.
 
-This guard also applies before copy-and-clear: never silently copy only the saved version and delete a file with unsaved feedback. Serialize extension mutations, including copy-and-clear, per repository. Recheck the snapshot and dirty-buffer state before deletion; if either changed, retain the file and ask the user to retry. Clipboard writes and filesystem deletion cannot be atomic, so report partial success explicitly rather than promising an all-or-nothing transaction.
+This guard also applies before copy-and-clear and recovery: never silently copy only the saved version and delete a file with unsaved feedback, or overwrite an active/dirty review with an archive. Serialize extension mutations, including handoff and recovery, per repository. After archive success, recheck the snapshot and dirty-buffer state before deletion; if either changed, keep the archived snapshot and retain the live file. Clipboard writes, archive persistence, and filesystem deletion cannot be one atomic transaction, so report partial success explicitly rather than promising all-or-nothing behavior.
+
+`workspace.fs` has no atomic compare-and-write/delete against external writers. Snapshot and dirty-buffer checks guard observed changes but cannot eliminate the final filesystem race; atomic archive publication does not make root-file recovery or clearing transactional.
 
 ---
 
@@ -408,21 +422,22 @@ This guard also applies before copy-and-clear: never silently copy only the save
 
 | Command | Title | Context |
 |---|---|---|
-| `loopReview.addComment` | Add review comment | current line or selection in file/git editor, editor menu, palette; gutter uses the native provider |
-| `loopReview.submitComment` | Add Comment | native draft comment composer |
-| `loopReview.editComment` | Edit comment | native comment title |
-| `loopReview.saveComment` | Save | native comment edit |
-| `loopReview.cancelEdit` | Cancel | native comment edit |
-| `loopReview.cancelDraft` | Cancel | native draft composer |
-| `loopReview.deleteComment` | Delete comment | native comment title, tree view |
-| `loopReview.reveal` | Reveal in COMMENTS.md | native comment title, tree view |
-| `loopReview.gotoCode` | Go to code | tree view |
-| `loopReview.openComparison` | Open Side-by-Side Comparison | comparison comment, original-side inline-diff fallback |
-| `loopReview.copyForAgent` | Copy Comments & Clear (Deletes COMMENTS.md) | tree view title, palette |
-| `loopReview.reanchorAll` | Rewrite line numbers from anchors | palette |
-| `loopReview.refresh` | Re-parse and refresh | palette, tree view title |
-| `loopReview.selectRepository` | Select Review Repository | palette, tree view title |
-| `loopReview.suggestGitignore` | Add COMMENTS.md to .gitignore | palette, one-time prompt per repository |
+| `dejareview.addComment` | Add review comment | current line or selection in file/git editor, editor menu, palette; gutter uses the native provider |
+| `dejareview.submitComment` | Add Comment | native draft comment composer |
+| `dejareview.editComment` | Edit comment | native comment title |
+| `dejareview.saveComment` | Save | native comment edit |
+| `dejareview.cancelEdit` | Cancel | native comment edit |
+| `dejareview.cancelDraft` | Cancel | native draft composer |
+| `dejareview.deleteComment` | Delete comment | native comment title, tree view |
+| `dejareview.reveal` | Reveal in COMMENTS.md | native comment title, tree view |
+| `dejareview.gotoCode` | Go to code | tree view |
+| `dejareview.openComparison` | Open Side-by-Side Comparison | comparison comment, original-side inline-diff fallback |
+| `dejareview.copyForAgent` | Copy Comments & Clear | dashboard primary button, tree view title, palette |
+| `dejareview.restoreArchive` | Recover Archived Review | dashboard archive row, palette picker |
+| `dejareview.reanchorAll` | Rewrite line numbers from anchors | palette |
+| `dejareview.refresh` | Re-parse and refresh | palette, tree view title |
+| `dejareview.selectRepository` | Select Review Repository | palette, tree view title |
+| `dejareview.suggestGitignore` | Add COMMENTS.md to .gitignore | palette, one-time prompt per repository |
 
 ### 8.1 Copy Comments & Clear
 
@@ -432,20 +447,31 @@ This guard also applies before copy-and-clear: never silently copy only the save
 2. Read the complete saved file into a snapshot. If the file is missing or whitespace-only, show "No review comments to copy", leave the clipboard untouched, and do not delete anything.
 3. Prepend the instruction below and copy the snapshot with `vscode.env.clipboard.writeText`. Preserve all raw content, including paths, side-local ranges, origins, explicit sides, comparison pairs, captured code snippets, stale comments, malformed blocks, and hand-written notes. Do not export only successfully parsed comments or substitute current code for the captured context.
 4. Await successful clipboard completion. If copying fails, report the failure and leave the file and UI intact.
-5. Verify that the saved file still matches the snapshot and no dirty editor buffer exists, then delete only that repository's `COMMENTS.md`. Never delete any other file or change the git index. If the file changed, retain it and report "Feedback copied, but COMMENTS.md was not cleared." with a request to save and retry.
-6. After successful deletion, clear saved review projections and any known drafts/edits explicitly authorized for discard; retain the controller and unobservable native gutter drafts (§7.2). Show "Review feedback copied; COMMENTS.md deleted. Paste it into your AI tool."
+5. Save the exact raw snapshot (without the handoff instruction) as a new archive (§8.2): write a temporary JSON file in the archive directory, then atomically rename it to its UUID destination without overwriting another archive. Await archive success before any source deletion. On failure, retain the source and input/UI, report that the clipboard copied but archiving failed and `COMMENTS.md` was not cleared, and clean up the temporary file where possible.
+6. Re-read the source and recheck that it matches the snapshot and no dirty editor buffer exists, then delete only that repository's `COMMENTS.md`. Never modify source code or the git index. If the file or buffer changed, retain the live state and the archived snapshot and report that feedback was copied and archived but `COMMENTS.md` was not cleared, with a request to save and retry.
+7. After successful deletion, clear saved review projections and any known drafts/edits explicitly authorized for discard; retain the controller and unobservable native gutter drafts (§7.2). Report that feedback was copied and archived, current comments were cleared, and it is ready to paste into the AI tool. Refresh the dashboard's recent archive list.
 
 Handoff instruction:
 
 > Review feedback follows. Address the comments using the included file paths and captured code snippets as context; line numbers and snippets may be stale. Side: left refers to Original, Side: right to Modified, and Side: document to a regular editor. Each comparison records both resources; lines and snippets belong to the selected side, not necessarily the current working-tree file. Staging remains under the human's control. This feedback was copied from a completed review pass; do not read, recreate, or reply in COMMENTS.md. Summarize your changes in this conversation.
 
-If deletion fails after copying succeeds, retain the file/UI and report "Feedback copied, but COMMENTS.md was not cleared." with the error. The user can retry; copying the same feedback again is safer than losing it. Do not clear or restore the clipboard on failure. Clipboard content is a point-in-time snapshot, not a persistent review archive.
+If deletion fails after copying and archiving succeed, retain the file/UI and archive and report partial success with the error. The user can retry; copying and archiving the same feedback again is safer than losing it. Do not clear or restore the clipboard on failure. Clipboard content is a point-in-time snapshot; persistent recovery uses the separate archive, not the clipboard.
 
 The deliberately named action needs no additional confirmation in the normal success path. Keep it available when the file contains only malformed blocks or free-form notes, since those must remain exportable. Disable it while a copy-and-clear operation is running.
 
+### 8.2 Batch archives and recovery
+
+Store archives outside the repository at `ExtensionContext.globalStorageUri/reviews/<sha256(repoURI)>/<uuid>.json`, hashing the repository URI string. Each JSON record contains `version`, `id`, `repoUri`, exact raw `text`, ISO `createdAt` (archive creation during copying), and `commentCount` from parsing that snapshot. Counts can be zero for meaningful malformed or free-form feedback. Validate record identity, repository, dates, counts, and content before use; reject invalid/path-like IDs and skip invalid records in listings.
+
+Archives persist across VS Code reloads and restarts in user-local machine storage. Sort newest first and show only the latest 10 valid batches in the dashboard/picker. Ten is a display limit, not a retention limit: retain older archives, with no automatic purge or archive-delete command. Recovery also keeps the archived copy and its original creation date. These files contain review prose and captured source-code snippets; they are local only, not synced or encrypted by the extension, and are not an encrypted backup service. Users must account for that retained content when managing their local storage.
+
+`dejareview.restoreArchive` recovers an explicitly selected batch for the selected repository. Block recovery while another mutation or known draft/edit is active. Require the root file to be absent or whitespace-only and have no dirty buffer; recheck both the saved snapshot and dirty state immediately before writing. If either changes, abort without overwriting the live review. Never merge, append to active feedback, or silently discard input. Stable APIs cannot enumerate native gutter drafts; preserve them and keep the existing native-input limitations explicit.
+
+Write the archived raw text exactly to root `COMMENTS.md`, preserving formatting, malformed/free-form content, snippets, and the original base SHA rather than substituting the current HEAD. Re-parse and refresh current native threads/tree/decorations afterward, applying normal stale-base/anchor rules. Only this explicit restore makes archive content current. Do not modify code or the index, consume the archive, or automatically restore on activation or an empty file.
+
 ### Input UI
 
-Use the native comment composer for multiline creation and editing (§5.1), with **Add Comment**, **Save**, and **Cancel** actions as appropriate. No single-line input box, escaped-newline convention, or custom webview. Hand-editing and saving `COMMENTS.md` remains supported; bodies require balanced fences and no unfenced `##` headings (use `###`).
+Use the native comment composer for multiline creation and editing (§5.1), with **Add Comment**, **Save**, and **Cancel** actions as appropriate. No single-line input box, escaped-newline convention, or custom webview composer; the dashboard webview is a separate handoff/recovery surface. Hand-editing and saving `COMMENTS.md` remains supported; bodies require balanced fences and no unfenced `##` headings (use `###`).
 
 **Implemented v0.1 deviation:** copy exports only submitted, saved comments and other raw content already saved in `COMMENTS.md`, never unsubmitted composer text or unsaved edits. Known keyboard/menu drafts and open saved-comment edits trigger a finish/discard/cancel prompt; authorized discard happens only after successful copy-and-clear. Stable APIs cannot enumerate native gutter-created drafts, so the extension cannot include them in that prompt or guarantee an all-drafts-finished pass boundary. It keeps the controller alive and does not silently destroy them: those unsubmitted native drafts remain available for the next pass. They are transient, not persisted across reloads. Their eventual submission requires context confirmation and captures then-current source text, not initial gutter-click text. Recommend keyboard entry when pre-typing capture matters.
 
@@ -455,8 +481,8 @@ Use the native comment composer for multiline creation and editing (§5.1), with
 
 | Setting | Default | Description |
 |---|---|---|
-| `loopReview.decorationStyle` | `badge` | `badge` \| `none` |
-| `loopReview.searchRadius` | `50` | Lines searched around recorded position when re-anchoring; range 0-10000 |
+| `dejareview.decorationStyle` | `badge` | `badge` \| `none` |
+| `dejareview.searchRadius` | `50` | Lines searched around recorded position when re-anchoring; range 0-10000 |
 
 The 20-line anchor threshold and first-10 / `...` / last-5 elision format are fixed, not configurable.
 
@@ -469,12 +495,13 @@ The 20-line anchor threshold and first-10 / `...` / last-5 elision format are fi
   "activationEvents": ["onStartupFinished"],
   "contributes": {
     "commands": [
-      { "command": "loopReview.addComment", "title": "Add review comment", "category": "Loop Review" },
-      { "command": "loopReview.copyForAgent", "title": "Copy Comments & Clear", "category": "Loop Review", "icon": "$(copy)", "enablement": "loopReview.hasFeedback && !loopReview.copyInProgress" }
+      { "command": "dejareview.addComment", "title": "Add review comment", "category": "DejaReview" },
+      { "command": "dejareview.copyForAgent", "title": "Copy Comments & Clear", "category": "DejaReview", "icon": "$(copy)", "enablement": "dejareview.hasFeedback && !dejareview.copyInProgress" },
+      { "command": "dejareview.restoreArchive", "title": "Recover Archived Review", "category": "DejaReview" }
     ],
     "keybindings": [
       {
-        "command": "loopReview.addComment",
+        "command": "dejareview.addComment",
         "key": "ctrl+alt+m",
         "mac": "cmd+alt+m",
         "when": "editorTextFocus"
@@ -482,30 +509,31 @@ The 20-line anchor threshold and first-10 / `...` / last-5 elision format are fi
     ],
     "menus": {
       "editor/context": [
-        { "command": "loopReview.addComment", "when": "resourceScheme == file || resourceScheme == git", "group": "loopReview@1" }
+        { "command": "dejareview.addComment", "when": "resourceScheme == file || resourceScheme == git", "group": "dejareview@1" }
       ],
       "view/title": [
-        { "command": "loopReview.copyForAgent", "when": "view == loopReview.tree", "group": "navigation@1" }
+        { "command": "dejareview.copyForAgent", "when": "view == dejareview.tree", "group": "navigation@1" }
       ]
     },
     "views": {
-      "loopReview": [
-        { "id": "loopReview.tree", "name": "Review Comments" }
+      "dejareview": [
+        { "id": "dejareview.dashboard", "name": "Review", "type": "webview", "initialSize": 2 },
+        { "id": "dejareview.tree", "name": "Review Comments" }
       ]
     },
     "viewsContainers": {
       "activitybar": [
-        { "id": "loopReview", "title": "Loop Review", "icon": "resources/icon.svg" }
+        { "id": "dejareview", "title": "DejaReview", "icon": "resources/icon.svg" }
       ]
     },
-    "configuration": { "title": "Simple loop-review comments", "properties": {} }
+    "configuration": { "title": "DejaReview", "properties": {} }
   }
 }
 ```
 
 `onStartupFinished` rather than a narrower activation event: the status bar and tree view need to be live before the user selects anything.
 
-`loopReview.hasFeedback` reflects non-whitespace raw content, not the parsed comment count. `loopReview.copyInProgress` prevents repeated invocation during a handoff. Both are scoped to the selected repository and updated after file changes.
+`dejareview.hasFeedback` reflects non-whitespace raw content, not the parsed comment count. `dejareview.copyInProgress` prevents repeated invocation during a handoff. Both are scoped to the selected repository and updated after file changes.
 
 The sketch omits native comment contributions: register submit/edit/save/delete/cancel commands and the `comments/commentThread/context`, `comments/comment/title`, and `comments/comment/context` menus with draft/editing context conditions. Use the controller's `commentingRangeProvider` for gutter entry; enforce resource support inside all command handlers too.
 
@@ -524,18 +552,21 @@ src/
   anchor.ts           re-anchoring algorithm (§4.2)
   git.ts              repository discovery, git extension API wrapper, origin blobs
   handoff.ts          pure copyAndClear() port, instruction and result types
+  archive.ts          repository-scoped JSON snapshots, atomic save, list/read validation
+  dashboard.ts        webview provider, display state, validated action messages
+  dashboardHtml.ts    themed responsive dashboard shell, copy button and archive rows
   editorContext.ts    freeze source/range, context picker, pair/side/origin, elision
   store.ts            ReviewStore: saved-file reads, watcher/save events, debounce,
                       serialized mutations, dirty/snapshot/symlink guards, handoff I/O
 ```
 
-UI remains in the single `extension.ts`; there are no `ui/` or `sync.ts` modules. `parser.ts`, `writer.ts`, `anchor.ts`, and the port-based `handoff.ts` run without a VS Code host. Runtime npm dependencies are zero; build, package, and test tools are development dependencies. The current `npm audit` reports low-severity transitive development-tool warnings, including age/license-policy findings, not an audit-clean development tree.
+Native comment/tree/editor UI remains in `extension.ts`; the dashboard provider and HTML are separate modules. There are no `ui/` or `sync.ts` modules. `parser.ts`, `writer.ts`, `anchor.ts`, the port-based `handoff.ts`, and `dashboardHtml.ts` run without a VS Code host. Runtime npm dependencies are zero; build, package, and test tools are development dependencies. The current `npm audit` reports low-severity transitive development-tool warnings, including age/license-policy findings, not an audit-clean development tree.
 
 ---
 
 ## 12. Test cases
 
-This is a validation checklist, not a claim that every UI scenario has been manually verified. `npm test` compiles and runs `test/core.test.ts` and `test/handoff.test.ts`. `npm run test:integration` compiles and runs the extension-host suite in `test/integration/` through `test/runIntegration.ts`.
+This is a validation checklist, not a claim that every UI scenario has been manually verified. `npm test` compiles and runs `test/core.test.ts`, `test/handoff.test.ts`, and `test/dashboard.test.ts`. `npm run test:integration` compiles and runs the extension-host suite in `test/integration/`, including `archives.ts` for archive persistence/recovery, through `test/runIntegration.ts`.
 
 The integration runner uses `/Applications/Visual Studio Code.app/Contents/MacOS/Code` by default; set `VSCODE_EXECUTABLE_PATH` to the actual executable for another installation. It creates an isolated disposable Git fixture, user-data directory, and extensions directory, isolates Git configuration, and restores prior clipboard text in cleanup (not other clipboard formats). Command/API assertions cover resource capture, persisted projections, editing/deletion, watcher refresh, re-anchoring, and real clipboard handoff. Visual gutter clicks, physical shortcut dispatch, modal prompt interactions, reload UX, and inline/same-URI placement remain pending manual validation.
 
@@ -571,18 +602,30 @@ Sync:
 - first comment after a handoff recreates the file with a fresh base SHA
 
 Clipboard handoff:
-- copies every comment with paths, ranges, origins, and original snippets before deleting the file
+- copies every comment with paths, ranges, origins, and original snippets, then atomically archives the exact raw snapshot before deleting the file
 - includes stale comments, malformed blocks, unknown sections, and free-form-only feedback verbatim
 - clipboard failure leaves the file and review UI intact
+- archive write/rename failure retains source and input/UI, reports clipboard-only partial success, and never deletes COMMENTS.md
 - deletion failure reports partial success and keeps feedback available for retry
 - missing or whitespace-only file does not overwrite the clipboard or delete anything
 - dirty buffer offers Save and retry / Cancel; cancellation changes nothing
-- file or buffer changes during clipboard write prevent deletion and prompt a retry
+- file or buffer changes during clipboard/archive writes preserve the archived snapshot and live feedback, prevent deletion, and prompt a retry
 - repeated clicks do not run overlapping handoffs
 - only the explicitly selected repository's COMMENTS.md is copied and deleted
 - successful handoff never stages, unstages, or modifies code
 - copied feedback unambiguously identifies the selected comparison side and both resources
 - known shortcut drafts/open edits prompt to finish, explicitly discard on success, or cancel; native gutter unsubmitted drafts are not exported and remain available for the next pass
+
+Archives and dashboard:
+- archives persist across store re-creation/restarts outside the repository, scoped by repository URI hash
+- latest 10 batches show newest-first copy/creation dates and parsed counts; older files remain retained
+- missing/whitespace-only root feedback shows archives; any non-whitespace raw content hides history, even with zero parsed comments
+- malformed/free-form-only feedback copies, archives, and restores verbatim with a zero parsed count
+- recovery preserves original raw text and base SHA, keeps the archive, and refreshes current projections only after explicit restore
+- recovery rejects active raw feedback, dirty buffers, known drafts/edits, concurrent mutations, and source changes during recovery without merging or overwriting
+- malformed records, invalid IDs, and repository mismatches cannot restore arbitrary files or leak another repository's archives
+- themed full-width button is at least 48px tall above the native tree; verify narrow sidebar, keyboard focus, light/dark/high-contrast themes manually
+- dashboard CSP and validated messages reject executable metadata and stale/cross-repository actions; raw code is not sent to the webview
 
 Editor integration (extension-host/manual tests):
 - gutter entry, current-line shortcut, range shortcut, and context menu work in regular editors for all text languages
@@ -620,7 +663,9 @@ The git index is the human's review signal, not yours.
   right is Modified. Lines belong to that selected side, not automatically
   the working tree. Locate by snippet and context; line numbers may be stale.
 - Do not read, recreate, or reply in `COMMENTS.md`. It is the extension's
-  scratch buffer and is deleted when the human copies a completed pass.
+  root scratch buffer, cleared only after the human copies and locally
+  archives a completed pass. Feedback is recoverable, not permanently deleted;
+  archive recovery is the human's explicit action, not the agent's task.
 - Only modify code covered by a comment, or code you must touch to satisfy one.
   Leave unrelated changes alone unless the human requests otherwise.
 - Use `git diff HEAD` to see your full change set — plain `git diff` hides
@@ -638,7 +683,7 @@ The git index is the human's review signal, not yours.
 
 **M3 — sync.** File watcher, loop prevention, generations, dirty-buffer guard, diagnostics for malformed blocks.
 
-**M4 - handoff UI.** Comments tree, comment-count status bar, prominent **Copy Comments & Clear** action, clipboard export, guarded file deletion, failure handling, and fresh-pass reset. Validates the full human-to-AI loop.
+**M4 - handoff UI.** Native comments tree, themed webview dashboard with the prominent **Copy Comments & Clear** button, comment-count status bar, clipboard export, atomic batch archive, guarded file deletion, recent-10 archive display, safe explicit recovery, failure handling, and fresh-pass reset. Validates the full human-to-AI loop.
 
 **M5 - polish.** `reanchorAll`, settings, stale-base warning, and repository-selection UX.
 

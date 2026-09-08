@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     // Inherited Git overrides must not redirect fixture commands to a user's repo.
     const env = { ...process.env };
     const extensionTestsEnv: Record<string, string | undefined> = {
-      LOOP_REVIEW_TEST_WORKSPACE: workspace,
+      DEJAREVIEW_TEST_WORKSPACE: workspace,
       ELECTRON_RUN_AS_NODE: undefined,
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: os.devNull,
@@ -59,7 +59,7 @@ async function main(): Promise<void> {
     await fs.writeFile(sample, "export const version = 'head';\nexport const stable = true;\n");
     await fs.writeFile(path.join(workspace, 'other.ts'), 'export const alternate = true;\n');
     await git('add', '--', 'sample.ts', 'other.ts');
-    await git('-c', 'user.name=Loop Review Integration', '-c', 'user.email=integration@example.invalid',
+    await git('-c', 'user.name=DejaReview Integration', '-c', 'user.email=integration@example.invalid',
       '-c', 'commit.gpgsign=false', '-c', `core.hooksPath=${os.devNull}`, 'commit', '-m', 'Initial fixture');
     await fs.writeFile(sample, "export const version = 'staged';\nexport const stable = true;\n");
     await git('add', '--', 'sample.ts');

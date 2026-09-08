@@ -1,6 +1,8 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { resolveAnchor } from './anchor';
+import { ReviewArchive, ReviewArchives } from './archive';
+import { ReviewDashboard } from './dashboard';
 import { CapturedContext, captureContext } from './editorContext';
 import { GitResources, Repository } from './git';
 import { ParsedComment, ResolvedAnchor, ReviewComment } from './model';
@@ -52,19 +54,30 @@ function range(anchor: ResolvedAnchor | ReviewComment): vscode.Range {
 
 class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<TreeNode> {
   readonly git = new GitResources();
-  private controller = vscode.comments.createCommentController('loopReview', 'Loop Review');
+  private controller = vscode.comments.createCommentController('dejareview', 'DejaReview');
   private readonly changes = new vscode.EventEmitter<TreeNode | undefined>();
   readonly onDidChangeTreeData = this.changes.event;
-  private readonly diagnostics = vscode.languages.createDiagnosticCollection('loopReview');
+  private readonly diagnostics = vscode.languages.createDiagnosticCollection('dejareview');
   private readonly status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 20);
-  private readonly output = vscode.window.createOutputChannel('Loop Review');
+  private readonly output = vscode.window.createOutputChannel('DejaReview');
   private readonly decoration = vscode.window.createTextEditorDecorationType({
     after: { contentText: ' [review]', margin: '0 0 0 1em', color: new vscode.ThemeColor('editorInfo.foreground') },
     overviewRulerColor: new vscode.ThemeColor('editorInfo.foreground'),
     overviewRulerLane: vscode.OverviewRulerLane.Right,
     rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
   });
-  private readonly tree = vscode.window.createTreeView('loopReview.tree', { treeDataProvider: this, showCollapseAll: true });
+  private readonly tree = vscode.window.createTreeView('dejareview.tree', { treeDataProvider: this, showCollapseAll: true });
+  private readonly dashboard = new ReviewDashboard(async action => {
+    try {
+      if (action.repoKey !== this.repo?.rootUri.toString()) { return; }
+      if (action.type === 'copy') { await this.handoff(); }
+      else if (action.type === 'restore' && action.archiveId) { await this.restore(action.archiveId, action.repoKey); }
+      else if (action.type === 'selectRepository') { await this.selectRepository(); }
+    } catch (error) { this.error(error); }
+  });
+  private archives: ReviewArchive[] = [];
+  private hasFeedback = false;
+  private historyError?: string;
   private readonly subscriptions: vscode.Disposable[] = [];
   private repoSubscriptions: vscode.Disposable[] = [];
   private store?: ReviewStore;
@@ -83,7 +96,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.configureController();
-    this.status.command = 'loopReview.tree.focus';
+    this.status.command = 'dejareview.dashboard.focus';
     this.status.tooltip = 'Open review comments';
     const commands: Record<string, (...args: any[]) => unknown> = {
       addComment: (uri?: vscode.Uri, selection?: vscode.Range) => this.add(uri, selection),
@@ -97,18 +110,20 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
       gotoCode: (entry: Entry) => this.goto(entry),
       openComparison: (arg: Entry | Note | vscode.CommentThread) => this.goto(this.entry('comments' in arg ? arg.comments[0] as Note : arg), true),
       copyForAgent: () => this.handoff(),
+      restoreArchive: (id?: string, repoKey?: string) => this.restore(id, repoKey),
       refresh: () => this.refresh(),
       selectRepository: () => this.selectRepository(),
       reanchorAll: () => this.reanchor(),
       suggestGitignore: () => this.gitignore(),
     };
     for (const [name, run] of Object.entries(commands)) {
-      this.subscriptions.push(vscode.commands.registerCommand(`loopReview.${name}`, async (...args: any[]) => {
+      this.subscriptions.push(vscode.commands.registerCommand(`dejareview.${name}`, async (...args: any[]) => {
         try { return await run(...args); }
         catch (error) { this.error(error); }
       }));
     }
     this.subscriptions.push(
+      vscode.window.registerWebviewViewProvider('dejareview.dashboard', this.dashboard),
       vscode.window.onDidChangeActiveTextEditor(editor => {
         if (editor) {
           this.lastEditor = editor;
@@ -126,7 +141,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
         if (event.document.uri.toString() !== this.store?.uri.toString()) { this.schedule(); }
       }),
       vscode.workspace.onDidChangeConfiguration(event => {
-        if (event.affectsConfiguration('loopReview')) { this.schedule(); }
+        if (event.affectsConfiguration('dejareview')) { this.schedule(); }
       }),
     );
   }
@@ -154,8 +169,15 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
   private error(error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
     this.output.appendLine(error instanceof Error ? error.stack ?? message : message);
-    console.error('Loop Review:', error);
-    void vscode.window.showErrorMessage(`Loop Review: ${message}`);
+    console.error('DejaReview:', error);
+    void vscode.window.showErrorMessage(`DejaReview: ${message}`);
+  }
+
+  private updateDashboard(): void {
+    this.dashboard.update({ repoKey: this.repo?.rootUri.toString(),
+      repoName: this.repo ? path.basename(this.repo.rootUri.fsPath) : undefined,
+      hasFeedback: this.hasFeedback, commentCount: this.entries.length,
+      busy: this.copyInProgress || !!this.store?.busy, archives: this.archives, error: this.historyError });
   }
 
   private entry(arg: Entry | Note): Entry {
@@ -193,8 +215,14 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     this.store?.dispose();
     this.repoSubscriptions.forEach(item => item.dispose());
     this.repo = repo;
-    this.store = new ReviewStore(repo);
-    this.repoSubscriptions = [this.store.onDidChange(() => this.schedule()), repo.state.onDidChange(() => this.schedule())];
+    this.store = new ReviewStore(repo, new ReviewArchives(this.context.globalStorageUri, repo.rootUri));
+    this.entries = [];
+    this.archives = [];
+    this.hasFeedback = false;
+    this.historyError = undefined;
+    this.updateDashboard();
+    this.repoSubscriptions = [this.store.onDidChange(() => this.schedule()),
+      this.store.onDidChangeBusy(() => this.updateDashboard()), repo.state.onDidChange(() => this.schedule())];
     this.tree.description = path.basename(repo.rootUri.fsPath);
     this.warnedBase = undefined;
     await this.refresh();
@@ -219,6 +247,12 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     const store = this.store;
     const repo = this.repo;
     const { text, parsed } = await store.load();
+    let archives: ReviewArchive[] = [];
+    let historyError: string | undefined;
+    if (!text?.trim()) {
+      try { archives = await store.archives.list(); }
+      catch (error) { historyError = `Cannot load review archives: ${error instanceof Error ? error.message : String(error)}`; }
+    }
     const staleBase = !!parsed.base && !!repo.state.HEAD?.commit && !repo.state.HEAD.commit.startsWith(parsed.base);
     const contents = new Map<string, Promise<string>>();
     const entries = await Promise.all(parsed.comments.map(async comment => {
@@ -228,7 +262,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
       try {
         const content = await contents.get(key)!;
         if (!(staleBase && ['head', 'staged'].includes(comment.origin))) {
-          resolved = resolveAnchor(comment, content, vscode.workspace.getConfiguration('loopReview').get('searchRadius', 50));
+          resolved = resolveAnchor(comment, content, vscode.workspace.getConfiguration('dejareview').get('searchRadius', 50));
         }
       } catch { /* Missing revisions and deleted anchors stay exportable in the Stale group. */ }
       return { comment, resolved, repo, snapshot: text ?? '' };
@@ -246,6 +280,10 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     }
     if (generation !== this.generation || this.disposed || store !== this.store) { return; }
     this.entries = entries;
+    this.archives = archives;
+    this.hasFeedback = !!text?.trim();
+    this.historyError = historyError;
+    this.updateDashboard();
     this.diagnostics.clear();
     this.diagnostics.set(store.uri, parsed.diagnostics.map(item => new vscode.Diagnostic(
       new vscode.Range(item.line - 1, 0, item.line - 1, 1000), item.message, vscode.DiagnosticSeverity.Warning)));
@@ -291,7 +329,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     this.threads = next;
     for (const editor of vscode.window.visibleTextEditors) {
       const options: vscode.DecorationOptions[] = [];
-      if (vscode.workspace.getConfiguration('loopReview').get<string>('decorationStyle', 'badge') !== 'none') {
+      if (vscode.workspace.getConfiguration('dejareview').get<string>('decorationStyle', 'badge') !== 'none') {
         for (const entry of entries) {
           const matching = resources.get(`${entry.comment.origin}:${entry.comment.path}`)?.some(uri => uri.toString() === editor.document.uri.toString());
           if (entry.resolved && matching) {
@@ -302,7 +340,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
       }
       editor.setDecorations(this.decoration, options);
     }
-    await vscode.commands.executeCommand('setContext', 'loopReview.hasFeedback', !!text?.trim());
+    await vscode.commands.executeCommand('setContext', 'dejareview.hasFeedback', !!text?.trim());
     this.status.text = `$(comment) ${entries.length}`;
     if (text !== undefined) { this.status.show(); } else { this.status.hide(); }
     this.tree.message = parsed.diagnostics.length ? `${parsed.diagnostics.length} malformed block(s). Open COMMENTS.md to fix; all raw feedback can still be copied.` : undefined;
@@ -316,7 +354,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     item.tooltip = markdown(node);
     item.contextValue = 'reviewComment';
     item.iconPath = new vscode.ThemeIcon(node.resolved ? 'comment' : 'warning');
-    item.command = { command: 'loopReview.gotoCode', title: 'Go to Code', arguments: [node] };
+    item.command = { command: 'dejareview.gotoCode', title: 'Go to Code', arguments: [node] };
     return item;
   }
 
@@ -345,6 +383,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     });
     if (!captured || this.copyInProgress) { return; }
     await this.useRepository(captured.repo);
+    if (this.copyInProgress || this.repo?.rootUri.toString() !== captured.repo.rootUri.toString()) { return; }
     const thread = this.controller.createCommentThread(source, range(captured.comment), []);
     thread.label = label(captured.comment);
     thread.contextValue = 'draft';
@@ -466,7 +505,8 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     if (!this.store) { await this.selectRepository(); }
     if (!this.store) { return; }
     this.copyInProgress = true;
-    await vscode.commands.executeCommand('setContext', 'loopReview.copyInProgress', true);
+    this.updateDashboard();
+    await vscode.commands.executeCommand('setContext', 'dejareview.copyInProgress', true);
     try {
       if (this.drafts.size || this.threads.some(thread => thread.comments.some(note => note.mode === vscode.CommentMode.Editing))) {
         const choice = await vscode.window.showWarningMessage(
@@ -484,7 +524,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
         // Native gutter templates are not enumerable. Keep the controller alive:
         // unsubmitted native input is not exported, but must never be destroyed.
         await this.refresh();
-        void vscode.window.showInformationMessage('Review feedback copied; COMMENTS.md deleted. Paste it into your AI tool.');
+        void vscode.window.showInformationMessage('Review feedback copied and archived; COMMENTS.md cleared. Recover it from Recent Archives when needed.');
       } else if (result.status === 'empty') {
         void vscode.window.showInformationMessage('No review comments to copy.');
       } else if (result.status !== 'cancelled') {
@@ -494,7 +534,43 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
       }
     } finally {
       this.copyInProgress = false;
-      await vscode.commands.executeCommand('setContext', 'loopReview.copyInProgress', false);
+      this.updateDashboard();
+      await vscode.commands.executeCommand('setContext', 'dejareview.copyInProgress', false);
+    }
+  }
+
+  private async restore(id?: string, repoKey?: string): Promise<void> {
+    if (this.copyInProgress || this.submitting.size) { return; }
+    if (!this.store) { await this.selectRepository(); }
+    const store = this.store;
+    const selectedKey = this.repo?.rootUri.toString();
+    if (!store || (repoKey && repoKey !== selectedKey)) { return; }
+    if (this.drafts.size || this.threads.some(thread => thread.comments.some(note => note.mode === vscode.CommentMode.Editing))) {
+      throw new Error('Finish or cancel open drafts and edits before recovering a review.');
+    }
+    if (!id) {
+      const archives = await store.archives.list();
+      const choice = await vscode.window.showQuickPick(archives.map(archive => ({
+        label: new Date(archive.createdAt).toLocaleString(),
+        description: `${archive.commentCount} comment${archive.commentCount === 1 ? '' : 's'}`, id: archive.id,
+      })), { placeHolder: archives.length ? 'Recover a recent review batch' : 'No archived reviews for this repository' });
+      id = choice?.id;
+    }
+    if (!id || this.store !== store || this.copyInProgress) { return; }
+    if (this.submitting.size || this.drafts.size || this.threads.some(thread => thread.comments.some(note => note.mode === vscode.CommentMode.Editing))) {
+      throw new Error('Finish or cancel open drafts and edits before recovering a review.');
+    }
+    this.copyInProgress = true;
+    this.updateDashboard();
+    await vscode.commands.executeCommand('setContext', 'dejareview.copyInProgress', true);
+    try {
+      if (!await store.restore(id)) { throw new Error('Current feedback exists or changed. Copy and clear it before recovering a review.'); }
+      await this.refresh();
+      void vscode.window.showInformationMessage('Review recovered to COMMENTS.md. The archive is still available.');
+    } finally {
+      this.copyInProgress = false;
+      this.updateDashboard();
+      await vscode.commands.executeCommand('setContext', 'dejareview.copyInProgress', false);
     }
   }
 
@@ -546,8 +622,9 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     if (await vscode.workspace.applyEdit(edit)) { await document.save(); }
   }
 
-  getState(): { repo?: string; comments: number; threads: number } {
-    return { repo: this.repo?.rootUri.fsPath, comments: this.entries.length, threads: this.threads.length };
+  getState(): { repo?: string; comments: number; threads: number; hasFeedback: boolean; archives: ReviewArchive[] } {
+    return { repo: this.repo?.rootUri.fsPath, comments: this.entries.length, threads: this.threads.length,
+      hasFeedback: this.hasFeedback, archives: [...this.archives] };
   }
   getDrafts(): readonly vscode.CommentThread[] { return [...this.drafts.keys()]; }
   getThreads(): readonly vscode.CommentThread[] { return this.threads; }
@@ -558,7 +635,7 @@ class ReviewExtension implements vscode.Disposable, vscode.TreeDataProvider<Tree
     if (this.timer) { clearTimeout(this.timer); }
     this.store?.dispose();
     [...this.subscriptions, ...this.repoSubscriptions, this.controller, this.git, this.changes,
-      this.diagnostics, this.status, this.tree, this.decoration, this.output].forEach(item => item.dispose());
+      this.diagnostics, this.status, this.tree, this.dashboard, this.decoration, this.output].forEach(item => item.dispose());
   }
 }
 

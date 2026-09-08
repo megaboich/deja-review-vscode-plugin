@@ -3,6 +3,8 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { ReviewArchives } from '../../src/archive';
+import type { ReviewArchive } from '../../src/archive';
 import { captureContext } from '../../src/editorContext';
 import { GitResources } from '../../src/git';
 import { HANDOFF_INSTRUCTION } from '../../src/handoff';
@@ -11,11 +13,12 @@ import { parse } from '../../src/parser';
 import { ReviewStore } from '../../src/store';
 import { appendComment, deleteComment, editComment } from '../../src/writer';
 import { testResourceEdges } from './resources';
+import { testArchives } from './archives';
 
 // Activation must expose live snapshots; CommentController has no public threads property.
 export interface ReviewTestAPI {
   refresh(): Promise<void>;
-  getState(): { repo?: string; comments: number; threads: number };
+  getState(): { repo?: string; comments: number; threads: number; hasFeedback: boolean; archives: ReviewArchive[] };
   getDrafts(): readonly vscode.CommentThread[];
   getThreads(): readonly vscode.CommentThread[];
 }
@@ -64,7 +67,7 @@ async function openDiff(original: vscode.Uri, modified: vscode.Uri): Promise<vsc
 
 export async function run(): Promise<void> {
   // Refuse manual launches against any workspace other than the runner's disposable fixture.
-  const fixture = process.env.LOOP_REVIEW_TEST_WORKSPACE;
+  const fixture = process.env.DEJAREVIEW_TEST_WORKSPACE;
   assert.ok(fixture, 'Launch this suite through test/runIntegration.ts');
   const root = await fs.realpath(fixture);
   assert.equal(path.dirname(path.dirname(root)), await fs.realpath(os.tmpdir()));
@@ -80,8 +83,8 @@ export async function run(): Promise<void> {
     console.log(`PASS ${name}`);
   };
   try {
-    const extension = vscode.extensions.getExtension<ReviewTestAPI>('local-review.simple-loop-review');
-    assert.ok(extension, 'Development extension local-review.simple-loop-review must be installed');
+    const extension = vscode.extensions.getExtension<ReviewTestAPI>('local-review.dejareview');
+    assert.ok(extension, 'Development extension local-review.dejareview must be installed');
     const api = await within('extension activation', () => extension.activate());
     assert.ok(api, 'activate() must return the integration test API');
     for (const method of ['refresh', 'getState', 'getDrafts', 'getThreads'] as const) {
@@ -94,7 +97,8 @@ export async function run(): Promise<void> {
     const repo = await git.repositoryFor(vscode.Uri.file(path.join(root, 'sample.ts')));
     assert.ok(repo);
     assert.equal(repo.rootUri.fsPath, root);
-    store = new ReviewStore(repo);
+    const storageUri = vscode.Uri.joinPath(repo.rootUri, '.test-archive-storage');
+    store = new ReviewStore(repo, new ReviewArchives(storageUri, repo.rootUri));
     const reviewStore = store;
     const feedback = reviewStore.uri.fsPath;
     const range = new vscode.Range(0, 0, 1, 0);
@@ -177,6 +181,8 @@ export async function run(): Promise<void> {
       }
     });
 
+    await testArchives(repo, storageUri, captured[0].comment, test);
+
     const savedThread = (uri: vscode.Uri, body: string): vscode.CommentThread => {
       const thread = api.getThreads().find(item => item.uri.toString() === uri.toString()
         && item.comments.some(comment => (typeof comment.body === 'string' ? comment.body : comment.body.value).includes(body)));
@@ -195,12 +201,12 @@ export async function run(): Promise<void> {
           await openDocument(context.uri);
         }
         const previous = new Set(api.getDrafts());
-        await vscode.commands.executeCommand('loopReview.addComment', context.uri, range);
+        await vscode.commands.executeCommand('dejareview.addComment', context.uri, range);
         const draft = api.getDrafts().filter(thread => !previous.has(thread)).at(-1);
         assert.ok(draft, 'addComment(uri, range) must expose its new draft via getDrafts()');
         assert.equal(draft.uri.toString(), context.uri.toString());
         context.comment.body = `Integration feedback ${index}`;
-        await vscode.commands.executeCommand('loopReview.submitComment', { thread: draft, text: context.comment.body });
+        await vscode.commands.executeCommand('dejareview.submitComment', { thread: draft, text: context.comment.body });
         await api.refresh();
         assert.equal(api.getDrafts().length, 0);
         const parsed = parse(await fs.readFile(feedback, 'utf8'));
@@ -252,7 +258,7 @@ export async function run(): Promise<void> {
           assert.equal(thread.contextValue, 'comparison');
           assert.equal(vscode.workspace.getConfiguration('diffEditor').get('renderSideBySide'), false);
           await within('openComparison live thread command', () =>
-            vscode.commands.executeCommand('loopReview.openComparison', thread), 5_000);
+            vscode.commands.executeCommand('dejareview.openComparison', thread), 5_000);
           await waitFor('side-by-side comparison setting', () =>
             vscode.workspace.getConfiguration('diffEditor').get('renderSideBySide') === true);
           const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
@@ -274,9 +280,9 @@ export async function run(): Promise<void> {
       const before = await fs.readFile(feedback, 'utf8');
       const thread = savedThread(working, captured[0].comment.body);
       const comment = thread.comments[0];
-      await vscode.commands.executeCommand('loopReview.editComment', comment);
+      await vscode.commands.executeCommand('dejareview.editComment', comment);
       assert.equal(comment.mode, vscode.CommentMode.Editing);
-      await vscode.commands.executeCommand('loopReview.saveComment', comment);
+      await vscode.commands.executeCommand('dejareview.saveComment', comment);
       assert.equal(comment.mode, vscode.CommentMode.Preview);
       assert.equal(comment.contextValue, 'saved');
       assert.equal(savedThread(working, captured[0].comment.body).comments[0].mode, vscode.CommentMode.Preview);
@@ -289,17 +295,17 @@ export async function run(): Promise<void> {
       const thread = savedThread(working, captured[0].comment.body);
       const comment = thread.comments.find(item => (typeof item.body === 'string' ? item.body : item.body.value)
         .includes(captured[0].comment.body))!;
-      await vscode.commands.executeCommand('loopReview.editComment', comment);
+      await vscode.commands.executeCommand('dejareview.editComment', comment);
       assert.equal(comment.mode, vscode.CommentMode.Editing);
       comment.body = 'Edited integration feedback';
-      await vscode.commands.executeCommand('loopReview.saveComment', comment);
+      await vscode.commands.executeCommand('dejareview.saveComment', comment);
       await api.refresh();
       let parsed = parse(await fs.readFile(feedback, 'utf8'));
       assert.equal(parsed.comments[0].body, 'Edited integration feedback');
       assert.equal(parsed.comments[0].anchorText, captured[0].comment.anchorText);
       const updated = savedThread(working, 'Edited integration feedback').comments.find(item =>
         (typeof item.body === 'string' ? item.body : item.body.value).includes('Edited integration feedback'))!;
-      await vscode.commands.executeCommand('loopReview.deleteComment', updated);
+      await vscode.commands.executeCommand('dejareview.deleteComment', updated);
       await api.refresh();
       parsed = parse(await fs.readFile(feedback, 'utf8'));
       assert.deepEqual(parsed.diagnostics, []);
@@ -321,7 +327,7 @@ export async function run(): Promise<void> {
       await api.refresh();
       assert.equal(api.getState().comments, 2);
       const comment = savedThread(working, duplicate.body).comments[0];
-      await vscode.commands.executeCommand('loopReview.editComment', comment);
+      await vscode.commands.executeCommand('dejareview.editComment', comment);
       assert.equal(comment.mode, vscode.CommentMode.Editing);
       try {
         const survivor = deleteComment(text, parsed.comments[0]);
@@ -333,14 +339,14 @@ export async function run(): Promise<void> {
         assert.ok(api.getThreads().some(thread => thread.comments.includes(comment)), 'Keep the stale editor input alive');
         comment.body = 'Should not apply';
         // The command catches the stale-action error and must not await its nonmodal notification.
-        await within('stale save command', () => vscode.commands.executeCommand('loopReview.saveComment', comment), 5_000);
+        await within('stale save command', () => vscode.commands.executeCommand('dejareview.saveComment', comment), 5_000);
         assert.equal(await fs.readFile(feedback, 'utf8'), survivor);
         assert.equal(parse(await fs.readFile(feedback, 'utf8')).comments[0].body, duplicate.body);
         assert.equal(comment.body, 'Should not apply');
         assert.equal(comment.mode, vscode.CommentMode.Editing);
         assert.ok(api.getThreads().some(thread => thread.comments.includes(comment)));
       } finally {
-        await vscode.commands.executeCommand('loopReview.cancelEdit', comment);
+        await vscode.commands.executeCommand('dejareview.cancelEdit', comment);
         await api.refresh();
       }
     });
@@ -395,7 +401,7 @@ export async function run(): Promise<void> {
       savedThread(working, captured[0].comment.body);
     });
 
-    // Modal dirty-buffer guard paths are covered by the pure handoff tests, not UI automation.
+    // Handoff's modal save/discard choices remain covered by pure tests, not UI automation.
     await test('real clipboard handoff through ReviewStore and the copy command', async () => {
       const previousClipboard = await vscode.env.clipboard.readText();
       try {
@@ -405,20 +411,78 @@ export async function run(): Promise<void> {
         assert.equal(result.clipboardCopied, true);
         assert.equal(await vscode.env.clipboard.readText(), `${HANDOFF_INSTRUCTION}\n\n${snapshot}`);
         assert.equal(await reviewStore.read(), undefined);
+        const directArchive = (await reviewStore.archives.list())[0];
+        assert.ok(directArchive);
+        assert.equal(directArchive.commentCount, parse(snapshot).comments.length);
+        assert.equal(await new ReviewArchives(storageUri, repo.rootUri).read(directArchive.id), snapshot);
         await api.refresh();
         assert.equal(api.getState().threads, 0);
-        const raw = '\uFEFFFree-form feedback\r\n\r\n## File: broken\r\n  Preserve every byte.\r\n';
+        assert.equal(api.getState().hasFeedback, false);
+        assert.deepEqual(api.getState().archives, [], 'Extension history must not use direct-store fixture storage');
+        const base = repo.state.HEAD!.commit!.slice(0, 12);
+        const valid = appendComment(appendComment('', captured[1].comment, base), captured[2].comment);
+        const raw = `\uFEFFFree-form feedback\r\n\r\n${valid.replace(/\n/g, '\r\n')}\r\n## File: broken\r\n  Preserve every byte.\r\n`;
+        const sources = await Promise.all([working, other].map(uri => vscode.workspace.fs.readFile(uri)));
+        const indexBefore = await git.content({ path: 'sample.ts', origin: 'staged' }, repo);
         await fs.writeFile(feedback, raw);
         await api.refresh();
+        assert.equal(api.getState().hasFeedback, true);
         // Success notifications must be fire-and-forget, not awaited by this command.
         await within('copyForAgent command (must not await a notification)', () =>
-          vscode.commands.executeCommand('loopReview.copyForAgent'), 10_000);
+          vscode.commands.executeCommand('dejareview.copyForAgent'), 10_000);
         assert.equal(await vscode.env.clipboard.readText(), `${HANDOFF_INSTRUCTION}\n\n${raw}`);
         assert.equal(await reviewStore.read(), undefined);
         await api.refresh();
         assert.equal(api.getState().comments, 0);
         assert.equal(api.getState().threads, 0);
         assert.equal(api.getThreads().length, 0);
+        assert.equal(api.getState().hasFeedback, false);
+        const archive = api.getState().archives[0];
+        assert.ok(archive, 'Command handoff must expose a recoverable archive after clearing');
+        assert.equal(archive.commentCount, 2);
+        assert.equal(new Date(archive.createdAt).toISOString(), archive.createdAt);
+        const repoKey = repo.rootUri.toString();
+        const staleKey = vscode.Uri.joinPath(repo.rootUri, 'other-repository').toString();
+        await within('stale repository restore command', () =>
+          vscode.commands.executeCommand('dejareview.restoreArchive', archive.id, staleKey), 5_000);
+        assert.equal(await reviewStore.read(), undefined, 'A stale repoKey must not restore into the selected repository');
+        await within('restore archive command', () =>
+          vscode.commands.executeCommand('dejareview.restoreArchive', archive.id, repoKey), 5_000);
+        assert.equal(await reviewStore.read(), raw);
+        assert.deepEqual(await fs.readFile(feedback), Buffer.from(raw));
+        await api.refresh();
+        assert.equal(api.getState().hasFeedback, true);
+        assert.equal(api.getState().comments, 2);
+        assert.ok(api.getState().threads >= 2);
+        for (const context of captured.slice(1, 3)) { savedThread(context.uri, context.comment.body); }
+        const restored = parse(await reviewStore.read() ?? '');
+        assert.equal(restored.base, base);
+        assert.deepEqual(restored.comments.map(comment => comment.anchorText),
+          captured.slice(1, 3).map(context => context.comment.anchorText));
+
+        const active = appendComment('', { ...captured[0].comment, body: 'New active feedback must survive recovery' });
+        await fs.writeFile(feedback, active);
+        await api.refresh();
+        // Rejections are reported as fire-and-forget notifications, not rejected command promises.
+        await within('restore blocked by current feedback (must not await notification)', () =>
+          vscode.commands.executeCommand('dejareview.restoreArchive', archive.id, repoKey), 5_000);
+        assert.equal(await reviewStore.read(), active);
+        await within('stale repository restore must not overwrite current feedback', () =>
+          vscode.commands.executeCommand('dejareview.restoreArchive', archive.id, staleKey), 5_000);
+        assert.equal(await reviewStore.read(), active);
+        savedThread(working, 'New active feedback must survive recovery');
+
+        await fs.unlink(feedback);
+        await api.refresh();
+        assert.deepEqual(api.getState().archives.find(item => item.id === archive.id), archive,
+          'Recovery must retain the original archive metadata');
+        await within('recover the retained archive again', () =>
+          vscode.commands.executeCommand('dejareview.restoreArchive', archive.id, repoKey), 5_000);
+        assert.equal(await reviewStore.read(), raw, 'The archived record must remain readable after recovery');
+        assert.deepEqual(await Promise.all([working, other].map(uri => vscode.workspace.fs.readFile(uri))), sources);
+        assert.equal(await git.content({ path: 'sample.ts', origin: 'staged' }, repo), indexBefore);
+        await fs.unlink(feedback);
+        await api.refresh();
       } finally {
         await vscode.env.clipboard.writeText(previousClipboard);
       }
@@ -439,7 +503,7 @@ export async function run(): Promise<void> {
         assert.ok(await editor.edit(edit => edit.insert(new vscode.Position(0, 0), '// Inserted in unsaved buffer\n\n')));
         assert.equal(editor.document.isDirty, true);
         assert.equal(await fs.readFile(working.fsPath, 'utf8'), original, 'The anchor must move only in the live buffer');
-        await vscode.commands.executeCommand('loopReview.reanchorAll');
+        await vscode.commands.executeCommand('dejareview.reanchorAll');
         const parsed = parse(await fs.readFile(feedback, 'utf8'));
         assert.deepEqual(parsed.diagnostics, []);
         assert.equal(parsed.comments.length, 1);

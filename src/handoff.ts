@@ -6,7 +6,9 @@ export interface HandoffPort {
   read(): Promise<string | undefined>;
   isDirty(): boolean;
   copy(text: string): Promise<void>;
-  remove(): Promise<void>;
+  /** Resolve only once the exact raw snapshot is durably archived. */
+  archive(snapshot: string): Promise<void>;
+  remove(snapshot: string): Promise<void>;
 }
 
 export type HandoffResult =
@@ -15,14 +17,17 @@ export type HandoffResult =
   | { status: "changed" }
   | { status: "copied" }
   | { status: "copyFailed"; error: unknown }
+  | { status: "archiveFailed"; error: unknown }
   | { status: "deleteFailed"; error: unknown }
   | { status: "readFailed"; error: unknown };
 
 /**
  * The caller owns per-repository mutation serialization and save/discard UI.
- * `copied` includes a file removed externally after clipboard success.
+ * `copied` includes a file removed externally after clipboard success, but
+ * always requires the initial snapshot to have been archived successfully.
  * `dirty` and `readFailed` can occur before or after copying; never restore the
- * clipboard on failure. `changed` and `deleteFailed` imply clipboard success.
+ * clipboard on failure. `archiveFailed`, `changed`, and `deleteFailed` imply
+ * clipboard success; the latter two also imply archive success.
  */
 export async function copyAndClear(port: HandoffPort): Promise<HandoffResult> {
   if (port.isDirty()) return { status: "dirty" };
@@ -45,6 +50,12 @@ export async function copyAndClear(port: HandoffPort): Promise<HandoffResult> {
     return { status: "copyFailed", error };
   }
 
+  try {
+    await port.archive(snapshot);
+  } catch (error) {
+    return { status: "archiveFailed", error };
+  }
+
   if (port.isDirty()) return { status: "dirty" };
 
   let current: string | undefined;
@@ -61,7 +72,7 @@ export async function copyAndClear(port: HandoffPort): Promise<HandoffResult> {
   // Unavoidable filesystem TOCTOU: an external writer can change the file
   // between this check and removal; this port has no atomic compare-and-delete.
   try {
-    await port.remove();
+    await port.remove(snapshot);
   } catch (error) {
     return { status: "deleteFailed", error };
   }
