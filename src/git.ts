@@ -391,21 +391,16 @@ export class GitResources implements vscode.Disposable {
   async filesToReview(repo: Repository, notedPaths: ReadonlySet<string>, excludedFolders: readonly vscode.Uri[] = []): Promise<FileReviewRow[]> {
     const noted = new Set([...notedPaths].map(value => value.replace(/\\/g, '/')));
     const isCurrentCandidate = (uri: vscode.Uri, untracked: boolean): boolean => {
-      try {
-        return !this.disposed && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString()
-          && unstagedCandidates(repo).get(uri.toString())?.untracked === untracked;
-      } catch { return false; }
+      return !this.disposed && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString()
+        && unstagedCandidates(repo).get(uri.toString())?.untracked === untracked;
     };
     const validateCandidate = async (uri: vscode.Uri, untracked: boolean): Promise<boolean> => {
-      try { return await this.repositoryFor(uri) === repo && isCurrentCandidate(uri, untracked); }
-      catch { return false; }
+      if (this.disposed) { return false; }
+      return await this.repositoryFor(uri) === repo && isCurrentCandidate(uri, untracked);
     };
 
-    let candidates: Map<string, FileCandidate>;
-    try {
-      if (await this.workspaceRepository() !== repo) { return []; }
-      candidates = unstagedCandidates(repo);
-    } catch { return []; }
+    if (await this.workspaceRepository() !== repo) { return []; }
+    const candidates = unstagedCandidates(repo);
 
     const rows: (FileCandidate & { row: FileReviewRow })[] = [];
     for (const { uri, untracked } of candidates.values()) {
@@ -415,22 +410,40 @@ export class GitResources implements vscode.Disposable {
         if (uri.scheme !== 'file') { continue; }
         const name = path.basename(uri.fsPath);
         if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
-        resource = await this.resource(uri, repo);
-      } catch { continue; }
-      if (!resource || noted.has(resource.path) || !isCurrentCandidate(uri, untracked)) { continue; }
+        const value = source(uri);
+        const filePath = value && relative(value.file, repo);
+        if (!filePath) { continue; }
+        resource = normalizeResource({ path: filePath, origin: 'changed' });
+      } catch {
+        // Unsupported URI/path shapes are exclusions, not failed discovery.
+        continue;
+      }
+      if (noted.has(resource.path) || !await validateCandidate(uri, untracked)) { continue; }
       const name = path.posix.basename(resource.path);
       if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
       const row: FileReviewRow = { path: resource.path };
+      let validationFailure: { error: unknown } | undefined;
       try {
         let statistics: FileStatistics | undefined;
         if (untracked) {
-          statistics = await untrackedStatistics(uri, row, () => validateCandidate(uri, untracked));
+          statistics = await untrackedStatistics(uri, row, async () => {
+            try {
+              return await validateCandidate(uri, untracked);
+            } catch (error) {
+              validationFailure = { error };
+              throw error;
+            }
+          });
         } else {
           statistics = await trackedStatistics(repo, uri);
         }
         if (!statistics) { continue; }
         Object.assign(row, statistics);
-      } catch { /* Statistics failures must not hide an otherwise reviewable file. */ }
+      } catch {
+        // Ownership failures invalidate the batch, even if a later retry would succeed.
+        if (validationFailure) { throw validationFailure.error; }
+        // Statistics failures must not hide an otherwise reviewable file.
+      }
       if (await validateCandidate(uri, untracked)) { rows.push({ uri, untracked, row }); }
     }
     // Later files can await while earlier entries are staged, removed, or change ownership.

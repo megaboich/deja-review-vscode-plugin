@@ -271,9 +271,8 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     repositories.push({ ...repository, rootUri: file('/repo/packages/app/nested') });
     repository.state.submodules = [{ path: 'packages/app/module' }];
     markers.set('/repo/packages/app/closed/.git', 1);
-    markers.set('/repo/packages/app/denied/.git', Object.assign(new Error('denied'), { code: 'NoPermissions' }));
     const rejected = ['/repo/outside.ts', '/repo/packages/other.ts', '/repo/packages/app/nested/a.ts',
-      '/repo/packages/app/closed/a.ts', '/repo/packages/app/module/a.ts', '/repo/packages/app/denied/a.ts'];
+      '/repo/packages/app/closed/a.ts', '/repo/packages/app/module/a.ts'];
     repository.state.workingTreeChanges = [...rejected.map(target => change(target)), change('/repo/packages/app/src/a.ts')];
     repository.state.untrackedChanges = rejected.map(target => change(target, GitStatus.Untracked));
     assert.deepEqual(await list(), [{ path: 'src/a.ts', insertions: 2, deletions: 1 }]);
@@ -291,10 +290,119 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
       Uri.from({ path: '/repo/a.ts', query: 'query' }),
       Uri.from({ path: '/repo/a.ts', fragment: 'fragment' }),
       Uri.from({ path: '/repo/a.ts', authority: 'remote' }),
-      Uri.file('/repo/../outside.ts'), Uri.file('/repo'),
+      Uri.file('/repo/../outside.ts'), Uri.file('/repo'), Uri.file('/repo/back`tick.ts'),
     ].map(uri => ({ uri } satisfies GitChange));
     assert.deepEqual(await list(), []);
     assert.deepEqual(diffCalls, []);
+    assert.deepEqual(reads, []);
+  });
+
+  await t.test('initial repository discovery errors reject instead of confirming an empty batch', async child => {
+    reset();
+    const adapter = await git.workspaceRepository();
+    assert.ok(adapter);
+    const failure = new Error('Synthetic discovery failure');
+    child.mock.getter(api, 'repositories', () => { throw failure; });
+
+    await assert.rejects(git.filesToReview(adapter, new Set()), error => error === failure);
+    assert.deepEqual(diffCalls, []);
+    assert.deepEqual(reads, []);
+  });
+
+  for (const phase of ['enumeration', 'membership'] as const) {
+    await t.test(`Git state access failure during ${phase} rejects instead of excluding candidates`, async () => {
+      reset();
+      const changes = [change('/repo/a.ts')];
+      let armed = phase === 'enumeration';
+      let failures = 0;
+      const failure = new Error('Synthetic Git state unavailable');
+      repository.state = {
+        ...repository.state,
+        get workingTreeChanges() {
+          if (armed && failures === 0) {
+            failures++;
+            throw failure;
+          }
+          return changes;
+        },
+      };
+      onDiff = async () => { armed = true; };
+
+      await assert.rejects(list(), error => error === failure);
+      assert.equal(failures, 1);
+      assert.deepEqual(await list(), [{ path: 'a.ts', insertions: 2, deletions: 1 }]);
+    });
+  }
+
+  for (const phase of ['workspace', 'resource', 'after diff', 'final batch'] as const) {
+    await t.test(`one-shot boundary stat failure during ${phase} rejects the whole candidate batch`, async () => {
+      reset();
+      workspace.workspaceFolders = [{ uri: Uri.file('/repo/packages/app') }];
+      const first = '/repo/packages/app/src/a.ts';
+      const second = '/repo/packages/app/src/b.ts';
+      repository.state.workingTreeChanges = [change(first), change(second)];
+      const adapter = await git.workspaceRepository();
+      assert.ok(adapter);
+      const failure = Object.assign(new Error('Synthetic boundary access failure'), { code: 'NoPermissions' });
+      let armed = phase === 'workspace' || phase === 'resource';
+      let failures = 0;
+      onDiff = async target => {
+        if (phase === 'after diff' || (phase === 'final batch' && target === second)) {
+          armed = true;
+        }
+      };
+      onStat = async uri => {
+        const target = phase === 'workspace' ? '/repo/packages/app' : first;
+        if (armed && failures === 0 && uri.path === target) {
+          failures++;
+          throw failure;
+        }
+      };
+
+      await assert.rejects(git.filesToReview(adapter, new Set()), { cause: failure });
+      assert.equal(failures, 1);
+      assert.deepEqual(await git.filesToReview(adapter, new Set()), [
+        { path: 'src/a.ts', insertions: 2, deletions: 1 },
+        { path: 'src/b.ts', insertions: 2, deletions: 1 },
+      ], 'A later refresh can retry, but the failed batch must not publish partial rows');
+    });
+  }
+
+  for (const fileStat of [3, 4]) {
+    await t.test(`untracked ownership failure at file stat ${fileStat} is not swallowed as unavailable statistics`, async () => {
+      reset();
+      const target = '/repo/src/new.ts';
+      put(target, 'source\n');
+      repository.state.untrackedChanges = [change(target, GitStatus.Untracked)];
+      const failure = Object.assign(new Error('Synthetic ownership failure'), { code: 'Unavailable' });
+      let fileStats = 0;
+      onStat = async uri => {
+        if (uri.path === target && ++fileStats === fileStat) {
+          throw failure;
+        }
+      };
+
+      await assert.rejects(list(), { cause: failure });
+      assert.equal(fileStats, fileStat);
+      assert.deepEqual(readBudget, new Map());
+      assert.deepEqual(closedHandles, fileStat === 4 ? [target] : []);
+      assert.deepEqual(await list(), [{ path: 'src/new.ts', insertions: 1, deletions: 0 }]);
+    });
+  }
+
+  await t.test('untracked statistics-only stat failure retains an authorized row with unavailable counts', async () => {
+    reset();
+    const target = '/repo/src/new.ts';
+    put(target, 'source\n');
+    repository.state.untrackedChanges = [change(target, GitStatus.Untracked)];
+    let fileStats = 0;
+    onStat = async uri => {
+      if (uri.path === target && ++fileStats === 2) {
+        throw Object.assign(new Error('Synthetic statistics failure'), { code: 'Unavailable' });
+      }
+    };
+
+    assert.deepEqual(await list(), [{ path: 'src/new.ts' }]);
     assert.deepEqual(reads, []);
   });
 
@@ -519,7 +627,11 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
         }
         if (operation === 'read') { onRead = mutate; }
         if (operation === 'diff') { onDiff = mutate; }
-        assert.deepEqual(await git.filesToReview(adapter, new Set()), []);
+        if (mutation === 'boundaryError') {
+          await assert.rejects(git.filesToReview(adapter, new Set()), /Cannot validate Git repository boundaries/);
+        } else {
+          assert.deepEqual(await git.filesToReview(adapter, new Set()), []);
+        }
         assert.equal(triggered, true);
         if (operation === 'ownership' || operation === 'stat') {
           assert.deepEqual(reads, []);

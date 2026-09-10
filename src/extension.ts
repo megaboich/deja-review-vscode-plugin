@@ -30,6 +30,7 @@ type RefreshProjection = {
   historyError: string | undefined;
   staleBase: boolean;
   resources: Map<string, vscode.Uri[]>;
+  visiblePaths: Set<string>;
 };
 
 interface DashboardEditor {
@@ -203,7 +204,10 @@ class ReviewExtension implements vscode.Disposable {
   private files: DashboardState['files'] = [];
   private filesError?: string;
   private filesGeneration = 0;
-  private fileActionBusy = false;
+  private pendingFileAction?: { repo: Repository; file: DashboardState['files'][number]; action: 'stage' | 'revert' };
+  private get fileActionBusy(): boolean {
+    return this.pendingFileAction !== undefined;
+  }
   private threads: vscode.CommentThread[] = [];
   private readonly drafts = new Map<vscode.CommentThread, CapturedContext>();
   private generation = 0;
@@ -255,13 +259,14 @@ class ReviewExtension implements vscode.Disposable {
           this.lastEditor = editor;
           this.lastTab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
         }
-        this.schedule();
       }),
       vscode.window.onDidChangeTextEditorSelection(event => {
         this.lastEditor = event.textEditor;
         this.lastTab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
       }),
-      vscode.window.onDidChangeVisibleTextEditors(() => this.schedule()),
+      vscode.window.onDidChangeVisibleTextEditors(() => {
+        void this.refresh().catch(error => this.error(error));
+      }),
       vscode.workspace.onDidOpenTextDocument(() => this.schedule()),
       vscode.workspace.onDidChangeWorkspaceFolders(() => this.schedule(true)),
       vscode.workspace.onDidChangeTextDocument(event => {
@@ -372,7 +377,11 @@ class ReviewExtension implements vscode.Disposable {
 
     this.dashboard.update({
       repoKey: this.repo?.rootUri.toString(),
-      files: this.files,
+      files: this.files.map(file => ({
+        ...file,
+        pending: this.pendingFileAction && this.pendingFileAction.repo === this.repo && this.pendingFileAction.file.path === file.path
+          ? this.pendingFileAction.action : undefined,
+      })),
       filesError: this.filesError,
       hasFeedback: this.hasFeedback,
       commentCount: this.savedEntries.length,
@@ -590,6 +599,10 @@ class ReviewExtension implements vscode.Disposable {
     if (this.disposed) {
       return;
     }
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
     this.generation++;
     this.filesGeneration++;
     if (!this.refreshing) {
@@ -708,6 +721,8 @@ class ReviewExtension implements vscode.Disposable {
     repo: Repository,
     { text, parsed }: Awaited<ReturnType<ReviewStore['load']>>,
   ): Promise<RefreshProjection> {
+    const visibleDocuments = vscode.window.visibleTextEditors.map(editor => editor.document);
+    const visibleUris = new Set(visibleDocuments.map(document => document.uri.toString()));
     let archives: ReviewArchive[] = [];
     let historyError: string | undefined;
     if (!text?.trim()) {
@@ -749,7 +764,9 @@ class ReviewExtension implements vscode.Disposable {
     }
 
     const resources = new Map<string, vscode.Uri[]>();
-    for (const doc of vscode.workspace.textDocuments) {
+    const visiblePaths = new Set<string>();
+    const documents = new Map([...vscode.workspace.textDocuments, ...visibleDocuments].map(doc => [doc.uri.toString(), doc]));
+    for (const doc of documents.values()) {
       if (doc.isClosed || !['file', 'git'].includes(doc.uri.scheme)) {
         continue;
       }
@@ -758,21 +775,27 @@ class ReviewExtension implements vscode.Disposable {
         if (resource) {
           const key = `${resource.origin}:${resource.path}`;
           resources.set(key, [...(resources.get(key) ?? []), doc.uri]);
+          if (visibleUris.has(doc.uri.toString())) {
+            visiblePaths.add(resource.path);
+          }
         }
       } catch {
         // Unrelated or unsupported virtual documents are not review targets.
       }
     }
-    return { text, parsed, entries, files, filesError, archives, historyError, staleBase, resources };
+    return { text, parsed, entries, files, filesError, archives, historyError, staleBase, resources, visiblePaths };
   }
 
   private publishProjection(projection: RefreshProjection, store: ReviewStore, repo: Repository, generation: number): void {
-    const { text, parsed, entries, files, filesError, archives, historyError, staleBase, resources } = projection;
+    const { text, parsed, entries, files, filesError, archives, historyError, staleBase, resources, visiblePaths } = projection;
     this.entries = entries;
     this.publishedGeneration = generation;
     this.savedEntries = [...entries, ...parsed.generalNotes.map(comment => ({ comment, repo, snapshot: text ?? '' }))]
       .sort((a, b) => a.comment.startOffset - b.comment.startOffset);
-    this.files = files.map(file => ({ ...file, id: file.path }));
+    // A failed candidate read is not evidence that the previous rows disappeared.
+    this.files = (filesError ? this.files : files).map(file => ({
+      ...file, id: file.path, visible: visiblePaths.has(file.path),
+    }));
     this.filesError = filesError;
     this.archives = archives;
     this.hasFeedback = !!text?.trim();
@@ -1169,10 +1192,11 @@ class ReviewExtension implements vscode.Disposable {
     const repo = this.repo;
     const file = this.files.find(file => file.id === id);
     if (!repo || !file) { return; }
-    this.fileActionBusy = true;
-    this.updateDashboard();
+    this.pendingFileAction = { repo, file, action: revert ? 'revert' : 'stage' };
     const generation = this.filesGeneration;
+    let failure: { error: unknown } | undefined;
     try {
+      this.updateDashboard();
       const validate = (): void => {
         if (this.disposed || this.repo !== repo || this.copyInProgress || this.store?.busy
           || this.filesGeneration !== generation || !this.files.includes(file)
@@ -1191,10 +1215,30 @@ class ReviewExtension implements vscode.Disposable {
       } else {
         await this.git.stageFile(repo, file.path, notedPaths, [this.context.globalStorageUri], validate);
       }
+    } catch (error) {
+      failure = { error };
+    }
+
+    try {
+      // Keep the captured row pending until current Git candidates are published,
+      // including cancellation and failures. Never remove a row optimistically.
+      await this.refresh();
+    } catch (error) {
+      failure ??= { error };
     } finally {
-      this.fileActionBusy = false;
+      this.pendingFileAction = undefined;
       this.updateDashboard();
-      this.schedule(true);
+    }
+    // Scope transitions are deferred while the file-action lock is held.
+    if (vscode.workspace.workspaceFolders?.[0]?.uri.toString() !== repo.rootUri.toString()) {
+      try {
+        await this.refresh();
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+    if (failure) {
+      throw failure.error;
     }
   }
 

@@ -26,10 +26,12 @@ export function isDashboardHostMessage(value: unknown): value is DashboardHostMe
     return typeof data === 'number' && Number.isSafeInteger(data) && data >= 0;
   }
   function file(data: unknown): boolean {
-    return record(data) && keys(data, ['id', 'path'], ['insertions', 'deletions'])
+    return record(data) && keys(data, ['id', 'path'], ['insertions', 'deletions', 'visible', 'pending'])
       && text(data.id) && typeof data.path === 'string'
       && (data.insertions === undefined || count(data.insertions))
-      && (data.deletions === undefined || count(data.deletions));
+      && (data.deletions === undefined || count(data.deletions))
+      && (data.visible === undefined || typeof data.visible === 'boolean')
+      && (data.pending === undefined || data.pending === 'stage' || data.pending === 'revert');
   }
   function note(data: unknown): boolean {
     if (!record(data) || !text(data.id) || typeof data.preview !== 'string') {
@@ -100,6 +102,8 @@ export function dashboardClient(
     insertions: HTMLSpanElement;
     deletions: HTMLSpanElement;
     unknown: HTMLSpanElement;
+    eye: HTMLSpanElement;
+    status: HTMLSpanElement;
     current: File;
     repoKey: string | undefined;
   };
@@ -139,6 +143,8 @@ export function dashboardClient(
   const body = byId('editor-body') as HTMLTextAreaElement;
   const noteRows = new Map<string, NoteRow>();
   const fileRows = new Map<string, FileRow>();
+  const exitingFiles = new Map<string, { row: FileRow; animation: Animation }>();
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
   const archiveRows = new Map<string, ArchiveRow>();
   let state: DashboardState | undefined;
   let renderedRepoKey: string | undefined;
@@ -365,7 +371,7 @@ export function dashboardClient(
   }
 
   function sendFile(type: 'openFile' | 'revertFile' | 'stageFile', row: FileRow): void {
-    if (!state?.repoKey || state.busy || state.editor || row.repoKey !== state.repoKey) {
+    if (!state?.repoKey || state.busy || state.editor || row.current.pending || row.repoKey !== state.repoKey) {
       return;
     }
     if (!row.item.isConnected || fileRows.get(row.current.id) !== row) {
@@ -392,7 +398,18 @@ export function dashboardClient(
     const unknown = document.createElement('span');
     unknown.className = 'muted';
     unknown.textContent = 'Stats unavailable';
-    open.append(name, insertions, deletions, unknown);
+    const eye = document.createElement('span');
+    eye.className = 'file-visible';
+    eye.title = 'Visible in editor';
+    eye.setAttribute('aria-hidden', 'true');
+    eye.append(icon('eye-icon'));
+    const status = document.createElement('span');
+    status.className = 'file-progress';
+    status.setAttribute('role', 'status');
+    const label = document.createElement('span');
+    label.className = 'file-label';
+    label.append(eye, name);
+    open.append(label, insertions, deletions, unknown);
 
     const revert = document.createElement('button');
     revert.type = 'button';
@@ -406,10 +423,10 @@ export function dashboardClient(
     stage.title = 'Stage File';
     stage.setAttribute('aria-label', 'Stage File');
     stage.append(icon('stage-icon'));
-    item.append(open, revert, stage);
+    item.append(open, revert, stage, status);
 
     const row: FileRow = {
-      item, open, revert, stage, name, insertions, deletions, unknown, current: file, repoKey,
+      item, open, revert, stage, name, insertions, deletions, unknown, eye, status, current: file, repoKey,
     };
     open.addEventListener('click', () => sendFile('openFile', row));
     revert.addEventListener('click', () => sendFile('revertFile', row));
@@ -421,6 +438,21 @@ export function dashboardClient(
     row.current = file;
     row.name.textContent = file.path.slice(file.path.lastIndexOf('/') + 1);
     row.open.title = file.path;
+    row.eye.hidden = file.visible !== true;
+    row.status.hidden = !file.pending;
+    row.status.textContent = file.pending === 'stage' ? 'Staging file' : '';
+    if (file.pending === 'revert') {
+      row.status.textContent = 'Reverting file';
+    }
+    row.item.className = 'file-row';
+    if (file.visible) {
+      row.item.className += ' file-in-editor';
+    }
+    if (file.pending) {
+      row.item.className += ' file-pending';
+    }
+    row.item.setAttribute('aria-busy', String(!!file.pending));
+    blocked = blocked || !!file.pending;
 
     const labels: string[] = [];
     for (const key of ['insertions', 'deletions'] as const) {
@@ -439,10 +471,54 @@ export function dashboardClient(
     if (!row.unknown.hidden) {
       labels.push('Stats unavailable');
     }
+    if (file.visible) {
+      labels.push('Visible in editor');
+    }
     row.open.setAttribute('aria-label', 'Open file: ' + file.path + ', ' + labels.join(', '));
     row.open.disabled = blocked;
     row.revert.disabled = blocked;
     row.stage.disabled = blocked;
+  }
+
+  function removeFileRow(id: string, row: FileRow): void {
+    fileRows.delete(id);
+    row.item.inert = true;
+    row.item.setAttribute('aria-hidden', 'true');
+    row.open.disabled = true;
+    row.revert.disabled = true;
+    row.stage.disabled = true;
+    if (reducedMotion.matches) {
+      row.item.remove();
+      return;
+    }
+
+    const height = row.item.getBoundingClientRect().height;
+    const style = window.getComputedStyle(row.item);
+    // Border-box height alone cannot collapse padding/borders. Block layout keeps
+    // the content from recentering or shrinking while the outer row is clipped.
+    row.item.className += ' file-exiting';
+    const animation = row.item.animate([
+      {
+        height: height + 'px', opacity: 1,
+        paddingTop: style.paddingTop, paddingBottom: style.paddingBottom,
+        marginTop: style.marginTop, marginBottom: style.marginBottom,
+        borderTopWidth: style.borderTopWidth, borderBottomWidth: style.borderBottomWidth,
+      },
+      {
+        height: '0px', opacity: 0, paddingTop: '0px', paddingBottom: '0px',
+        marginTop: '0px', marginBottom: '0px', borderTopWidth: '0px', borderBottomWidth: '0px',
+      },
+    ], { duration: 160, easing: 'ease-out', fill: 'forwards' });
+    exitingFiles.set(id, { row, animation });
+    const cleanup = (): void => {
+      if (exitingFiles.get(id)?.animation !== animation) {
+        return;
+      }
+      exitingFiles.delete(id);
+      row.item.remove();
+      animation.cancel();
+    };
+    void animation.finished.then(cleanup, cleanup);
   }
 
   function renderFiles(current: DashboardState, blocked: boolean): void {
@@ -451,23 +527,33 @@ export function dashboardClient(
     byId('files-error').textContent = current.filesError || '';
     byId('files-error').hidden = !current.filesError;
     const files = current.repoKey ? current.files : [];
+    byId('files-title').textContent = 'Files to Review (' + files.length + ')';
     byId('no-files').hidden = files.length > 0;
     const ids = new Set(files.map(file => file.id));
     for (const [id, row] of fileRows) {
       if (!ids.has(id)) {
-        row.item.remove();
-        fileRows.delete(id);
+        removeFileRow(id, row);
       }
     }
     files.forEach((file, index) => {
       let row = fileRows.get(file.id);
+      const exiting = exitingFiles.get(file.id);
+      if (exiting) {
+        exitingFiles.delete(file.id);
+        exiting.animation.cancel();
+        row = exiting.row;
+        row.item.inert = false;
+        row.item.removeAttribute('aria-hidden');
+        fileRows.set(file.id, row);
+      }
       if (!row) {
         row = createFileRow(file, current.repoKey);
         fileRows.set(file.id, row);
       }
       updateFileRow(row, file, blocked);
-      if (list.children[index] !== row.item) {
-        list.insertBefore(row.item, list.children[index] || null);
+      const active = Array.from(list.children).filter(item => !(item as HTMLElement).inert);
+      if (active[index] !== row.item) {
+        list.insertBefore(row.item, active[index] || null);
       }
     });
   }
@@ -768,6 +854,11 @@ export function dashboardClient(
       row.item.remove();
     }
     fileRows.clear();
+    for (const { row, animation } of exitingFiles.values()) {
+      row.item.remove();
+      animation.cancel();
+    }
+    exitingFiles.clear();
     renderedRepoKey = repoKey;
   }
 
@@ -831,6 +922,16 @@ export function dashboardClient(
   restoreTransport();
   setupToolbarEvents();
   setupEditorEvents();
+  reducedMotion.addEventListener('change', () => {
+    if (!reducedMotion.matches) {
+      return;
+    }
+    for (const { row, animation } of exitingFiles.values()) {
+      row.item.remove();
+      animation.cancel();
+    }
+    exitingFiles.clear();
+  });
   window.addEventListener('message', receiveHostMessage);
   vscode.postMessage({ type: 'ready' });
 }

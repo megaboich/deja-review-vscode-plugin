@@ -376,11 +376,22 @@ test("static shell has nonce-only CSP, accessible full-text copy button and resp
   }
   assert.doesNotMatch(html, /select-repository|<header\b|<h1\b|id="repository"|repoName/);
   assert.match(html, /<button id="copy"[^>]*>[^<]*<\/button>\s*<section id="files-section"[^>]*>[\s\S]*?<\/section>\s*<p id="count"[^>]*>0 review notes<\/p>/);
-  assert.match(html, /<h2 id="files-title">Files to Review<\/h2>/);
+  assert.match(html, /<h2 id="files-title">Files to Review \(0\)<\/h2>/);
   assert.match(html, /<p id="no-files" class="muted">No files to review\.<\/p>/);
   assert.match(html, /\.file-insertions \{ color: var\(--vscode-gitDecoration-addedResourceForeground,/);
   assert.match(html, /\.file-deletions \{ color: var\(--vscode-gitDecoration-deletedResourceForeground,/);
   assert.match(html, /\.file-row\s*\{[^}]*position: relative;/);
+  assert.match(html, /\.file-exiting\s*\{[^}]*display: block;[^}]*overflow: hidden;[^}]*min-height: 0;[^}]*pointer-events: none;/);
+  assert.match(html, /\.file-pending\s*\{ box-shadow: inset 2px 0 var\(--vscode-progressBar-background\); \}/);
+  assert.match(html, /\.file-in-editor\s*\{ background: var\(--vscode-list-inactiveSelectionBackground, var\(--vscode-list-hoverBackground\)\); \}/);
+  const progressStyles = matchedText(html, /\.file-progress\s*\{([^}]+)\}/, 1);
+  assert.match(progressStyles, /position: absolute/);
+  assert.match(progressStyles, /clip-path: inset\(50%\)/);
+  const labelStyles = matchedText(html, /\.file-label\s*\{([^}]+)\}/, 1);
+  assert.match(labelStyles, /display: flex/);
+  assert.doesNotMatch(labelStyles, /flex-wrap: wrap/);
+  assert.doesNotMatch(html, /\.file-exiting \.file-progress/);
+  assert.match(html, /\.file-visible\s*\{ color: var\(--vscode-icon-foreground\);/);
   assert.match(html, /\.file-open\s*\{[^}]*padding-right: 70px;/);
   const actionStyle = matchedText(html, /\.file-action\s*\{([^}]+)\}/, 1);
   assert.match(actionStyle, /position: absolute;\s*right: 4px;[\s\S]*width: 28px;\s*height: 28px;\s*padding: 6px;/);
@@ -514,6 +525,151 @@ test("provider normalizes the first two source lines to LF and bounds previews t
   dashboard.dispose();
 });
 
+test("file count badge updates before ready, while hidden and on replacement resolution", () => {
+  const dashboard = new ReviewDashboard(() => {});
+  dashboard.update(state());
+  const fixture = viewFixture();
+  fixture.resolve(dashboard);
+  assert.deepEqual(fixture.view.badge, { value: 1, tooltip: '1 file to review · 2 Review Notes' });
+  assert.equal(fixture.messages.length, 0);
+  fixture.hide();
+  dashboard.update(state({ commentCount: 1, files: [{ id: 'a', path: 'a' }, { id: 'b', path: 'b', pending: 'stage' }] }));
+  assert.equal(fixture.view.visible, false);
+  assert.deepEqual(fixture.view.badge, { value: 2, tooltip: '2 files to review · 1 Review Note' });
+  fixture.send({ type: 'ready' });
+  dashboard.update(state({ files: [] }));
+  assert.equal(fixture.view.badge, undefined);
+  dashboard.update(state());
+  dashboard.update(state({ repoKey: undefined }));
+  assert.equal(fixture.view.badge, undefined, 'no folder hides even a nonempty stale list');
+  dashboard.update(state());
+  fixture.close();
+  dashboard.update(state({ commentCount: 0, files: [{ id: 'other', path: 'other' }, { id: 'new', path: 'new' }] }));
+  const replacement = viewFixture();
+  replacement.resolve(dashboard);
+  assert.deepEqual(replacement.view.badge, { value: 2, tooltip: '2 files to review · 0 Review Notes' });
+  dashboard.dispose();
+});
+
+test("zero candidates clear retained Activity Bar counts on older VS Code hosts", () => {
+  const dashboard = new ReviewDashboard(() => {});
+  const fixture = viewFixture();
+  type Badge = typeof fixture.view.badge;
+  let badge: Badge;
+  let activity: Badge = { value: 1, tooltip: 'Previously rendered count' };
+  const writes: Badge[] = [];
+  // Model the old WebviewViewPane: undefined updates the API value but does
+  // not dispose the activity. NumberBadge(0) is hidden by the Activity Bar.
+  Object.defineProperty(fixture.view, 'badge', {
+    get: (): Badge => badge,
+    set: (value: Badge): void => {
+      writes.push(value);
+      if (badge?.value === value?.value && badge?.tooltip === value?.tooltip) {
+        return;
+      }
+      badge = value;
+      if (value) {
+        activity = value;
+      }
+    },
+  });
+
+  fixture.resolve(dashboard);
+  assert.equal(activity?.value, 0, 'empty startup clears activity retained from an earlier view');
+  assert.equal(fixture.view.badge, undefined);
+
+  for (const emptyState of [state({ files: [] }), state({ repoKey: undefined })]) {
+    dashboard.update(state());
+    assert.equal(activity?.value, 1);
+    fixture.hide();
+    dashboard.update(emptyState);
+    assert.deepEqual(writes.slice(-2), [{ value: 0, tooltip: '' }, undefined]);
+    assert.equal(activity?.value, 0, 'the Activity Bar no longer displays the last file count');
+    assert.equal(activity?.tooltip, '', 'no stale file or note count remains in the activity tooltip');
+    assert.equal(fixture.view.badge, undefined);
+    fixture.show();
+    fixture.send({ type: 'ready' });
+    assert.equal(activity?.value, 0);
+  }
+
+  dashboard.update(state());
+  assert.equal(activity?.value, 1, 'new candidates restore the badge normally');
+  dashboard.dispose();
+});
+
+test("file optional metadata is exactly validated and whitelisted in the serialized client protocol", () => {
+  const dashboard = new ReviewDashboard(() => {});
+  const fixture = viewFixture();
+  fixture.resolve(dashboard);
+  fixture.send({ type: 'ready' });
+  for (const visible of [undefined, false, true]) {
+    for (const pending of [undefined, 'stage', 'revert'] as const) {
+      const file = { id: 'a', path: 'a', visible, pending };
+      const message = { type: 'state', state: state({ files: [file] }) };
+      assert.equal(isDashboardHostMessage(message), true);
+      const privateFile = { ...file, privateData: 'PRIVATE' };
+      dashboard.update(state({ files: [privateFile] }));
+      assert.equal(fixture.latestState.files[0].visible, visible);
+      assert.equal(fixture.latestState.files[0].pending, pending);
+      assert.doesNotMatch(JSON.stringify(fixture.latestState), /PRIVATE|privateData/);
+      assert.equal(isDashboardHostMessage({ ...message, state: { ...state(), files: [{ ...file, extra: undefined }] } }), false);
+    }
+  }
+  const client = scriptFixture();
+  client.update(state());
+  for (const fields of [
+    ...[null, 0, 'true', {}, []].map(visible => ({ visible })),
+    ...[null, false, 1, '', 'staging', 'reverting', {}, []].map(pending => ({ pending })),
+  ]) {
+    const message = { type: 'state', state: { ...state(), files: [{ id: 'a', path: 'a', ...fields }] } };
+    assert.equal(isDashboardHostMessage(message), false);
+    client.receive(message);
+    assert.equal(client.element('files').children[0].children[0].title, 'src/example.ts');
+  }
+  dashboard.dispose();
+});
+
+for (const type of ['stageFile', 'revertFile'] as const) test(`${type} publishes targeted pending before owner dispatch and clears it on settlement`, async () => {
+  let finish: (() => void) | undefined;
+  const fixture = viewFixture();
+  const pending = type === 'stageFile' ? 'stage' : 'revert';
+  let calls = 0;
+  const dashboard = new ReviewDashboard(() => {
+    calls++;
+    assert.equal(fixture.latestState.busy, true);
+    assert.equal(fixture.latestState.files[0].pending, pending);
+    assert.equal(fixture.latestState.files[1].pending, undefined);
+    return new Promise<void>(resolve => { finish = resolve; });
+  });
+  const current = state({ files: [{ id: 'a', path: 'a' }, { id: 'b', path: 'b' }] });
+  dashboard.update(current);
+  fixture.resolve(dashboard);
+  fixture.send({ type: 'ready' });
+  fixture.send({ type, repoKey: '/other', fileId: 'a' });
+  fixture.send({ type, repoKey: '/repo', fileId: 'missing' });
+  assert.equal(calls, 0);
+  fixture.send({ type, repoKey: '/repo', fileId: 'a' });
+  assert.equal(calls, 1);
+  dashboard.update(current);
+  assert.equal(fixture.latestState.files[0].pending, pending);
+  fixture.send({ type, repoKey: '/repo', fileId: 'b' });
+  assert.equal(calls, 1);
+  dashboard.update({ ...current, repoKey: '/other' });
+  assert.equal(fixture.latestState.files[0].pending, undefined, 'never decorate a matching ID in another folder');
+  dashboard.update(current);
+  assert.ok(finish);
+  finish();
+  await settle();
+  assert.deepEqual(fixture.latestState.files, current.files);
+  assert.equal(fixture.latestState.busy, false);
+  dashboard.update({ ...current, files: [{ id: 'a', path: 'a', pending }] });
+  for (const action of ['openFile', 'stageFile', 'revertFile']) {
+    fixture.send({ type: action, repoKey: '/repo', fileId: 'a' });
+  }
+  assert.equal(calls, 1, 'owner-published pending also rejects row actions');
+  dashboard.dispose();
+});
+
 test("provider whitelists file metadata, snapshots it and leaves unknown counts optional", () => {
   const dashboard = new ReviewDashboard(() => {});
   const fixture = viewFixture();
@@ -580,7 +736,8 @@ for (const type of ["openFile", "revertFile", "stageFile"]) test(`provider valid
     fixture.send({ ...action, fileId: "image.png" });
     assert.equal(actions.length, count, "in-flight file actions are serialized");
     assert.equal(fixture.latestState.busy, type !== "openFile");
-    assert.deepEqual(fixture.latestState.files, current.files, "no optimistic candidate removal");
+    assert.deepEqual(fixture.latestState.files, current.files.map(file => type === 'openFile' ? file
+      : { ...file, pending: type === 'stageFile' ? 'stage' : 'revert' }), "no optimistic candidate removal");
     assert.ok(finish, "Expected a pending file action");
     finish();
     await settle();
@@ -1889,7 +2046,7 @@ test("modal cancel buttons, busy guards, new session initialization and cross-fo
   element("editor-body").dispatch("input");
   assert.equal(element("note-editor").dispatch("cancel"), true);
   for (const row of [...element("files").children, ...element("notes").children]) {
-    for (const button of row.children) {
+    for (const button of row.children.filter(child => child.tagName === 'button')) {
       assert.equal(button.disabled, true);
       button.invokeListener("click");
     }
@@ -2006,7 +2163,7 @@ test("busy transitions reuse keyed rows and all descendants while disabling cont
   };
   capture(element("dashboard"));
   const controls = [element("copy"), element("add-general"), element("more"), element("show-archives"),
-    ...element("files").children.flatMap(row => row.children),
+    ...element("files").children.flatMap(row => row.children.filter(child => child.tagName === 'button')),
     ...element("notes").children.flatMap(row => row.children)];
   for (const busy of [true, false, true, false]) {
     update({ ...current, busy });
@@ -2029,6 +2186,157 @@ test("busy transitions reuse keyed rows and all descendants while disabling cont
   }
   element("files").children[0].children[2].click();
   assert.deepEqual({ ...lastMessage(messages) }, { type: "stageFile", repoKey: "/repo", fileId: "files:0" });
+});
+
+test("file heading counts confirmed candidates and visible/pending metadata updates only the targeted keyed row", () => {
+  const client = scriptFixture();
+  const files: DashboardState['files'] = [{ id: 'a', path: 'a', visible: true }, { id: 'b', path: 'b' }];
+  client.update(state({ files }));
+  assert.equal(client.element('files-title').textContent, 'Files to Review (2)');
+  const [first, second] = client.element('files').children;
+  const fileLabel = first.children[0].children[0];
+  const eye = fileLabel.children[0];
+  assert.equal(fileLabel.className, 'file-label');
+  assert.equal(fileLabel.children[1].className, 'file-name', 'eye precedes the filename inside a shared nonwrapping label');
+  assert.equal(first.className, 'file-row file-in-editor');
+  assert.equal(eye.tagName, 'span');
+  assert.equal(eye.title, 'Visible in editor');
+  assert.equal(eye.attributes.get('aria-hidden'), 'true');
+  assert.equal(eye.hidden, false);
+  assert.equal(eye.listeners.size, 0);
+  assert.match(first.children[0].attributes.get('aria-label') || '', /Visible in editor/);
+  assert.equal(second.children[0].children[0].children[0].hidden, true);
+  for (const pending of ['stage', 'revert'] as const) {
+    client.update(state({ files: [{ ...files[0], pending }, files[1]], busy: true }));
+    assert.equal(client.element('files').children[0], first);
+    assert.equal(first.className, 'file-row file-in-editor file-pending');
+    assert.equal(first.attributes.get('aria-busy'), 'true');
+    assert.equal(first.children[3].attributes.get('role'), 'status');
+    assert.equal(first.children[3].hidden, false);
+    assert.equal(first.children[3].textContent, pending === 'stage' ? 'Staging file' : 'Reverting file');
+    assert.equal(second.className, 'file-row');
+    assert.equal(second.children[3].hidden, true);
+    for (const row of [first, second]) {
+      for (const button of row.children.slice(0, 3)) {
+        assert.equal(button.disabled, true);
+        button.invokeListener('click');
+      }
+    }
+    client.update(state({ files: [{ ...files[0], pending }, files[1]] }));
+    first.children[0].invokeListener('click');
+    assert.equal(first.children[0].disabled, true, 'pending row is read-only independently of global busy');
+    assert.equal(second.children[0].disabled, false);
+    assert.equal(client.messages.length, 1);
+  }
+  client.update(state({ files: [{ ...files[0], visible: false }, files[1]] }));
+  assert.equal(first.className, 'file-row');
+  assert.equal(first.children[3].hidden, true);
+  assert.equal(eye.hidden, true);
+  assert.doesNotMatch(first.children[0].attributes.get('aria-label') || '', /Visible in editor/);
+  assert.equal(first.children[0].disabled, false);
+  client.update(state({ files: [] }));
+  assert.equal(client.element('files-title').textContent, 'Files to Review (0)');
+});
+
+test("confirmed removals collapse actual row boxes, stay inert and clean up on animation settlement", async () => {
+  const client = scriptFixture();
+  client.setReducedMotion(false);
+  client.update(state());
+  const row = client.element('files').children[0];
+  row.height = 93;
+  row.children[2].click();
+  assert.equal(row.animations.length, 0, 'a click is not confirmed removal');
+  client.update(state({ busy: true, files: [{ ...state().files[0], pending: 'stage' }] }));
+  assert.equal(row.animations.length, 0, 'pending is not confirmed removal');
+  client.update(state({ files: [] }));
+  assert.equal(row.isConnected, true);
+  assert.equal(row.inert, true);
+  assert.equal(row.attributes.get('aria-hidden'), 'true');
+  assert.equal(client.element('files-title').textContent, 'Files to Review (0)');
+  assert.equal(client.element('no-files').hidden, false);
+  for (const button of row.children.slice(0, 3)) {
+    assert.equal(button.disabled, true);
+    button.invokeListener('click');
+  }
+  assert.equal(client.messages.length, 2, 'exiting handles have no candidate membership');
+  const animation = row.animations[0];
+  assert.deepEqual({ ...animation.options }, { duration: 160, easing: 'ease-out', fill: 'forwards' });
+  assert.deepEqual({ ...animation.frames[0] }, {
+    height: '93px', opacity: 1, paddingTop: '10px', paddingBottom: '10px', marginTop: '0px', marginBottom: '0px',
+    borderTopWidth: '0px', borderBottomWidth: '1px',
+  });
+  assert.deepEqual({ ...animation.frames[1] }, {
+    height: '0px', opacity: 0, paddingTop: '0px', paddingBottom: '0px', marginTop: '0px', marginBottom: '0px',
+    borderTopWidth: '0px', borderBottomWidth: '0px',
+  });
+  client.update(state({ files: [] }));
+  assert.equal(row.animations.length, 1, 'refresh must not restart an exit');
+  animation.finish();
+  await Promise.resolve();
+  assert.equal(row.isConnected, false);
+  assert.equal(animation.cancelled, true);
+  assert.equal(client.element('files').children.length, 0);
+});
+
+test("concurrent exits survive reorder, reappearing rows cancel and reuse, and old settlements cannot remove new rows", async () => {
+  const client = scriptFixture();
+  client.setReducedMotion(false);
+  const [a, b, c, d] = ['a', 'b', 'c', 'd'].map(id => ({ id, path: id }));
+  client.update(state({ files: [a, b, c, d] }));
+  const [rowA, rowB, rowC, rowD] = client.element('files').children;
+  client.update(state({ files: [a, c] }));
+  assert.deepEqual(client.element('files').children, [rowA, rowB, rowC, rowD], 'exits keep their layout positions');
+  client.update(state({ files: [c, a, b] }));
+  assert.equal(rowB.animations[0].cancelled, true);
+  assert.equal(rowB.inert, false);
+  assert.equal(rowB.attributes.has('aria-hidden'), false);
+  assert.equal(rowB.children[0].disabled, false);
+  assert.deepEqual(client.element('files').children.filter(row => !row.inert), [rowC, rowA, rowB]);
+  assert.equal(client.element('files-title').textContent, 'Files to Review (3)');
+  client.update(state({ files: [c, a] }));
+  assert.equal(rowB.animations.length, 2);
+  await Promise.resolve();
+  assert.equal(rowB.isConnected, true, 'cancelled first animation cannot clean up the second exit');
+  rowD.animations[0].finish();
+  await Promise.resolve();
+  assert.equal(rowD.isConnected, false);
+  assert.equal(rowB.isConnected, true);
+  rowB.animations[1].cancel();
+  await Promise.resolve();
+  assert.equal(rowB.isConnected, false, 'external cancellation cleans up without an unhandled rejection');
+  assert.deepEqual(client.element('files').children, [rowC, rowA]);
+});
+
+test("folder changes and reduced motion immediately clear exits and never animate across scopes", async () => {
+  const client = scriptFixture();
+  client.setReducedMotion(false);
+  client.update(state());
+  const old = client.element('files').children[0];
+  client.update(state({ files: [] }));
+  client.update(state({ repoKey: '/other' }));
+  const replacement = client.element('files').children[0];
+  assert.notEqual(old, replacement);
+  assert.equal(old.isConnected, false);
+  assert.equal(old.animations[0].cancelled, true);
+  await Promise.resolve();
+  assert.equal(replacement.isConnected, true);
+  client.update(state({ repoKey: '/other', files: [] }));
+  client.setReducedMotion(true);
+  assert.equal(replacement.isConnected, false);
+  assert.equal(replacement.animations[0].cancelled, true);
+  client.update(state());
+  const reduced = client.element('files').children[0];
+  client.update(state({ files: [] }));
+  assert.equal(reduced.isConnected, false);
+  assert.equal(reduced.animations.length, 0);
+  client.setReducedMotion(false);
+  client.update(state());
+  const noFolder = client.element('files').children[0];
+  client.update(state({ repoKey: undefined }));
+  assert.equal(noFolder.isConnected, false);
+  assert.equal(noFolder.animations.length, 0);
+  assert.equal(client.element('files-title').textContent, 'Files to Review (0)');
+  await Promise.resolve();
 });
 
 test("files without feedback render text-only stats and sibling accessible revert/stage icons without optimistic removal", () => {
@@ -2060,10 +2368,14 @@ test("files without feedback render text-only stats and sibling accessible rever
     assert.deepEqual(row.children.map(node => [node.tagName, node.className, node.type]), [
       ["button", "file-open", "button"], ["button", "file-action file-revert", "button"],
       ["button", "file-action file-stage", "button"],
+      ["span", "file-progress", ""],
     ]);
     const [open, revert, stage] = row.children;
     assert.equal(open.title, files[index].path);
-    for (const child of open.children) assert.equal(child.children.length, 0, "metadata stays text-only");
+    const filename = open.children[0].children[1];
+    for (const child of [filename, ...open.children.slice(1)]) {
+      assert.equal(child.children.length, 0, "metadata stays text-only");
+    }
     for (const [button, action, label] of [[revert, "revert", "Revert File"], [stage, "stage", "Stage File"]] as const) {
       const template = element(`${action}-icon`).content;
       assert.ok(template);
@@ -2101,7 +2413,7 @@ test("files without feedback render text-only stats and sibling accessible rever
     assert.deepEqual({ ...lastMessage(messages) }, { type: "openFile", repoKey: "/repo", fileId: files[index].id });
   }
   const known = rows[0].children[0];
-  assert.equal(known.children[0].textContent, `${unsafe}.ts`);
+  assert.equal(known.children[0].children[1].textContent, `${unsafe}.ts`);
   assert.equal(known.children[1].textContent, "+2");
   assert.equal(known.children[1].className, "file-insertions");
   assert.equal(known.children[2].textContent, "-1");
@@ -2122,7 +2434,7 @@ test("files without feedback render text-only stats and sibling accessible rever
   update({ ...current, busy: true });
   for (const row of rows) {
     assert.equal(row.isConnected, true);
-    for (const button of row.children) {
+    for (const button of row.children.filter(child => child.tagName === 'button')) {
       assert.equal(button.disabled, true);
       button.click();
       button.invokeListener("click");
@@ -2133,7 +2445,7 @@ test("files without feedback render text-only stats and sibling accessible rever
   assert.equal(element("files-error").textContent, "File action failed");
   assert.equal(element("files").children.length, 3);
   assert.equal(element("files").children[0], rows[0]);
-  for (const button of rows[0].children) assert.equal(button.disabled, false, "actions can be retried after busy clears");
+  for (const button of rows[0].children.filter(child => child.tagName === 'button')) assert.equal(button.disabled, false, "actions can be retried after busy clears");
   update({ ...current, files: [], filesError: undefined });
   assert.equal(element("files-section").hidden, false);
   assert.equal(element("files").children.length, 0);
@@ -2163,7 +2475,7 @@ for (const [buttonIndex, type] of ["openFile", "revertFile", "stageFile"].entrie
   assert.deepEqual(element("files").children, [secondRow, firstRow]);
   assert.equal(document.activeElement, button);
   assert.equal(open.title, "renamed.ts");
-  assert.equal(open.children[0].textContent, "renamed.ts");
+  assert.equal(open.children[0].children[1].textContent, "renamed.ts");
   assert.equal(open.children[1].textContent, "");
   assert.equal(open.children[1].hidden, true);
   assert.equal(open.children[3].hidden, false);

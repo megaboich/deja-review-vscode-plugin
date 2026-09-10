@@ -48,10 +48,14 @@ Saved feedback lives in `REVIEW-NOTES.md` at the opened folder's root. It is cre
 
 **Files to Review**, above the note cards, helps you find files that still need attention. It lists unstaged changes and untracked files in the opened folder that have no saved file-specific note on their path.
 
+The section heading shows the file count. Once the Review Notes view has initialized, its native Activity Bar badge shows the same count; the badge tooltip includes both files to review and saved Review Notes. The badge is hidden when there are no candidate files. VS Code controls its theme colors and visibility.
+
 - A saved file note hides that path even if it refers to an older revision or can no longer be located. A general note, an unsaved draft, or a note mentioning a file only as the other comparison endpoint does not hide it. Malformed notes are not used to guess file associations.
 - Fully staged files are absent; partially staged files can remain while unstaged changes exist. The list updates with Git changes. After handoff or deletion of a file's last note, that file can reappear for the next pass.
 - Click a tracked file for its unstaged diff, an untracked file to open it, or a deleted file to see its staged version.
+- An eye icon before the filename and a subtle background highlight mark files currently visible in an editor, including a diff pane. Hidden tabs do not count; split editors can mark multiple files. The indicator follows visible panes as you switch or close them.
 - Hover or focus a row to reveal **Revert File**, then **Stage File**. Neither button opens the file. Actions are disabled while a staging or revert operation, including its confirmation, is in progress. Failures are reported, and the list follows Git's actual state rather than assuming success.
+- The affected row immediately shows an inset progress accent and stays read-only through verification, without adding a loading line or changing its height. Staging/reverting status remains available to screen readers. The panel refreshes immediately after the action, without the normal debounce delay. A row briefly collapses only after Git confirms it is no longer a candidate, never on an optimistic timeout. Reduced-motion preferences skip the animation. Failed candidate refreshes retain the last known list and show an error.
 
 **Stage File** stages that whole file's saved disk state without a confirmation dialog, including remaining unstaged changes or a deletion. It does not save or stage unsaved editor text. Use VS Code Source Control to stage selected hunks instead.
 

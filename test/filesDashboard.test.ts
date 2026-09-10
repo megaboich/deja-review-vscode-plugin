@@ -44,6 +44,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   const receive = new EventEmitter<unknown>();
   const viewDisposed = new EventEmitter();
   const visibilityChanged = new EventEmitter();
+  const visibleEditorsChanged = new EventEmitter();
+  const activeEditorChanged = new EventEmitter<vscode.TextEditor | undefined>();
   const commands = new Map<string, (...args: unknown[]) => Promise<unknown>>();
   function registeredCommand(id: string): (...args: unknown[]) => Promise<unknown> {
     const callback = commands.get(id);
@@ -275,16 +277,19 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     }) },
     languages: { createDiagnosticCollection: () => ({ ...disposable(), clear() {}, set() {} }) },
     window: {
-      visibleTextEditors: [], tabGroups: { activeTabGroup: {} },
+      visibleTextEditors: [] as Array<{
+        document: Pick<vscode.TextDocument, 'uri' | 'isDirty' | 'isClosed' | 'getText'>;
+        setDecorations: vscode.TextEditor['setDecorations'];
+      }>, tabGroups: { activeTabGroup: {} },
       createStatusBarItem: () => status,
       createOutputChannel: () => ({ ...disposable(), appendLine() {} }),
       createTextEditorDecorationType: disposable,
       registerWebviewViewProvider(id: string, value: vscode.WebviewViewProvider) {
         assert.equal(id, 'dejareview.dashboard'); provider = value; return disposable();
       },
-      onDidChangeActiveTextEditor: disposable,
+      onDidChangeActiveTextEditor: activeEditorChanged.event,
       onDidChangeTextEditorSelection: disposable,
-      onDidChangeVisibleTextEditors: disposable,
+      onDidChangeVisibleTextEditors: visibleEditorsChanged.event,
       async showTextDocument(document: { uri: vscode.Uri }, options: unknown) { shown.push({ document, options }); },
       async showErrorMessage(message: string) { errors.push(message); },
       async showInformationMessage() { return onInformation(); },
@@ -473,6 +478,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     diffText = '@@ -1 +1,2 @@\n-index content\n+disk content\n+extra\n';
     workspace.workspaceFolders = [{ uri: file('/synthetic/repo') }];
     workspace.textDocuments = [];
+    mock.window.visibleTextEditors = [];
     sources.set('/synthetic/repo/src/a.ts', 'disk content\n');
     sources.set('/synthetic/repo/src/other.ts', 'other disk content\n');
     index.set('/synthetic/repo/src/a.ts', 'index content\n');
@@ -1721,6 +1727,345 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     });
   }
 
+  function visibleEditor(uri: vscode.Uri): typeof mock.window.visibleTextEditors[number] {
+    return {
+      document: { uri, isClosed: false, isDirty: false, getText: () => '' },
+      setDecorations() {},
+    };
+  }
+  const visiblePaths = (): string[] => state().files.filter(row => row.visible).map(row => row.path);
+
+  await t.test('visibility follows visible split panes, moves and closes, not hidden documents or focus alone', async () => {
+    await reset();
+    repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+    const first = visibleEditor(file('/synthetic/repo/src/a.ts'));
+    const second = visibleEditor(file('/synthetic/repo/src/other.ts'));
+    workspace.textDocuments = [first.document, second.document];
+    for (const [editors, expected] of [
+      [[first], ['src/a.ts']],
+      [[second], ['src/other.ts']],
+      [[first, second, first], ['src/a.ts', 'src/other.ts']],
+      [[], []],
+    ] as const) {
+      mock.window.visibleTextEditors = [...editors];
+      visibleEditorsChanged.fire();
+      await settle();
+      assert.deepEqual(visiblePaths(), expected, 'Visible changes publish without advancing the debounce');
+    }
+    const before = diffCalls;
+    activeEditorChanged.fire(undefined);
+    await automaticRefresh();
+    assert.equal(diffCalls, before, 'Focus-only changes do not recompute candidates');
+    assert.deepEqual(visiblePaths(), []);
+  });
+
+  await t.test('visible Git revisions match validated source paths, including different-file diff panes', async () => {
+    await reset();
+    repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+    for (const ref of ['', 'HEAD', '~', 'b'.repeat(40)]) {
+      mock.window.visibleTextEditors = [visibleEditor(Uri.from({
+        scheme: 'git', path: '/synthetic/repo/src/a.ts',
+        query: JSON.stringify({ path: '/synthetic/repo/src/a.ts', ref }),
+      })), visibleEditor(file('/synthetic/repo/src/other.ts'))];
+      visibleEditorsChanged.fire();
+      await settle();
+      assert.deepEqual(visiblePaths(), ['src/a.ts', 'src/other.ts']);
+    }
+    mock.window.visibleTextEditors = [mock.window.visibleTextEditors[0]];
+    visibleEditorsChanged.fire();
+    await settle();
+    assert.deepEqual(visiblePaths(), ['src/a.ts'], 'The Original revision alone marks the file visible');
+  });
+
+  await t.test('outside-folder, malformed, unsupported and nested-repository editors never mark a candidate visible', async () => {
+    await reset();
+    const invalid = [
+      file('/synthetic/other/src/a.ts'),
+      Uri.from({ scheme: 'git', path: '/synthetic/repo/src/a.ts', query: '{malformed' }),
+      Uri.from({ scheme: 'git', path: '/synthetic/repo/src/a.ts',
+        query: JSON.stringify({ path: '/synthetic/other/src/a.ts', ref: 'HEAD' }) }),
+      Uri.from({ scheme: 'git', path: '/synthetic/repo/src/a.ts',
+        query: JSON.stringify({ path: '/synthetic/repo/src/a.ts', ref: ':1' }) }),
+      Uri.from({ scheme: 'untitled', path: '/synthetic/repo/src/a.ts' }),
+    ];
+    mock.window.visibleTextEditors = invalid.map(visibleEditor);
+    visibleEditorsChanged.fire();
+    await settle();
+    assert.deepEqual(paths(), ['src/a.ts']);
+    assert.deepEqual(visiblePaths(), []);
+
+    workspace.workspaceFolders = [{ uri: file('/synthetic/repo/src') }];
+    mock.window.visibleTextEditors = [visibleEditor(file('/synthetic/repo/src/a.ts')),
+      visibleEditor(file('/synthetic/repo/outside.ts'))];
+    foldersChanged.fire();
+    await registeredCommand('dejareview.refresh')();
+    assert.deepEqual(visiblePaths(), ['a.ts']);
+    repositories.push({ ...repository, rootUri: file('/synthetic/repo/src') });
+    workspace.workspaceFolders = [{ uri: file('/synthetic/repo') }];
+    foldersChanged.fire();
+    await registeredCommand('dejareview.refresh')();
+    assert.deepEqual(visiblePaths(), []);
+    assert.deepEqual(errors, []);
+  });
+
+  for (const mutation of ['move', 'close', 'folder'] as const) {
+    await t.test(`visibility validation cannot publish stale eyes after ${mutation}`, async child => {
+      await reset();
+      const started = deferred();
+      const release = deferred();
+      const resource = GitResources.prototype.resource;
+      child.mock.method(GitResources.prototype, 'resource', async function (
+        this: InstanceType<typeof GitResources>, uri: vscode.Uri, repo: Repository,
+      ) {
+        const resolved = await resource.call(this, uri, repo);
+        if (uri.scheme === 'git') {
+          started.resolve();
+          await release.promise;
+        }
+        return resolved;
+      });
+      mock.window.visibleTextEditors = [visibleEditor(Uri.from({
+        scheme: 'git', path: '/synthetic/repo/src/a.ts',
+        query: JSON.stringify({ path: '/synthetic/repo/src/a.ts', ref: 'HEAD' }),
+      }))];
+      visibleEditorsChanged.fire();
+      await started.promise;
+      const before = messages.length;
+      mock.window.visibleTextEditors = mutation === 'move'
+        ? [visibleEditor(file('/synthetic/repo/src/other.ts'))] : [];
+      if (mutation === 'folder') {
+        switchFolder();
+      } else {
+        repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+        visibleEditorsChanged.fire();
+      }
+      release.resolve();
+      await settle();
+      assert.ok(messages.slice(before).every(message => !message.files.some(row => row.path === 'src/a.ts' && row.visible)));
+      assert.deepEqual(visiblePaths(), mutation === 'move' ? ['src/other.ts'] : []);
+      if (mutation === 'folder') {
+        assert.equal(state().repoKey, file('/synthetic/other').toString());
+      }
+      assert.deepEqual(errors, []);
+    });
+  }
+
+  for (const operation of ['stage', 'revert'] as const) {
+    for (const outcome of ['success', 'failure', 'cancel'] as const) {
+      if (operation === 'stage' && outcome === 'cancel') {
+        continue;
+      }
+      await t.test(`${operation} ${outcome} holds captured row progress through immediate refresh settlement`, async child => {
+        child.mock.method(console, 'error', () => {});
+        await reset();
+        repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+        await registeredCommand('dejareview.refresh')();
+        const started = deferred();
+        const release = deferred();
+        const refreshing = deferred();
+        const finishRefresh = deferred();
+        const checkPending = (): void => {
+          assert.deepEqual(state().files.map(row => row.pending), [operation, undefined]);
+          assert.equal(state().busy, true);
+        };
+        onWarning = async () => {
+          checkPending();
+          if (outcome === 'cancel') {
+            started.resolve();
+            await release.promise;
+            return undefined;
+          }
+          return 'Revert File';
+        };
+        const mutate = async (): Promise<void> => {
+          checkPending();
+          started.resolve();
+          await release.promise;
+          if (outcome === 'failure') {
+            throw new Error('Synthetic operation failure');
+          }
+          repository.state.workingTreeChanges = [change('/synthetic/repo/src/other.ts')];
+          gitChanged.fire();
+        };
+        onAdd = mutate;
+        onClean = mutate;
+        let settled = false;
+        const pending = incoming(operation === 'stage' ? stageAction() : revertAction()).then(() => { settled = true; });
+        checkPending();
+        await started.promise;
+        onDiff = async () => {
+          refreshing.resolve();
+          await finishRefresh.promise;
+        };
+        release.resolve();
+        await refreshing.promise;
+        checkPending();
+        assert.equal(settled, false);
+        assert.deepEqual(paths(), ['src/a.ts', 'src/other.ts'], 'Even updated Git state requires a completed projection');
+        await incoming(stageAction());
+        await incoming(revertAction());
+        finishRefresh.resolve();
+        await pending;
+        assert.equal(state().busy, false);
+        assert.ok(state().files.every(row => row.pending === undefined));
+        assert.deepEqual(paths(), outcome === 'success' ? ['src/other.ts'] : ['src/a.ts', 'src/other.ts']);
+        assert.equal(errors.length, outcome === 'failure' ? 1 : 0);
+        const before = diffCalls;
+        t.mock.timers.tick(1000);
+        await settle();
+        assert.equal(diffCalls, before, 'No leftover post-operation debounce refresh');
+      });
+    }
+  }
+
+  for (const operationFails of [false, true]) {
+    await t.test(`refresh rejection releases pending and ${operationFails ? 'preserves the original operation error' : 'reports the refresh error'}`, async child => {
+      child.mock.method(console, 'error', () => {});
+      await reset();
+      onAdd = async () => {
+        onWorkspaceRepository = async () => { throw new Error('Synthetic refresh failure'); };
+        if (operationFails) {
+          throw new Error('Synthetic original add failure');
+        }
+      };
+      await incoming(stageAction());
+      assert.equal(state().busy, false);
+      assert.equal(state().files[0].pending, undefined);
+      assert.deepEqual(paths(), ['src/a.ts']);
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], operationFails ? /Synthetic original add failure/ : /Synthetic refresh failure/);
+      onWorkspaceRepository = async () => {};
+      onAdd = async () => {};
+      await incoming(stageAction());
+      assert.equal(adds.length, 2, 'The refresh drain and file lock both permit retry');
+      assert.equal(state().busy, false);
+    });
+  }
+
+  await t.test('captured pending identity survives row reprojection and never follows the same path into another folder', async () => {
+    const api = await reset();
+    const started = deferred();
+    const release = deferred();
+    onAdd = async () => {
+      started.resolve();
+      await release.promise;
+    };
+    const pending = incoming(stageAction());
+    await started.promise;
+    mock.window.visibleTextEditors = [visibleEditor(file('/synthetic/repo/src/a.ts'))];
+    visibleEditorsChanged.fire();
+    await api.refresh();
+    assert.equal(state().files[0].pending, 'stage');
+    assert.equal(state().files[0].visible, true);
+    switchFolder();
+    release.resolve();
+    await pending;
+    assert.equal(state().repoKey, file('/synthetic/other').toString());
+    assert.deepEqual(paths(), ['src/a.ts']);
+    assert.equal(state().files[0].pending, undefined);
+    assert.equal(state().files[0].visible, false);
+    assert.equal(state().busy, false);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('candidate refresh failure retains rows and returns row progress to normal', async child => {
+    await reset();
+    onAdd = async () => {
+      child.mock.method(GitResources.prototype, 'filesToReview', async () => {
+        throw new Error('Synthetic candidate refresh failure');
+      });
+    };
+    await incoming(stageAction());
+    assert.deepEqual(paths(), ['src/a.ts']);
+    assert.equal(state().files[0].pending, undefined);
+    assert.equal(state().busy, false);
+    assert.match(state().filesError ?? '', /could not be refreshed/);
+  });
+
+  for (const phase of ['workspace discovery', 'resource ownership', 'post-stat ownership', 'final batch ownership'] as const) {
+    await t.test(`${phase} stat rejection retains actual dashboard rows and count without removal animation`, async () => {
+      const api = await reset();
+      workspace.workspaceFolders = [{ uri: file('/synthetic/repo/src') }];
+      repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+      await api.refresh();
+      const previous = state().files;
+      const client = scriptFixture();
+      client.update(state());
+      const rows = [...client.element('files').children];
+      assert.equal(client.element('files-title').textContent, 'Files to Review (2)');
+      let armed = phase === 'resource ownership';
+      let failures = 0;
+      const before = diffCalls;
+      onRead = async () => {
+        // Arm after the extension's outer discovery, before filesToReview's own discovery.
+        if (phase === 'workspace discovery') {
+          armed = true;
+        }
+      };
+      onDiff = async () => {
+        if (phase === 'post-stat ownership' || (phase === 'final batch ownership' && diffCalls === before + 2)) {
+          armed = true;
+        }
+      };
+      onStat = async uri => {
+        const target = phase === 'workspace discovery' ? '/synthetic/repo/src' : '/synthetic/repo/src/a.ts';
+        if (armed && failures === 0 && uri.path === target) {
+          failures++;
+          throw Object.assign(new Error('Synthetic boundary access failure'), { code: 'Unavailable' });
+        }
+      };
+
+      await api.refresh();
+
+      assert.equal(failures, 1, 'The real Git ownership walk must encounter the lower-level rejection');
+      assert.deepEqual(state().files, previous);
+      assert.match(state().filesError ?? '', /could not be refreshed/);
+      client.update(state());
+      assert.equal(client.element('files-title').textContent, 'Files to Review (2)');
+      assert.equal(client.element('files-error').hidden, false);
+      assert.deepEqual(client.element('files').children, rows);
+      assert.ok(rows.every(row => row.animations.length === 0 && !row.inert));
+
+      onRead = async () => {};
+      onDiff = async () => {};
+      onStat = async () => {};
+      repository.state.workingTreeChanges = [change('/synthetic/repo/src/other.ts')];
+      await api.refresh();
+      assert.deepEqual(paths(), ['other.ts'], 'A successful refresh still publishes confirmed removal');
+      assert.equal(state().filesError, undefined);
+      client.update(state());
+      assert.equal(client.element('files-title').textContent, 'Files to Review (1)');
+      assert.deepEqual(errors, []);
+    });
+  }
+
+  await t.test('retained rows still require independent live ownership authorization for every action', async child => {
+    child.mock.method(console, 'error', () => {});
+    const api = await reset();
+    onStat = async uri => {
+      if (uri.path === '/synthetic/repo/src/a.ts') {
+        throw Object.assign(new Error('Synthetic boundary access failure'), { code: 'NoPermissions' });
+      }
+    };
+    await api.refresh();
+    assert.deepEqual(paths(), ['src/a.ts']);
+    assert.match(state().filesError ?? '', /could not be refreshed/);
+
+    await incoming(action());
+    await incoming(stageAction());
+    await incoming(revertAction());
+
+    assert.equal(errors.length, 3);
+    assert.ok(errors.every(error => /Cannot validate Git repository boundaries/.test(error)));
+    assert.deepEqual(navigation(), []);
+    assert.deepEqual(adds, []);
+    assert.deepEqual(cleans, []);
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(paths(), ['src/a.ts']);
+    assert.equal(state().files[0].pending, undefined);
+    assert.equal(state().busy, false);
+  });
+
   for (const kind of ['tracked', 'binary', 'unknown stats', 'new', 'new binary', 'partial', 'deleted'] as const) {
     await t.test(`stageFile sends one absolute ${kind} path and waits for refreshed Git state`, async () => {
       await reset(kind === 'deleted' ? GitStatus.Deleted : GitStatus.Modified,
@@ -1894,7 +2239,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       const client = scriptFixture();
       client.update(state());
       const row = client.element('files').children[0];
-      assert.deepEqual(row.children.slice(1).map(button => ({
+      const buttons = row.children.filter(child => child.tagName === 'button');
+      assert.deepEqual(buttons.slice(1).map(button => ({
         title: button.title, label: button.attributes.get('aria-label'), disabled: button.disabled,
       })), [
         { title: 'Revert File', label: 'Revert File', disabled: false },
@@ -1909,7 +2255,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       await started.promise;
       assert.equal(state().busy, true);
       client.update(state());
-      assert.ok(row.children.every(button => button.disabled), 'Published busy state disables actual client controls');
+      assert.ok(buttons.every(button => button.disabled), 'Published busy state disables actual client controls');
       const cleanCount = cleans.length, addCount = adds.length, warningCount = warnings.length;
       for (const target of ['src/a.ts', 'src/other.ts']) {
         for (const type of ['stageFile', 'revertFile'] as const) {
@@ -2224,7 +2570,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     gitChanged.fire();
     await automaticRefresh();
     assert.ok(diffCalls > before, 'Git event must request fresh statistics');
-    assert.deepEqual(state().files, [{ id: 'src/a.ts', path: 'src/a.ts', insertions: 2, deletions: 1 }]);
+    assert.deepEqual(state().files, [{ id: 'src/a.ts', path: 'src/a.ts', insertions: 2, deletions: 1,
+      visible: false }]);
     repository.state.workingTreeChanges = [];
     gitChanged.fire();
     await automaticRefresh();

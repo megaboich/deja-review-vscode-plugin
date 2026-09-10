@@ -18,7 +18,10 @@ export interface DashboardState {
   hasFeedback: boolean;
   commentCount: number;
   busy: boolean;
-  files: Array<{ id: string; path: string; insertions?: number; deletions?: number }>;
+  files: Array<{
+    id: string; path: string; insertions?: number; deletions?: number;
+    visible?: boolean; pending?: 'stage' | 'revert';
+  }>;
   filesError?: string;
   notes: DashboardNote[];
   noteError?: string;
@@ -137,6 +140,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
   private ready = false;
   private disposed = false;
   private handlingAction?: DashboardAction['type'];
+  private handlingFile?: { repoKey: string; fileId: string; pending: 'stage' | 'revert' };
   private handlingRequestId?: string;
   private settledEditor?: Extract<DashboardHostMessage, { requestId: string }>;
   private publication = 0;
@@ -163,13 +167,19 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
   }
 
   private projectState(state: DashboardState): DashboardState {
-    const files = state.files.map(({ id, path, insertions, deletions }) => {
+    const files = state.files.map(({ id, path, insertions, deletions, visible, pending }) => {
       const file: DashboardState['files'][number] = { id, path };
       if (typeof insertions === "number" && Number.isSafeInteger(insertions) && insertions >= 0) {
         file.insertions = insertions;
       }
       if (typeof deletions === "number" && Number.isSafeInteger(deletions) && deletions >= 0) {
         file.deletions = deletions;
+      }
+      if (typeof visible === "boolean") {
+        file.visible = visible;
+      }
+      if (pending === 'stage' || pending === 'revert') {
+        file.pending = pending;
       }
       return file;
     });
@@ -220,6 +230,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
     }
     this.releaseView();
     this.view = view;
+    this.pushState();
     view.webview.options = { enableScripts: true, localResourceRoots: [] };
     this.listeners.push(
       view.webview.onDidReceiveMessage((message: unknown) => {
@@ -324,6 +335,12 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
     const input = action.type === "input";
     if (!input) {
       this.handlingAction = action.type;
+      if (action.type === 'stageFile' || action.type === 'revertFile') {
+        this.handlingFile = {
+          repoKey: action.repoKey, fileId: action.fileId,
+          pending: action.type === 'stageFile' ? 'stage' : 'revert',
+        };
+      }
       this.handlingRequestId = 'requestId' in decoded ? decoded.requestId : undefined;
       this.pushState();
     }
@@ -350,6 +367,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
     } finally {
       if (!input) {
         this.handlingAction = undefined;
+        this.handlingFile = undefined;
         this.handlingRequestId = undefined;
         this.pushState();
         if (decoded.type === "saveEdit" || decoded.type === "cancelEdit") {
@@ -407,7 +425,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
       case "openFile":
       case "revertFile":
       case "stageFile":
-        return this.state.files.some(file => file.id === action.fileId) ? action : undefined;
+        return this.state.files.some(file => file.id === action.fileId && !file.pending) ? action : undefined;
       case "restore":
         if (!this.historyVisible || this.state.hasFeedback) {
           return;
@@ -436,15 +454,31 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
   }
 
   private pushState(): void {
-    if (!this.view || !this.ready || this.disposed) {
+    if (!this.view || this.disposed) {
+      return;
+    }
+    const count = this.state.repoKey ? this.state.files.length : 0;
+    const filesLabel = count + (count === 1 ? ' file to review' : ' files to review');
+    const notesLabel = this.state.commentCount + (this.state.commentCount === 1 ? ' Review Note' : ' Review Notes');
+    // VS Code 1.96 leaves the old activity visible on undefined alone. A zero
+    // NumberBadge hides it first, then undefined clears the public badge state.
+    this.view.badge = { value: count, tooltip: count > 0 ? `${filesLabel} · ${notesLabel}` : '' };
+    if (count === 0) {
+      this.view.badge = undefined;
+    }
+    if (!this.ready) {
       return;
     }
     const handlingMutation = !!this.handlingAction && this.handlingAction !== 'openFile' && this.handlingAction !== 'open';
+    const pending = this.handlingFile;
+    const files = this.state.files.map(file => pending && pending.repoKey === this.state.repoKey && pending.fileId === file.id
+      ? { ...file, pending: pending.pending } : file);
     try {
       void Promise.resolve(this.view.webview.postMessage({
         type: "state",
         state: {
           ...this.state,
+          files,
           historyVisible: this.historyVisible,
           busy: this.state.busy || handlingMutation,
         },

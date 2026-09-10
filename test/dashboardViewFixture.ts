@@ -13,6 +13,7 @@ export type DashboardViewFixture = {
   send(message: unknown): void;
   close(): void;
   show(): void;
+  hide(): void;
   resolve(provider: vscode.WebviewViewProvider): void | Thenable<void>;
 };
 
@@ -25,10 +26,11 @@ export function viewFixture(): DashboardViewFixture {
   const transport: DashboardHostMessage[] = [];
   let html = "";
   let htmlWrites = 0;
+  let visible = true;
   const view: vscode.WebviewView = {
     viewType: "dejareview.dashboard",
-    visible: true,
-    show() { visibility?.(); },
+    get visible() { return visible; },
+    show() { visible = true; visibility?.(); },
     webview: {
       options: {},
       cspSource: "test-webview:",
@@ -70,7 +72,8 @@ export function viewFixture(): DashboardViewFixture {
     },
     send(message: unknown) { receive?.(message); },
     close() { close?.(); },
-    show() { visibility?.(); },
+    show() { view.show(); },
+    hide() { visible = false; visibility?.(); },
     resolve(provider: vscode.WebviewViewProvider) {
       return provider.resolveWebviewView(view, { state: undefined }, {
         isCancellationRequested: false,

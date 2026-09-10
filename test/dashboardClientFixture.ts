@@ -7,6 +7,30 @@ type KeyEvent = { key?: string; preventDefault(): void };
 type Listener = (event?: KeyEvent) => void;
 type Document = { activeElement?: Element; root: Element };
 
+class ControlledAnimation implements Pick<Animation, 'cancel'> {
+  readonly finished: Promise<void>;
+  private resolveFinished?: () => void;
+  private rejectFinished?: (error: Error) => void;
+  cancelled = false;
+
+  constructor(readonly frames: Keyframe[], readonly options: KeyframeAnimationOptions) {
+    this.finished = new Promise((resolve, reject) => {
+      this.resolveFinished = resolve;
+      this.rejectFinished = reject;
+    });
+  }
+
+  finish(): void {
+    // The client consumes only settlement, not the resolved animation.
+    this.resolveFinished?.();
+  }
+
+  cancel(): void {
+    this.cancelled = true;
+    this.rejectFinished?.(new Error('Animation cancelled'));
+  }
+}
+
 // Only the DOM surface consumed by the dashboard, not a browser/layout emulator.
 export class Element {
   children: Element[] = [];
@@ -15,6 +39,9 @@ export class Element {
   textContent = "";
   hidden = false;
   disabled = false;
+  inert = false;
+  height = 64;
+  animations: ControlledAnimation[] = [];
   dateTime = "";
   className = "";
   type = "";
@@ -29,6 +56,16 @@ export class Element {
   listeners = new Map<string, Listener>();
 
   constructor(readonly tagName: string, private readonly document: Partial<Document>) {}
+
+  getBoundingClientRect(): Pick<DOMRect, 'height'> {
+    return { height: this.height };
+  }
+
+  animate(frames: Keyframe[], options: KeyframeAnimationOptions): ControlledAnimation {
+    const animation = new ControlledAnimation(frames, options);
+    this.animations.push(animation);
+    return animation;
+  }
 
   get isConnected(): boolean {
     return this === this.document.root || !!this.parent?.isConnected;
@@ -178,6 +215,7 @@ type ClientFixture = {
   receive(message: unknown): void;
   showArchives(): void;
   update(next: DashboardState): void;
+  setReducedMotion(reduced: boolean): void;
 };
 
 let clientSequence = 0;
@@ -242,6 +280,14 @@ export function scriptFixture(cache: { value?: unknown } = {}, instanceKey = "te
   const messages: ClientMessage[] = [];
   let receive: ((event: { data: unknown }) => void) | undefined;
   let requestSequence = 0;
+  let motionChange: (() => void) | undefined;
+  const motion = {
+    matches: true,
+    addEventListener(name: string, listener: () => void): void {
+      assert.equal(name, 'change');
+      motionChange = listener;
+    },
+  };
   const script = html.match(/<script nonce="test-nonce">([\s\S]*?)<\/script>/);
   assert.ok(script, "Expected a nonce-protected dashboard client script");
   runInNewContext(script[1], {
@@ -258,7 +304,17 @@ export function scriptFixture(cache: { value?: unknown } = {}, instanceKey = "te
       createElement: (tag: string) => new Element(tag, document),
       addEventListener: root.addEventListener.bind(root),
     }),
-    window: { addEventListener: (_name: string, listener: typeof receive) => { receive = listener; } },
+    window: {
+      addEventListener: (_name: string, listener: typeof receive) => { receive = listener; },
+      matchMedia(query: string) {
+        assert.equal(query, '(prefers-reduced-motion: reduce)');
+        return motion;
+      },
+      getComputedStyle: () => ({
+        paddingTop: '10px', paddingBottom: '10px', marginTop: '0px', marginBottom: '0px',
+        borderTopWidth: '0px', borderBottomWidth: '1px',
+      } satisfies Pick<CSSStyleDeclaration, 'paddingTop' | 'paddingBottom' | 'marginTop' | 'marginBottom' | 'borderTopWidth' | 'borderBottomWidth'>),
+    },
     crypto: { randomUUID: () => instanceKey + ":" + ++requestSequence + ":" + fixtureSequence },
   });
   assert.equal(messages[0]?.type, "ready");
@@ -273,5 +329,9 @@ export function scriptFixture(cache: { value?: unknown } = {}, instanceKey = "te
       element("show-archives").click();
     },
     update: (next: DashboardState) => receiveMessage({ data: { type: "state", state: next } }),
+    setReducedMotion(reduced: boolean) {
+      motion.matches = reduced;
+      motionChange?.();
+    },
   };
 }
