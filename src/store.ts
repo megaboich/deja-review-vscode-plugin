@@ -1,9 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import { ReviewArchives } from './archive';
-import { Repository } from './git';
-import { copyAndClear, HandoffResult } from './handoff';
-import { ParseResult } from './model';
+import type { ReviewArchives } from './archive';
+import type { Repository } from './git';
+import { copyAndClear } from './handoff';
+import type { HandoffResult } from './handoff';
+import type { ParseResult } from './model';
 import { parse } from './parser';
+import { assertUtf8Text } from './writer';
 
 function isFileNotFound(error: unknown): boolean {
   return error instanceof vscode.FileSystemError && error.code === 'FileNotFound';
@@ -24,20 +27,27 @@ export class ReviewStore implements vscode.Disposable {
   constructor(repo: Repository, public readonly archives: ReviewArchives) {
     this.uri = vscode.Uri.joinPath(repo.rootUri, 'REVIEW-NOTES.md');
     const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repo.rootUri, 'REVIEW-NOTES.md'));
-    this.subscriptions = [watcher,
+    this.subscriptions = [
+      watcher,
       watcher.onDidCreate(() => this.scheduleChange()),
       watcher.onDidChange(() => this.scheduleChange()),
       watcher.onDidDelete(() => this.scheduleChange()),
       vscode.workspace.onDidSaveTextDocument(document => {
-        if (document.uri.toString() === this.uri.toString()) { this.scheduleChange(); }
+        if (document.uri.toString() === this.uri.toString()) {
+          this.scheduleChange();
+        }
       }),
     ];
   }
 
-  get busy(): boolean { return this.pending > 0; }
+  get busy(): boolean {
+    return this.pending > 0;
+  }
 
   private assertActive(): void {
-    if (this.disposed) { throw new Error('Review store has been disposed.'); }
+    if (this.disposed) {
+      throw new Error('Review store has been disposed.');
+    }
   }
 
   private dirtyDocuments(): vscode.TextDocument[] {
@@ -49,10 +59,13 @@ export class ReviewStore implements vscode.Disposable {
   private async stat(): Promise<boolean> {
     this.assertActive();
     let stat: vscode.FileStat;
-    try { stat = await vscode.workspace.fs.stat(this.uri); }
-    catch (error) {
+    try {
+      stat = await vscode.workspace.fs.stat(this.uri);
+    } catch (error) {
       this.assertActive();
-      if (isFileNotFound(error)) { return false; }
+      if (isFileNotFound(error)) {
+        return false;
+      }
       throw error;
     }
     this.assertActive();
@@ -66,12 +79,18 @@ export class ReviewStore implements vscode.Disposable {
   }
 
   async read(): Promise<string | undefined> {
-    if (!await this.stat()) { return undefined; }
+    if (!await this.stat()) {
+      return undefined;
+    }
+
     let bytes: Uint8Array;
-    try { bytes = await vscode.workspace.fs.readFile(this.uri); }
-    catch (error) {
+    try {
+      bytes = await vscode.workspace.fs.readFile(this.uri);
+    } catch (error) {
       this.assertActive();
-      if (isFileNotFound(error)) { return undefined; }
+      if (isFileNotFound(error)) {
+        return undefined;
+      }
       throw error;
     }
     this.assertActive();
@@ -91,10 +110,14 @@ export class ReviewStore implements vscode.Disposable {
         'REVIEW-NOTES.md has unsaved changes. Save it before continuing.',
         { modal: true }, 'Save and retry', 'Cancel');
       this.assertActive();
-      if (choice !== 'Save and retry') { return false; }
+      if (choice !== 'Save and retry') {
+        return false;
+      }
       for (const document of this.dirtyDocuments()) {
         await this.stat();
-        if (!document.isClosed && document.isDirty && !await document.save()) { return false; }
+        if (!document.isClosed && document.isDirty && !await document.save()) {
+          return false;
+        }
         this.assertActive();
       }
     }
@@ -108,99 +131,206 @@ export class ReviewStore implements vscode.Disposable {
     const result = this.queue.then(() => {
       this.assertActive();
       return operation();
-    }).finally(() => { this.pending--; if (!this.disposed) { this.busyChanges.fire(); } });
+    }).finally(() => {
+      this.pending--;
+      if (!this.disposed) {
+        this.busyChanges.fire();
+      }
+    });
     // A failed operation must not poison subsequent queued operations.
     this.queue = result.then(() => {}, () => {});
     return result;
   }
 
-  /** The callback receives current disk text; only an explicit append should create missing content. */
-  async mutate(change: (text: string) => string): Promise<boolean> {
+  /**
+   * The callback receives current disk text; only an explicit append should create missing content.
+   * Async validation runs after temporary writing; validateInput is synchronous and runs just before rename.
+   */
+  async mutate(
+    change: (text: string) => string,
+    validate?: () => Promise<void>,
+    validateInput?: () => void,
+  ): Promise<boolean> {
     return this.serialize(async () => {
       while (await this.ensureSaved()) {
         const snapshot = await this.read();
-        if (this.dirtyDocuments().length) { continue; }
+        if (this.dirtyDocuments().length) {
+          continue;
+        }
+
         const next = change(snapshot ?? '');
-        if (next === (snapshot ?? '')) { return false; }
-        const current = await this.read();
-        if (this.dirtyDocuments().length) { continue; }
-        if (current !== snapshot) {
-          throw new Error('REVIEW-NOTES.md changed on disk; retry the operation.');
+        if (next === (snapshot ?? '')) {
+          return false;
         }
-        const exists = await this.stat();
-        if (this.dirtyDocuments().length) { continue; }
-        if (exists !== (snapshot !== undefined)) {
-          throw new Error('REVIEW-NOTES.md was created or deleted on disk; retry the operation.');
+
+        const published = await this.publish(next, snapshot !== undefined, async () => {
+          await validate?.();
+
+          const current = await this.read();
+          if (this.dirtyDocuments().length) {
+            return false;
+          }
+          if (current !== snapshot) {
+            throw new Error('REVIEW-NOTES.md changed on disk; retry the operation.');
+          }
+
+          const exists = await this.stat();
+          if (this.dirtyDocuments().length) {
+            return false;
+          }
+          if (exists !== (snapshot !== undefined)) {
+            throw new Error('REVIEW-NOTES.md was created or deleted on disk; retry the operation.');
+          }
+          return true;
+        }, validateInput);
+        if (published) {
+          return true;
         }
-        // workspace.fs has no atomic compare-and-write; external filesystem races remain possible.
-        await vscode.workspace.fs.writeFile(this.uri, new TextEncoder().encode(next));
-        this.fireChange();
-        return true;
       }
       return false;
     });
   }
 
-  async restore(id: string): Promise<boolean> {
+  private async publish(
+    text: string,
+    overwrite: boolean,
+    validate: () => Promise<boolean>,
+    validateInput?: () => void,
+  ): Promise<boolean> {
+    assertUtf8Text(text);
+    const temporary = vscode.Uri.joinPath(this.uri, '..', `.REVIEW-NOTES.md.${randomUUID()}.tmp`);
+    let published = false;
+    try {
+      this.assertActive();
+      await vscode.workspace.fs.writeFile(temporary, new TextEncoder().encode(text));
+
+      if (!await validate()) {
+        return false;
+      }
+      // These synchronous checks also cover changes while the async validator was returning.
+      if (this.dirtyDocuments().length) {
+        return false;
+      }
+      this.assertActive();
+      validateInput?.();
+
+      // Rename prevents partial writes to live feedback, but is not compare-and-swap against external writers.
+      await vscode.workspace.fs.rename(temporary, this.uri, { overwrite });
+      published = true;
+      this.fireChange();
+      return true;
+    } finally {
+      if (!published) {
+        try {
+          await vscode.workspace.fs.delete(temporary, { recursive: false, useTrash: false });
+        } catch (error) {
+          if (!isFileNotFound(error)) {
+            console.warn('Could not remove temporary review notes:', error);
+          }
+        }
+      }
+    }
+  }
+
+  async restore(id: string, validateInput?: () => void): Promise<boolean> {
     return this.serialize(async () => {
       const assertClean = (): void => {
         this.assertActive();
+        validateInput?.();
         if (this.dirtyDocuments().length) {
           throw new Error('REVIEW-NOTES.md has unsaved changes; save or discard them before recovering an archive.');
         }
       };
+
       assertClean();
       const snapshot = await this.read();
       assertClean();
-      if (snapshot?.trim()) { return false; }
+      if (snapshot?.trim()) {
+        return false;
+      }
+
       const text = await this.archives.read(id);
       assertClean();
-      const current = await this.read();
-      assertClean();
-      if (current !== snapshot || current?.trim()) { return false; }
-      const exists = await this.stat();
-      assertClean();
-      if (exists !== (snapshot !== undefined)) { return false; }
-      // workspace.fs cannot atomically compare and write against external writers.
-      await vscode.workspace.fs.writeFile(this.uri, new TextEncoder().encode(text));
-      this.fireChange();
-      return true;
+
+      return this.publish(text, snapshot !== undefined, async () => {
+        const current = await this.read();
+        assertClean();
+        if (current !== snapshot || current?.trim()) {
+          return false;
+        }
+
+        const exists = await this.stat();
+        assertClean();
+        return exists === (snapshot !== undefined);
+      }, assertClean);
     });
   }
 
-  async handoff(): Promise<(HandoffResult | { status: 'cancelled' }) & { clipboardCopied?: boolean }> {
+  async handoff(validateInput?: () => void): Promise<(HandoffResult | { status: 'cancelled' }) & { clipboardCopied?: boolean }> {
     return this.serialize(async () => {
-      if (!await this.ensureSaved()) { return { status: 'cancelled', clipboardCopied: false }; }
+      validateInput?.();
+      if (!await this.ensureSaved()) {
+        return { status: 'cancelled', clipboardCopied: false };
+      }
+      validateInput?.();
+
       let clipboardCopied = false;
       const dirtyBeforeDelete = new Error('REVIEW-NOTES.md has unsaved changes; retry the handoff.');
       const changedBeforeDelete = new Error('REVIEW-NOTES.md changed on disk; retry the handoff.');
       const result = await copyAndClear({
-        read: () => this.read(),
+        read: async () => {
+          const text = await this.read();
+          validateInput?.();
+          return text;
+        },
         isDirty: () => this.dirtyDocuments().length > 0,
         copy: async text => {
           this.assertActive();
+          validateInput?.();
           await vscode.env.clipboard.writeText(text);
           clipboardCopied = true;
         },
         archive: async snapshot => {
           this.assertActive();
+          validateInput?.();
           await this.archives.save(snapshot);
           this.fireChange();
         },
         remove: async snapshot => {
           const current = await this.read();
-          if (this.dirtyDocuments().length) { throw dirtyBeforeDelete; }
-          if (current === undefined) { return; }
-          if (current !== snapshot) { throw changedBeforeDelete; }
+          validateInput?.();
+          if (this.dirtyDocuments().length) {
+            throw dirtyBeforeDelete;
+          }
+          if (current === undefined) {
+            return;
+          }
+          if (current !== snapshot) {
+            throw changedBeforeDelete;
+          }
+
           const exists = await this.stat();
-          if (this.dirtyDocuments().length) { throw dirtyBeforeDelete; }
-          if (!exists) { return; }
+          validateInput?.();
+          if (this.dirtyDocuments().length) {
+            throw dirtyBeforeDelete;
+          }
+          if (!exists) {
+            return;
+          }
+
           // As with writes, stat/snapshot checks cannot make deletion transactional.
-          try { await vscode.workspace.fs.delete(this.uri, { recursive: false, useTrash: false }); }
-          catch (error) { if (!isFileNotFound(error)) { throw error; } }
+          try {
+            await vscode.workspace.fs.delete(this.uri, { recursive: false, useTrash: false });
+          } catch (error) {
+            if (!isFileNotFound(error)) {
+              throw error;
+            }
+          }
         },
       });
-      if (result.status === 'copied') { this.fireChange(); }
+      if (result.status === 'copied') {
+        this.fireChange();
+      }
       if (result.status === 'deleteFailed' && result.error === dirtyBeforeDelete) {
         return { status: 'dirty', clipboardCopied };
       }
@@ -212,21 +342,37 @@ export class ReviewStore implements vscode.Disposable {
   }
 
   private scheduleChange(): void {
-    if (this.disposed) { return; }
-    if (this.timer !== undefined) { clearTimeout(this.timer); }
+    if (this.disposed) {
+      return;
+    }
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+    }
     this.timer = setTimeout(() => this.fireChange(), 300);
   }
 
   private fireChange(): void {
-    if (this.timer !== undefined) { clearTimeout(this.timer); this.timer = undefined; }
-    if (!this.disposed) { this.changes.fire(); }
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    if (!this.disposed) {
+      this.changes.fire();
+    }
   }
 
   dispose(): void {
-    if (this.disposed) { return; }
+    if (this.disposed) {
+      return;
+    }
     this.disposed = true;
-    if (this.timer !== undefined) { clearTimeout(this.timer); this.timer = undefined; }
-    for (const subscription of this.subscriptions) { subscription.dispose(); }
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    for (const subscription of this.subscriptions) {
+      subscription.dispose();
+    }
     this.changes.dispose();
     this.busyChanges.dispose();
   }

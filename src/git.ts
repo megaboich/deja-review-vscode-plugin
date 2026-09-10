@@ -1,16 +1,42 @@
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { normalizeResource, Resource } from './model';
+import { normalizeResource, type Resource } from './model';
+
+// Values from the bundled vscode.git API, not porcelain status letters.
+const GitStatus = {
+  IndexModified: 0,
+  IndexAdded: 1,
+  IndexDeleted: 2,
+  IndexRenamed: 3,
+  IndexCopied: 4,
+  Modified: 5,
+  Deleted: 6,
+  Untracked: 7,
+};
+
+type FileCandidate = { uri: vscode.Uri; untracked: boolean };
+type FileStatistics = { insertions?: number; deletions?: number };
+type FileReviewRow = FileStatistics & { path: string };
 
 export interface Repository {
   rootUri: vscode.Uri;
   state: {
     HEAD?: { commit?: string };
-    indexChanges?: readonly { readonly uri: vscode.Uri }[];
+    indexChanges?: readonly { readonly uri: vscode.Uri; readonly status?: number }[];
+    workingTreeChanges?: readonly { readonly uri: vscode.Uri; readonly status?: number }[];
+    untrackedChanges?: readonly { readonly uri: vscode.Uri; readonly status?: number }[];
+    mergeChanges?: readonly { readonly uri: vscode.Uri; readonly status?: number }[];
+    submodules?: readonly { readonly path: string }[];
     onDidChange: vscode.Event<void>;
   };
   show(ref: string, path: string): Promise<string>;
   getCommit(ref: string): Promise<{ hash: string }>;
+  getObjectDetails?(ref: string, path: string): Promise<{ mode: string; object: string; size: number }>;
+  diffWithHEAD?(path: string): Promise<string>;
+  add?(paths: string[]): Promise<void>;
+  clean?(paths: string[]): Promise<void>;
 }
 
 interface GitAPI {
@@ -24,6 +50,114 @@ interface GitAPI {
 interface GitExtension {
   readonly enabled?: boolean;
   getAPI(version: 1): GitAPI;
+}
+
+function unstagedCandidates(repo: Repository): Map<string, FileCandidate> {
+  const entries = new Map<string, FileCandidate>();
+  for (const change of repo.state.workingTreeChanges ?? []) {
+    const key = change.uri.toString();
+    const untracked = change.status === GitStatus.Untracked || entries.get(key)?.untracked === true;
+    entries.set(key, { uri: change.uri, untracked });
+  }
+  for (const change of repo.state.untrackedChanges ?? []) {
+    entries.set(change.uri.toString(), { uri: change.uri, untracked: true });
+  }
+  return entries;
+}
+
+function revisionRef(origin: Exclude<Resource['origin'], 'changed'>): string {
+  switch (origin) {
+    case 'staged':
+      return '';
+    case 'head':
+      return 'HEAD';
+    default:
+      return origin.slice(7);
+  }
+}
+
+async function trackedStatistics(repo: Repository, uri: vscode.Uri): Promise<FileStatistics> {
+  // Despite its public name, VS Code 1.96 diffWithHEAD compares index to disk.
+  const diffWithHEAD = repo.diffWithHEAD;
+  if (!diffWithHEAD) { return {}; }
+
+  const diff = await diffWithHEAD.call(repo, uri.fsPath);
+  let insertions = 0;
+  let deletions = 0;
+  let oldRemaining = 0;
+  let newRemaining = 0;
+  let binary = false;
+  for (const line of diff.split('\n')) {
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (hunk) {
+      oldRemaining = Number(hunk[1] ?? 1);
+      newRemaining = Number(hunk[2] ?? 1);
+      continue;
+    }
+    if (oldRemaining > 0 || newRemaining > 0) {
+      switch (line[0]) {
+        case '+':
+          insertions++;
+          newRemaining--;
+          break;
+        case '-':
+          deletions++;
+          oldRemaining--;
+          break;
+        case ' ':
+          oldRemaining--;
+          newRemaining--;
+          break;
+      }
+    } else if (/^(?:Binary files .* differ|GIT binary patch)\r?$/.test(line)) {
+      binary = true;
+    }
+  }
+  return binary ? {} : { insertions, deletions };
+}
+
+// Undefined rejects the candidate; empty statistics retain it with unavailable counts.
+async function untrackedStatistics(
+  uri: vscode.Uri, statistics: FileStatistics, validate: () => Promise<boolean>,
+): Promise<FileStatistics | undefined> {
+  const stat = await vscode.workspace.fs.stat(uri);
+  if (!await validate()) { return undefined; }
+  if (stat.type !== vscode.FileType.File) { return undefined; }
+
+  // Stat is only a preflight. The handle read has a hard byte budget even
+  // if the file grows; one extra byte distinguishes an exact-limit file.
+  const limit = 5 * 1024 * 1024;
+  if (!(stat.size <= limit)) { return {}; }
+
+  const handle = await open(uri.fsPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile()) { return undefined; }
+    if (opened.size > limit) { throw new Error('Untracked statistics exceed the read limit.'); }
+    if (!await validate()) { return undefined; }
+
+    const buffer = Buffer.alloc(limit + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (!bytesRead) { break; }
+      length += bytesRead;
+    }
+    const bytes = buffer.subarray(0, length);
+    if (length > limit || bytes.subarray(0, 8000).includes(0)) { return {}; }
+
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    let insertions = length && bytes[length - 1] !== 10 ? 1 : 0;
+    for (const byte of bytes) {
+      if (byte === 10) { insertions++; }
+    }
+    // Retain completed counts even if closing the handle subsequently fails.
+    statistics.insertions = insertions;
+    statistics.deletions = 0;
+    return statistics;
+  } finally {
+    await handle.close();
+  }
 }
 
 function source(uri: vscode.Uri): { file: vscode.Uri; ref?: string } | undefined {
@@ -53,6 +187,9 @@ function source(uri: vscode.Uri): { file: vscode.Uri; ref?: string } | undefined
   } else if (uri.query || uri.fragment) {
     throw new Error('File URIs with a query or fragment are not supported.');
   }
+  if (path.sep === '/' && file.fsPath.includes('\\')) {
+    throw new Error('Literal backslashes in filesystem paths cannot be represented losslessly in Review Notes.');
+  }
   if (!path.isAbsolute(file.fsPath) || file.fsPath.split(/[\\/]/).includes('..')) {
     throw new Error('Expected an absolute file path without traversal.');
   }
@@ -61,6 +198,7 @@ function source(uri: vscode.Uri): { file: vscode.Uri; ref?: string } | undefined
 
 function relative(file: vscode.Uri, repo: Repository): string | undefined {
   if (repo.rootUri.scheme !== 'file' || file.authority !== repo.rootUri.authority) { return undefined; }
+  if (path.sep === '/' && (file.fsPath.includes('\\') || repo.rootUri.fsPath.includes('\\'))) { return undefined; }
   const value = path.relative(repo.rootUri.fsPath, file.fsPath);
   if (path.isAbsolute(value) || value === '..' || value.startsWith(`..${path.sep}`)) { return undefined; }
   return value.split(path.sep).join('/');
@@ -107,8 +245,12 @@ export class GitResources implements vscode.Disposable {
         if (api.onDidCloseRepository) { this.subscriptions.push(api.onDidCloseRepository(() => this.repositoryChanges.fire())); }
       })();
     }
-    try { await this.initialization; }
-    catch (error) { this.initialization = undefined; throw error; }
+    try {
+      await this.initialization;
+    } catch (error) {
+      this.initialization = undefined;
+      throw error;
+    }
   }
 
   get repositories(): readonly Repository[] {
@@ -120,23 +262,88 @@ export class GitResources implements vscode.Disposable {
       .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length)[0];
   }
 
+  private async withinRepository(file: vscode.Uri, repo: Repository, directory = false): Promise<boolean> {
+    const root = repo.rootUri.toString();
+    const owned = (): boolean => {
+      const owner = this.containingRepository(file);
+      return owner?.rootUri.toString() === root && !owner.state.submodules?.some(submodule => {
+        const boundary = vscode.Uri.joinPath(repo.rootUri, submodule.path);
+        return relative(file, { ...repo, rootUri: boundary }) !== undefined;
+      });
+    };
+    if (!owned()) { return false; }
+    // Reject symlink traversal below the Git root, including in-scope aliases: Git
+    // paths and saved paths must identify the same file. Missing paths remain valid
+    // for deleted files and historical revisions. The root itself defines the scope.
+    let current = file;
+    while (current.toString() !== root) {
+      if (relative(current, repo) === undefined) { return false; }
+      try {
+        const stat = await vscode.workspace.fs.stat(current);
+        if (stat.type & vscode.FileType.SymbolicLink) { return false; }
+        if ((directory || current.toString() !== file.toString()) && stat.type !== vscode.FileType.Directory) {
+          return false;
+        }
+      } catch (error) {
+        if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'FileNotFound') {
+          throw new Error('Cannot validate Git repository boundaries. Check filesystem access and retry.', { cause: error });
+        }
+      }
+      // Closed/undiscovered repositories are absent from the Git API. Inspect only
+      // their boundary marker metadata, never marker contents.
+      if (directory || current.toString() !== file.toString()) {
+        try {
+          await vscode.workspace.fs.stat(vscode.Uri.joinPath(current, '.git'));
+          return false;
+        } catch (error) {
+          if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'FileNotFound') {
+            throw new Error('Cannot validate Git repository boundaries. Check filesystem access and retry.', { cause: error });
+          }
+        }
+      }
+      current = vscode.Uri.file(path.dirname(current.fsPath));
+    }
+    return owned();
+  }
+
   async workspaceRepository(): Promise<Repository | undefined> {
     await this.initialize();
     const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!folder || folder.scheme !== 'file') { return undefined; }
     const repository = this.containingRepository(folder);
-    if (!repository) { return undefined; }
+    if (!repository || !await this.withinRepository(folder, repository, true)
+      || vscode.workspace.workspaceFolders?.[0]?.uri.toString() !== folder.toString()) { return undefined; }
     const root = repository.rootUri.toString();
     const key = JSON.stringify([root, folder.toString()]);
     let adapter = this.workspaceAdapters.get(key);
     if (!adapter) {
       // Git can return fresh wrappers. Keep folder identity stable, but metadata live.
-      const actual = (): Repository => this.repositories.find(repo => repo.rootUri.toString() === root) ?? repository;
+      const actual = (): Repository => {
+        const current = this.repositories.find(repo => repo.rootUri.toString() === root);
+        if (!current) { throw new Error('The containing Git repository is no longer open. Refresh and retry.'); }
+        return current;
+      };
       adapter = {
         rootUri: folder,
         get state() { return actual().state; },
         show: (ref, filePath) => actual().show(ref, filePath),
         getCommit: ref => actual().getCommit(ref),
+        get getObjectDetails() {
+          const current = actual();
+          return current.getObjectDetails?.bind(current);
+        },
+        get diffWithHEAD() {
+          const current = actual();
+          return current.diffWithHEAD?.bind(current);
+        },
+        get add() {
+          const current = actual();
+          return current.add?.bind(current);
+        },
+        get clean() {
+          const current = actual();
+          return current.clean?.bind(current);
+        },
       };
       this.workspaceAdapters.set(key, adapter);
     }
@@ -148,9 +355,9 @@ export class GitResources implements vscode.Disposable {
     const repo = await this.workspaceRepository();
     if (!uri) { return repo; }
     if (!repo || !file || relative(file, repo) === undefined) { return undefined; }
-    const owner = this.containingRepository(file);
     const actual = this.containingRepository(repo.rootUri);
-    return owner?.rootUri.toString() === actual?.rootUri.toString() ? repo : undefined;
+    return actual && await this.withinRepository(file, actual)
+      && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString() ? repo : undefined;
   }
 
   async resource(uri: vscode.Uri, repo: Repository): Promise<Resource | undefined> {
@@ -158,9 +365,7 @@ export class GitResources implements vscode.Disposable {
     if (!value) { return undefined; }
     const filePath = relative(value.file, repo);
     if (!filePath) { return undefined; }
-    const owner = this.containingRepository(value.file);
-    const actual = this.containingRepository(repo.rootUri) ?? repo;
-    if (owner && owner.rootUri.toString() !== actual.rootUri.toString()) { return undefined; }
+    if (await this.repositoryFor(uri) !== repo) { return undefined; }
     const resource = normalizeResource({ path: filePath, origin: 'changed' });
     const ref = value.ref;
     if (ref === undefined) { return resource; }
@@ -176,10 +381,186 @@ export class GitResources implements vscode.Disposable {
     }
     try {
       const commit = await repo.getCommit(ref);
+      if (await this.repositoryFor(uri) !== repo) { return undefined; }
       return normalizeResource({ ...resource, origin: `commit:${commit.hash}` });
     } catch (error) {
       throw new Error(`Cannot resolve Git ref ${JSON.stringify(ref)} to a local commit: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
+  }
+
+  async filesToReview(repo: Repository, notedPaths: ReadonlySet<string>, excludedFolders: readonly vscode.Uri[] = []): Promise<FileReviewRow[]> {
+    const noted = new Set([...notedPaths].map(value => value.replace(/\\/g, '/')));
+    const isCurrentCandidate = (uri: vscode.Uri, untracked: boolean): boolean => {
+      try {
+        return !this.disposed && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString()
+          && unstagedCandidates(repo).get(uri.toString())?.untracked === untracked;
+      } catch { return false; }
+    };
+    const validateCandidate = async (uri: vscode.Uri, untracked: boolean): Promise<boolean> => {
+      try { return await this.repositoryFor(uri) === repo && isCurrentCandidate(uri, untracked); }
+      catch { return false; }
+    };
+
+    let candidates: Map<string, FileCandidate>;
+    try {
+      if (await this.workspaceRepository() !== repo) { return []; }
+      candidates = unstagedCandidates(repo);
+    } catch { return []; }
+
+    const rows: (FileCandidate & { row: FileReviewRow })[] = [];
+    for (const { uri, untracked } of candidates.values()) {
+      if (excludedFolders.some(rootUri => relative(uri, { ...repo, rootUri }) !== undefined)) { continue; }
+      let resource: Resource | undefined;
+      try {
+        if (uri.scheme !== 'file') { continue; }
+        const name = path.basename(uri.fsPath);
+        if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
+        resource = await this.resource(uri, repo);
+      } catch { continue; }
+      if (!resource || noted.has(resource.path) || !isCurrentCandidate(uri, untracked)) { continue; }
+      const name = path.posix.basename(resource.path);
+      if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
+      const row: FileReviewRow = { path: resource.path };
+      try {
+        let statistics: FileStatistics | undefined;
+        if (untracked) {
+          statistics = await untrackedStatistics(uri, row, () => validateCandidate(uri, untracked));
+        } else {
+          statistics = await trackedStatistics(repo, uri);
+        }
+        if (!statistics) { continue; }
+        Object.assign(row, statistics);
+      } catch { /* Statistics failures must not hide an otherwise reviewable file. */ }
+      if (await validateCandidate(uri, untracked)) { rows.push({ uri, untracked, row }); }
+    }
+    // Later files can await while earlier entries are staged, removed, or change ownership.
+    const verified: typeof rows = [];
+    for (const entry of rows) {
+      if (await validateCandidate(entry.uri, entry.untracked)) { verified.push(entry); }
+    }
+    return verified.filter(entry => isCurrentCandidate(entry.uri, entry.untracked)).map(entry => entry.row)
+      .sort((a, b) => {
+        if (a.path < b.path) { return -1; }
+        if (a.path > b.path) { return 1; }
+        return 0;
+      });
+  }
+
+  /** Reviewer-authorized whole-file staging; validate rechecks the host's live action guard. */
+  async stageFile(repo: Repository, filePath: string, notedPaths: ReadonlySet<string>,
+    excludedFolders: readonly vscode.Uri[], validate: () => void): Promise<void> {
+    return this.mutateFile('stage', repo, filePath, notedPaths, excludedFolders, validate);
+  }
+
+  /** Reviewer-authorized index-preserving revert; confirmation is supplied here or already held by the host. */
+  async revertFile(repo: Repository, filePath: string, notedPaths: ReadonlySet<string>,
+    excludedFolders: readonly vscode.Uri[], validate: () => void,
+    confirm?: (untracked: boolean) => Promise<boolean>): Promise<void> {
+    return this.mutateFile('revert', repo, filePath, notedPaths, excludedFolders, validate, confirm);
+  }
+
+  private async mutateFile(action: 'stage' | 'revert', repo: Repository, filePath: string, notedPaths: ReadonlySet<string>,
+    excludedFolders: readonly vscode.Uri[], validate: () => void,
+    confirm?: (untracked: boolean) => Promise<boolean>): Promise<void> {
+    const label = action === 'stage' ? 'Stage File' : 'Revert File';
+    if (path.sep === '/' && filePath.includes('\\')) {
+      throw new Error(`${label} requires a losslessly represented filesystem path without literal backslashes.`);
+    }
+    const resource = normalizeResource({ path: filePath, origin: 'changed' });
+    if (/[*?\[\]]/.test(resource.path)) {
+      throw new Error(`${label} requires one literal file path, not a wildcard.`);
+    }
+    const uri = this.uri(resource, repo);
+    const candidate = () => {
+      if (this.disposed || vscode.workspace.workspaceFolders?.[0]?.uri.toString() !== repo.rootUri.toString()) {
+        throw new Error('The opened folder has changed. Refresh Files to Review and retry.');
+      }
+      const name = path.posix.basename(resource.path);
+      if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)
+        || excludedFolders.some(rootUri => relative(uri, { ...repo, rootUri }) !== undefined)) {
+        throw new Error(`Review Notes, temporary review files and archive storage cannot be ${action === 'stage' ? 'staged' : 'reverted'}.`);
+      }
+      if ([...notedPaths].some(value => value.replace(/\\/g, '/') === resource.path)) {
+        throw new Error('This file has saved Review Notes and is no longer a Files to Review candidate.');
+      }
+      const matches = (change: { uri: vscode.Uri }): boolean => change.uri.toString() === uri.toString();
+      const changes = [
+        ...(repo.state.workingTreeChanges ?? []).filter(matches).map(change => ({ uri: change.uri, status: change.status, untracked: false })),
+        ...(repo.state.untrackedChanges ?? []).filter(matches).map(change => ({ uri: change.uri, status: change.status, untracked: true })),
+      ];
+      if (!changes.length) {
+        throw new Error('This file no longer has unstaged or untracked changes. Refresh Files to Review and retry.');
+      }
+      if (action === 'revert') {
+        if (vscode.workspace.textDocuments.some(doc => !doc.isClosed && doc.isDirty && doc.uri.toString() === uri.toString())) {
+          throw new Error('Revert File cannot discard a file with unsaved changes. Save or close the dirty document and retry.');
+        }
+        // Git clean may unstage intent-to-add or conflicted resources. Only these
+        // explicit working-tree statuses safely restore the index or delete untracked files.
+        const restorableStatuses = [GitStatus.Modified, GitStatus.Deleted, GitStatus.Untracked];
+        const standardIndexStatuses = [GitStatus.IndexModified, GitStatus.IndexAdded, GitStatus.IndexDeleted,
+          GitStatus.IndexRenamed, GitStatus.IndexCopied];
+        const unsupportedWorkingChange = changes.some(change => change.status === undefined
+          || !restorableStatuses.includes(change.status)
+          || (change.untracked && change.status !== GitStatus.Untracked));
+        const conflicted = repo.state.mergeChanges?.some(matches);
+        const unsupportedIndexChange = repo.state.indexChanges?.some(change => matches(change)
+          && (change.status === undefined || !standardIndexStatuses.includes(change.status)));
+        if (unsupportedWorkingChange || conflicted || unsupportedIndexChange) {
+          throw new Error('Revert File does not support this Git status, including conflicts and intent-to-add. Refresh and retry.');
+        }
+      }
+      return {
+        uri: changes[0].uri,
+        deleted: changes.some(change => change.status === GitStatus.Deleted),
+        untracked: changes.some(change => change.status === GitStatus.Untracked),
+        kind: changes.map(change => `${change.untracked}:${change.status}`).sort().join(','),
+      };
+    };
+    const initial = candidate();
+    await this.validatedUri(resource, repo);
+    const checkFile = async (): Promise<boolean> => {
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if (stat.type !== vscode.FileType.File) {
+          throw new Error(`${label} requires a regular file, not a directory or symbolic link.`);
+        }
+      } catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && error.code === 'FileNotFound') {
+          return true;
+        }
+        throw new Error(`Cannot ${action} ${resource.path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+      return false;
+    };
+    let missing = await checkFile();
+    if (confirm) {
+      validate();
+      const current = candidate();
+      if (current.kind !== initial.kind || (missing && !current.deleted)) {
+        throw new Error('The Git candidate changed. Refresh Files to Review and retry.');
+      }
+      if (!await confirm(initial.untracked)) { return; }
+      validate();
+      candidate();
+      missing = await checkFile();
+    }
+    await this.validatedUri(resource, repo);
+    missing = await checkFile();
+    // Keep the host guard, live membership checks and Git invocation in one synchronous turn.
+    validate();
+    const current = candidate();
+    if (action === 'revert' && current.kind !== initial.kind) {
+      throw new Error('The Git candidate kind or status has changed. Refresh Files to Review and retry.');
+    }
+    if (missing && !current.deleted) {
+      throw new Error(`Only a deleted Git candidate can be ${action === 'stage' ? 'staged' : 'reverted'} when its file is missing.`);
+    }
+    // VS Code 1.96 clean restores tracked files from the index, preserving staged
+    // changes, and deletes untracked files. Repository.revert would unstage instead.
+    const mutate = action === 'stage' ? repo.add : repo.clean;
+    if (!mutate) { throw new Error(`The containing Git repository does not support ${label}. Refresh and retry.`); }
+    await mutate.call(repo, [current.uri.fsPath]);
   }
 
   uri(resource: Resource, repo: Repository): vscode.Uri {
@@ -192,21 +573,54 @@ export class GitResources implements vscode.Disposable {
       throw new Error('The resource belongs to a nested repository, not the selected repository.');
     }
     if (normalized.origin === 'changed') { return file; }
-    const ref = normalized.origin === 'staged' ? '' : normalized.origin === 'head' ? 'HEAD' : normalized.origin.slice(7);
+    const ref = revisionRef(normalized.origin);
     return vscode.Uri.from({ scheme: 'git', authority: file.authority, path: file.path,
       query: JSON.stringify({ path: file.fsPath, ref }) });
   }
 
-  async content(resource: Resource, repo: Repository): Promise<string> {
+  /** Use for navigation; uri() only constructs a URI and cannot check filesystem boundaries. */
+  async validatedUri(resource: Resource, repo: Repository): Promise<vscode.Uri> {
     const uri = this.uri(resource, repo);
+    if (await this.repositoryFor(uri) !== repo) {
+      throw new Error('The resource is outside the opened folder or crosses a Git repository boundary. Refresh and retry.');
+    }
+    return uri;
+  }
+
+  async content(resource: Resource, repo: Repository, allowMissing = false): Promise<string> {
+    const uri = await this.validatedUri(resource, repo);
     try {
+      let text: string;
       if (uri.scheme === 'file') {
         const document = vscode.workspace.textDocuments.find(doc => !doc.isClosed && doc.uri.toString() === uri.toString());
         if (document) { return document.getText(); }
-        return new TextDecoder('utf-8', { fatal: true }).decode(await vscode.workspace.fs.readFile(uri));
+        text = new TextDecoder('utf-8', { fatal: true }).decode(await vscode.workspace.fs.readFile(uri));
+      } else {
+        const revision = source(uri);
+        if (!revision || revision.ref === undefined) {
+          throw new Error('Expected a Git revision URI.');
+        }
+        const filePath = revision.file.fsPath;
+        const ref = revision.ref;
+        try { text = await repo.show(ref, filePath); }
+        catch (error) {
+          if (!allowMissing || !repo.getObjectDetails) { throw error; }
+          if (error && typeof error === 'object' && 'gitErrorCode' in error
+            && error.gitErrorCode !== undefined && error.gitErrorCode !== 'UnknownPath') { throw error; }
+          // show() has no reliable missing-path code. The bundled Git API emits
+          // UnknownPath only after a successful ls-tree/ls-files finds no entry.
+          try { await repo.getObjectDetails(ref, filePath); }
+          catch (detailsError) {
+            if (!detailsError || typeof detailsError !== 'object'
+              || !('gitErrorCode' in detailsError) || detailsError.gitErrorCode !== 'UnknownPath') { throw detailsError; }
+            await this.validatedUri(resource, repo);
+            return '';
+          }
+          throw error;
+        }
       }
-      const { path: filePath, ref } = JSON.parse(uri.query) as { path: string; ref: string };
-      return await repo.show(ref, filePath);
+      await this.validatedUri(resource, repo);
+      return text;
     } catch (error) {
       throw new Error(`Cannot read ${resource.path} (${resource.origin}): ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }

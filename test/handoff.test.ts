@@ -46,9 +46,12 @@ function fixture(initial: string | undefined = "Review notes") {
   return { state, port };
 }
 
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => { resolve = done; });
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: (() => void) | undefined;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  assert.ok(resolve);
   return { promise, resolve };
 }
 
@@ -181,7 +184,8 @@ for (const saved of ["Review notes", undefined]) {
     let reads = 0;
     port.read = async () => {
       const snapshot = await read();
-      if (++reads === 2) {
+      reads++;
+      if (reads === 2) {
         state.saved = saved;
         state.dirty = true;
         return saved;
@@ -319,7 +323,10 @@ for (const failureOnRead of [1, 2]) {
     let reads = 0;
     port.read = async () => {
       state.events.push("read");
-      if (++reads === failureOnRead) throw error;
+      reads++;
+      if (reads === failureOnRead) {
+        throw error;
+      }
       return state.saved;
     };
     const result = await copyAndClear(port);

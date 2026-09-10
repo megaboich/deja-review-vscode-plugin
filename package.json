@@ -4,7 +4,7 @@
   "description": "Review code locally, then copy contextual feedback into any AI tool.",
   "version": "0.1.0",
   "publisher": "local-review",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.96.0"
   },
@@ -74,12 +74,6 @@
         "category": "DejaReview"
       },
       {
-        "command": "dejareview.reveal",
-        "title": "Reveal in REVIEW-NOTES.md",
-        "icon": "$(go-to-file)",
-        "category": "DejaReview"
-      },
-      {
         "command": "dejareview.gotoCode",
         "title": "Go to Code",
         "category": "DejaReview"
@@ -137,31 +131,9 @@
       ],
       "view/title": [
         {
-          "command": "dejareview.copyForAgent",
-          "when": "view == dejareview.tree && dejareview.hasFeedback",
-          "group": "navigation@1"
-        },
-        {
           "command": "dejareview.refresh",
-          "when": "view == dejareview.tree",
-          "group": "navigation@2"
-        }
-      ],
-      "view/item/context": [
-        {
-          "command": "dejareview.reveal",
-          "when": "view == dejareview.tree && viewItem == reviewComment",
-          "group": "inline@1"
-        },
-        {
-          "command": "dejareview.deleteComment",
-          "when": "view == dejareview.tree && viewItem == reviewComment",
-          "group": "inline@2"
-        },
-        {
-          "command": "dejareview.openComparison",
-          "when": "view == dejareview.tree && viewItem == reviewComment",
-          "group": "navigation"
+          "when": "view == dejareview.dashboard",
+          "group": "navigation@1"
         }
       ],
       "comments/commentThread/context": [
@@ -186,11 +158,6 @@
           "command": "dejareview.deleteComment",
           "when": "commentController == dejareview && comment == saved",
           "group": "inline@2"
-        },
-        {
-          "command": "dejareview.reveal",
-          "when": "commentController == dejareview",
-          "group": "inline@3"
         }
       ],
       "comments/comment/context": [
@@ -238,10 +205,6 @@
           "when": "false"
         },
         {
-          "command": "dejareview.reveal",
-          "when": "false"
-        },
-        {
           "command": "dejareview.gotoCode",
           "when": "false"
         },
@@ -264,24 +227,11 @@
       "dejareview": [
         {
           "id": "dejareview.dashboard",
-          "name": "Review",
-          "type": "webview",
-          "initialSize": 2
-        },
-        {
-          "id": "dejareview.tree",
           "name": "Review Notes",
-          "initialSize": 3
+          "type": "webview"
         }
       ]
     },
-    "viewsWelcome": [
-      {
-        "view": "dejareview.tree",
-        "contents": "Add review notes using the gutter or [Add Review Note](command:dejareview.addComment).\nWhen ready, use Copy Review Notes & Clear and paste into your AI tool.",
-        "when": "!dejareview.hasFeedback"
-      }
-    ],
     "configuration": {
       "title": "DejaReview",
       "properties": {

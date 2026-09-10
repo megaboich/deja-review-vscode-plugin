@@ -21,7 +21,7 @@ export async function testArchives(
   const base = '0123456789ab';
   const valid = appendComment(appendComment('', { ...comment, body: 'First archived comment' }, base),
     { ...comment, body: 'Second archived comment' });
-  const snapshot = `\uFEFF${valid.replace(/\n/g, '\r\n')}\r\n## File: broken\r\n  Keep malformed feedback verbatim.\r\n`;
+  const snapshot = `\uFEFF${valid.replace(/\n/g, '\r\n')}\r\n## \`broken\`:nope\r\n  Keep malformed feedback verbatim.\r\n`;
   const records: ReviewArchive[] = [];
   try {
     await test('durable archive metadata, exact BOM and malformed text, newest ten of twelve with older IDs retained', async () => {

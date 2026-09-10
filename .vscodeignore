@@ -8,6 +8,7 @@ node_modules/**
 tsconfig.json
 AGENTS.md
 REVIEW-NOTES.md
+.REVIEW-NOTES.md.*.tmp
 .gitignore
 package-lock.json
 *.vsix

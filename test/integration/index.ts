@@ -139,7 +139,7 @@ export async function run(): Promise<void> {
       assert.ok(normal);
       assert.deepEqual(normal.comment, {
         path: 'sample.ts', origin: 'changed', side: 'document', comparison: undefined,
-        startLine: 1, endLine: 1, anchorText: "export const version = 'working';", body: '',
+        startLine: 1, endLine: 1, anchorText: "export const version = 'working';", elided: false, body: '',
       });
       captured.push(normal);
       for (const [left, right, comparison, anchors] of [
@@ -153,7 +153,7 @@ export async function run(): Promise<void> {
           const context = await captureContext(git, uri, range, { tabInput: input });
           assert.ok(context);
           assert.deepEqual(context.comment, { ...comparison[side], side, comparison,
-            startLine: 1, endLine: 1, anchorText, body: '' });
+            startLine: 1, endLine: 1, anchorText, elided: false, body: '' });
           captured.push(context);
         }
       }
@@ -224,7 +224,7 @@ export async function run(): Promise<void> {
         assert.equal(parsed.comments.length, index + 1);
         const saved = parsed.comments[index];
         for (const key of Object.keys(context.comment) as (keyof ReviewComment)[]) {
-          assert.deepEqual(saved[key], context.comment[key], `Saved ${key} for comment ${index}`);
+          assert.deepEqual(key === 'elided' ? !!saved[key] : saved[key], context.comment[key], `Saved ${key} for comment ${index}`);
         }
         assert.equal(api.getState().comments, index + 1);
         assert.ok(api.getState().threads > 0);
@@ -394,7 +394,7 @@ export async function run(): Promise<void> {
     });
 
     await test('malformed feedback survives refresh and valid comment mutations', async () => {
-      const malformed = '## File: `sample.ts`; Lines: nope; Origin: changed; Side: document\n\nKeep this malformed feedback.\n';
+      const malformed = '## `sample.ts`:nope\nSelected: Working tree\n\nKeep this malformed feedback.\n';
       await fs.writeFile(feedback, malformed);
       await api.refresh();
       assert.equal(api.getState().comments, 0);

@@ -1,6 +1,14 @@
-/** Static shell only: repository metadata arrives over postMessage, never inside script source. */
-export function renderDashboard(nonce: string): string {
-  if (!/^[A-Za-z0-9_-]+$/.test(nonce)) throw new Error("Invalid dashboard nonce");
+import { dashboardClient, isDashboardHostMessage } from "./dashboardClient";
+
+/** Static shell only: metadata and explicit editor text arrive over postMessage, never inside script source. */
+export function renderDashboard(nonce: string, instanceKey = nonce): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(nonce)) {
+    throw new Error("Invalid dashboard nonce");
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(instanceKey)) {
+    throw new Error("Invalid dashboard instance key");
+  }
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -39,7 +47,8 @@ export function renderDashboard(nonce: string): string {
     }
     button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
     button:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
-    button:disabled { cursor: default; opacity: 0.6; }
+    button:disabled { cursor: default; }
+    #show-archives[aria-disabled="true"] { color: var(--vscode-disabledForeground); }
     #copy {
       display: flex;
       align-items: center;
@@ -56,8 +65,35 @@ export function renderDashboard(nonce: string): string {
       background: var(--vscode-button-background);
     }
     #copy:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
-    #explanation { font-size: 0.95em; }
-    #error { color: var(--vscode-errorForeground); }
+    #error, #note-error, #files-error, #editor-error { color: var(--vscode-errorForeground); }
+    .toolbar { display: flex; gap: 8px; align-items: start; position: relative; }
+    #add-general { flex: 1; text-align: left; }
+    #more { flex: 0 0 32px; padding: 6px; }
+    #more-menu {
+      position: absolute; right: 0; top: 100%; z-index: 1; padding: 6px;
+      max-width: 100%; background: var(--vscode-menu-background, var(--vscode-editor-background));
+      border: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border));
+    }
+    .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    dialog {
+      width: min(560px, calc(100% - 24px)); max-width: calc(100% - 24px);
+      max-height: calc(100% - 24px); overflow: auto; padding: 16px;
+      color: var(--vscode-foreground); background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border));
+      border-radius: 4px; box-shadow: 0 4px 16px var(--vscode-widget-shadow);
+    }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
+    dialog h2 { margin: 0; }
+    #editor-body {
+      display: block; width: 100%; min-height: 160px; height: 40vh; max-height: 60vh;
+      resize: vertical; margin: 8px 0; padding: 8px; font: inherit;
+      color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border, var(--vscode-contrastBorder, transparent));
+    }
+    #editor-body:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
+    .editor-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 8px; }
+    #save-edit { color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+    #save-edit:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
     ul { list-style: none; padding: 0; margin: 0; }
     li {
       display: flex;
@@ -69,103 +105,149 @@ export function renderDashboard(nonce: string): string {
     }
     .archive-details { flex: 1 1 130px; min-width: 0; }
     time, .archive-count { display: block; }
+    .file-row { position: relative; }
+    .file-open {
+      padding-right: 70px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      text-align: left;
+      color: var(--vscode-foreground);
+      background: transparent;
+      border-color: var(--vscode-contrastBorder, transparent);
+    }
+    .file-open:hover { background: var(--vscode-list-hoverBackground); }
+    .file-action {
+      position: absolute;
+      right: 4px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 28px;
+      height: 28px;
+      padding: 6px;
+      opacity: 0;
+      color: var(--vscode-icon-foreground);
+      background: var(--vscode-sideBar-background);
+    }
+    .file-revert { right: 36px; }
+    .file-row:hover .file-action, .file-row:focus-within .file-action { opacity: 1; }
+    .file-action svg { display: block; width: 14px; height: 14px; fill: currentColor; }
+    .file-name { flex: 1 1 100px; min-width: 0; }
+    .file-insertions { color: var(--vscode-gitDecoration-addedResourceForeground, #2ea043); }
+    .file-deletions { color: var(--vscode-gitDecoration-deletedResourceForeground, #f85149); }
+    #notes { display: grid; gap: 10px; margin-top: 12px; }
+    .note-card {
+      position: relative;
+      display: block;
+      min-width: 0;
+      padding: 0;
+      border: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border, var(--vscode-sideBarSectionHeader-border, transparent)));
+      border-radius: 3px;
+      background: var(--vscode-editor-background);
+    }
+    .note-open {
+      display: block;
+      width: 100%;
+      padding: 10px;
+      text-align: left;
+      line-height: 1.4;
+      color: var(--vscode-foreground);
+      background: transparent;
+      border-color: transparent;
+    }
+    .note-open:hover:not(:disabled) { background: var(--vscode-list-hoverBackground); color: var(--vscode-list-hoverForeground); }
+    .note-title {
+      display: block;
+      padding-right: 60px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .note-preview {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+      max-height: 2.8em;
+      overflow: hidden;
+      margin-top: 8px;
+      white-space: pre-wrap;
+    }
+    .note-action {
+      position: absolute;
+      top: 5px;
+      right: 5px;
+      width: 28px;
+      height: 28px;
+      padding: 6px;
+      opacity: 0;
+      color: var(--vscode-icon-foreground);
+      background: transparent;
+    }
+    .note-edit { right: 37px; }
+    .note-action:disabled { opacity: 0; }
+    .note-card:hover .note-action, .note-card:focus-within .note-action { opacity: 1; }
+    .note-action svg { display: block; width: 14px; height: 14px; fill: currentColor; }
     @media (max-width: 220px) {
       body { padding: 8px; }
-      li button { width: 100%; }
+      #archives li button { width: 100%; }
     }
   </style>
 </head>
 <body>
   <main id="dashboard" aria-busy="false">
+    <div id="toolbar" class="toolbar" role="group" aria-label="Review Note actions">
+      <button id="add-general" type="button" disabled>Add General Review Note</button>
+      <button id="more" type="button" title="More actions" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" aria-controls="more-menu" disabled>...</button>
+      <div id="more-menu" role="menu" aria-label="More actions" hidden>
+        <button id="show-archives" type="button" role="menuitem" aria-controls="history">Recent Archives</button>
+      </div>
+    </div>
+    <p id="archive-unavailable" class="muted" role="status" hidden></p>
+    <button id="copy" type="button" title="Copies your review notes to the clipboard, archives this batch, and clears the current review notes." aria-description="Copies your review notes to the clipboard, archives this batch, and clears the current review notes." hidden disabled>Copy Review Notes &amp; Clear</button>
+    <section id="files-section" aria-labelledby="files-title" hidden>
+      <h2 id="files-title">Files to Review</h2>
+      <p id="files-error" role="alert" hidden></p>
+      <p id="no-files" class="muted">No files to review.</p>
+      <ul id="files" aria-label="Files to Review"></ul>
+    </section>
     <p id="count" role="status" aria-live="polite">0 review notes</p>
-    <button id="copy" type="button" aria-describedby="explanation" hidden disabled>Copy Review Notes &amp; Clear</button>
-    <p id="explanation" class="muted" hidden>Copies your review notes to the clipboard, archives this batch, and clears the current review notes.</p>
     <p id="empty" class="muted">Open a local project folder in VS Code to start reviewing.</p>
+    <p id="note-error" role="alert" hidden></p>
+    <ul id="notes" aria-label="Review Notes"></ul>
     <p id="error" role="alert" hidden></p>
     <section id="history" aria-labelledby="history-title" hidden>
-      <h2 id="history-title">Recent Archives</h2>
+      <div class="section-heading">
+        <h2 id="history-title">Recent Archives</h2>
+        <button id="close-history" type="button" aria-label="Close archives" title="Close archives">Close</button>
+      </div>
       <p class="muted">Recover a batch to make its review notes active again.</p>
       <p id="no-archives" class="muted">No archived batches yet.</p>
       <ul id="archives" aria-label="Archived review note batches"></ul>
     </section>
   </main>
+  <dialog id="note-editor" aria-labelledby="editor-title">
+    <div class="section-heading">
+      <h2 id="editor-title">Edit Review Note</h2>
+      <button id="close-editor" type="button" aria-label="Close Review Note editor" title="Close Review Note editor">Close</button>
+    </div>
+    <label id="editor-label" for="editor-body">Review Note</label>
+    <textarea id="editor-body" aria-labelledby="editor-label"></textarea>
+    <p id="editor-error" role="alert" hidden></p>
+    <div class="editor-actions">
+      <button id="cancel-edit" type="button">Cancel</button>
+      <button id="save-edit" type="button" disabled>Save Review Note</button>
+    </div>
+  </dialog>
+  <template id="edit-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m11 1 4 4-9 9H2v-4l9-9zm0 2-8 8v2h2l8-8-2-2z"/></svg></template>
+  <template id="delete-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 1h4l1 2h3v1H2V3h3l1-2zm0 2h4l-.5-1h-3L6 3zM3 5h1v9h8V5h1v9l-1 1H4l-1-1V5zm3 1h1v6H6V6zm3 0h1v6H9V6z"/></svg></template>
+  <template id="revert-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 2 1 6l4 4V7h5a2 2 0 0 1 0 4H7v2h3a4 4 0 0 0 0-8H5V2z"/></svg></template>
+  <template id="stage-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></svg></template>
   <script nonce="${nonce}">
-    (() => {
-      const vscode = acquireVsCodeApi();
-      const byId = (id) => document.getElementById(id);
-      const copy = byId('copy');
-      const list = byId('archives');
-      const rows = new Map();
-      let state;
-      let renderedRepoKey;
-      const countLabel = (count) => count + (count === 1 ? ' review note' : ' review notes');
-      const send = (type, archiveId) => {
-        if (!state || state.busy) return;
-        vscode.postMessage({ type, repoKey: state.repoKey, ...(archiveId === undefined ? {} : { archiveId }) });
-      };
-      copy.addEventListener('click', () => {
-        if (state && state.repoKey && state.hasFeedback) send('copy');
-      });
-      window.addEventListener('message', (event) => {
-        if (!event.data || event.data.type !== 'state') return;
-        state = event.data.state;
-        byId('dashboard').setAttribute('aria-busy', String(state.busy));
-        byId('count').textContent = countLabel(state.commentCount);
-        copy.hidden = !state.repoKey || !state.hasFeedback;
-        byId('explanation').hidden = copy.hidden;
-        copy.disabled = state.busy || !state.repoKey || !state.hasFeedback;
-        byId('empty').hidden = state.hasFeedback;
-        byId('empty').textContent = state.repoKey
-          ? 'No current review notes. Add review notes in the editor or recover an archived batch.'
-          : 'Open a local project folder in VS Code to start reviewing.';
-        byId('error').textContent = state.error || '';
-        byId('error').hidden = !state.error;
-        byId('history').hidden = state.hasFeedback || !state.repoKey;
-        const archives = state.repoKey ? state.archives.slice(0, 10) : [];
-        byId('no-archives').hidden = archives.length > 0;
-        if (renderedRepoKey !== state.repoKey) {
-          for (const row of rows.values()) row.item.remove();
-          rows.clear();
-          renderedRepoKey = state.repoKey;
-        }
-        const ids = new Set(archives.map((archive) => archive.id));
-        for (const [id, row] of rows) {
-          if (!ids.has(id)) { row.item.remove(); rows.delete(id); }
-        }
-        archives.forEach((archive, index) => {
-          let row = rows.get(archive.id);
-          if (!row) {
-            const item = document.createElement('li');
-            const details = document.createElement('div');
-            details.className = 'archive-details';
-            const date = document.createElement('time');
-            const count = document.createElement('span');
-            count.className = 'archive-count muted';
-            const recover = document.createElement('button');
-            recover.type = 'button';
-            recover.textContent = 'Recover';
-            recover.addEventListener('click', () => {
-              if (state && state.repoKey && !state.hasFeedback) send('restore', archive.id);
-            });
-            details.append(date, count);
-            item.append(details, recover);
-            row = { item, date, count, recover };
-            rows.set(archive.id, row);
-          }
-          const date = new Date(archive.createdAt);
-          const validDate = !Number.isNaN(date.getTime());
-          row.date.textContent = validDate ? date.toLocaleString() : 'Unknown date';
-          if (validDate) row.date.dateTime = date.toISOString();
-          else row.date.removeAttribute('datetime');
-          row.count.textContent = countLabel(archive.commentCount);
-          row.recover.disabled = state.busy || state.hasFeedback || !state.repoKey;
-          row.recover.setAttribute('aria-label', 'Recover ' + countLabel(archive.commentCount) + ' from ' + row.date.textContent);
-          // Keep existing nodes in place during ordinary updates to preserve keyboard focus.
-          if (list.children[index] !== row.item) list.insertBefore(row.item, list.children[index] || null);
-        });
-      });
-      vscode.postMessage({ type: 'ready' });
-    })();
+    (${dashboardClient.toString()})(acquireVsCodeApi, "${instanceKey}", ${isDashboardHostMessage.toString()});
   </script>
 </body>
 </html>`;

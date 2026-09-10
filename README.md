@@ -1,100 +1,137 @@
 # DejaReview
 
-Local code-review feedback for VS Code 1.96+. Add review notes beside code, keep them in the opened workspace folder's root `REVIEW-NOTES.md`, then copy a review pass into any AI tool. No AI service, account, or runtime npm dependencies; the bundled `vscode.git` extension must be enabled and a containing Git repository is required. The extension provides no staging commands and does not change the index or source code.
+**Review code where you work. Send your AI one clear review pass.**
 
-### Install
+DejaReview brings your feedback together in a single **Review Notes** panel in VS Code. Leave a note beside the code or add a general request for the whole review, refine your feedback in the panel, then copy it into any AI tool. No manually copying file paths, line numbers, or code snippets: file-specific notes capture that context for you.
 
-With Node.js, npm, and Git installed, run from this project:
+- **Keep feedback in context.** Select code in a file or diff and write what needs to change. DejaReview remembers the selected revision and comparison side.
+- **Say more than line comments allow.** Add general feedback about design, tests, or the next iteration without opening a file.
+- **Manage one review pass in one place.** Browse changed files, revisit notes, and edit any saved note from its card.
+- **Hand off without losing your review.** Copy saved feedback with instructions for your agent, keep a local recovery archive, and start the next pass with a clear panel.
 
-```sh
-npm install
-npm test
-npm run package
-```
+The loop is simple: **review changes, stage what you approve, leave notes for what needs work, copy the review, repeat.** DejaReview does not run an AI or require an account.
 
-In VS Code, open **Extensions**, choose **Install from VSIX...** from its menu, and select the generated `dejareview-0.1.0.vsix`. For development instead, open this project and press **F5** with **Run DejaReview** selected; the launch task compiles and opens an Extension Development Host.
+## Install
 
-The extension ID is `local-review.dejareview`, with command/settings prefix `dejareview.`. The renamed extension cannot automatically update an installation of `local-review.simple-loop-review`; disable or uninstall that previous extension if both are installed.
+1. In VS Code, open **Extensions** and choose **Install from VSIX...** from its menu.
+2. Select `dejareview-0.1.0.vsix`.
+3. Open a local folder inside a Git repository, then open the **Review Notes** panel.
 
-### Review
+Requires **VS Code 1.96+**, Git, and VS Code's bundled Git extension enabled. In a multi-root workspace, only the **first folder** is used, not whichever editor is active. Opening a repository subfolder keeps the review and its paths scoped to that subfolder. There is no repository picker.
 
-Review agent changes in VS Code, stage the hunks you approve using the built-in Source Control UI, and leave **Review Notes** where more work is needed. Staging and adding a note are independent: an approved pattern can still receive a note asking the agent to use it elsewhere. Only you manage staging; DejaReview does not track acceptance or infer review completion.
+Building a VSIX or developing the extension is covered in `AGENTS.md` in the source repository.
 
-1. Open a local folder in a Git repository and a text file or comparison. DejaReview automatically scopes the review to the **first VS Code workspace folder**. With multiple workspace roots, folder order deterministically decides the scope; other roots are unsupported. There is no repository picker or active-editor switching. Opening a subfolder inside a repository keeps `REVIEW-NOTES.md` at that opened folder's root, not the Git root.
-2. Select lines, or leave the cursor on one line. Press **Ctrl+Alt+M** (**Cmd+Alt+M** on macOS), or use **Add Review Note** in the editor context menu/Command Palette. The shortcut is recommended: it captures the source, range, side, and snippet before you type. Confirm the context if asked.
-3. Alternatively, hover the native comment gutter and click **+**. Type multiline feedback and choose **Add Review Note**. Native gutter drafts require context confirmation at submission and capture the source text as it exists then, not when the gutter was clicked.
-4. Expand saved gutter review notes to read them, use **Edit Review Note** or **Delete Review Note**, or save/cancel edits. The **Review Notes** view groups review notes by file, with a **Stale** group for missing anchors; click to navigate, or use **Reveal in REVIEW-NOTES.md**. Hand-editing and saving that file is supported; **Refresh Review Notes** explicitly reloads it.
-5. Finish submitting review notes and saving edits, then use **Copy Review Notes & Clear**, the central full-width button (at least 48px tall) in the **Review** webview dashboard above the native **Review Notes** tree. The sidebar follows your VS Code theme; creation and editing remain in the native comment UI. The command is also available in the tree title when saved meaningful feedback exists, and in the Command Palette. It copies the saved file with a handoff instruction, atomically saves an archive via a temporary file and rename, then rechecks the source and dirty-buffer state before deleting `REVIEW-NOTES.md`. Clipboard or archive failure retains the source; an archive failure may leave the clipboard already copied. If the source changes, the original snapshot stays archived and the live file remains intact. Deletion failure also leaves feedback available.
-6. Paste the clipboard into your AI tool. The handoff tells the agent to use the captured context, never stage or unstage anything, and summarize changes in the conversation. Feedback has been archived, not permanently discarded. When no saved meaningful raw feedback remains (the file is missing or whitespace-only), the dashboard shows that folder's latest 10 archived batches, newest first, with copy/creation dates, parsed review note counts labeled **review notes**, and **Recover** actions. Any non-whitespace raw feedback hides archive history and remains copyable, even malformed blocks or free-form notes showing **0 review notes**.
+## Review Workflow
 
-Saved feedback includes opened-workspace-folder-relative paths, side-local line ranges, origins (`changed`, `staged`, `head`, or a commit), captured snippets, and **Document / Left Original / Right Modified** context with both comparison endpoints. Git discovery supplies revisions from the containing repository, including a parent repository when a subfolder is opened; it does not move the review file or change its path scope. This context persists across reloads in `REVIEW-NOTES.md`; displaying a revision elsewhere does not change its captured side. The next submitted comment creates a fresh file after a successful handoff unless you recover a batch first. A previously named scratch file is not scanned or migrated automatically.
+### Add Feedback
 
-The dashboard shows the parsed review note count (including **0 review notes**), conditional copy action, and conditional archive history, with no repository heading or selection button. The copy button and its explanatory paragraph are hidden initially, until saved meaningful raw feedback is known, and whenever the file is missing or whitespace-only. Both appear for any non-whitespace saved text, even with zero parsed review notes. While busy, the button stays visible but disabled, and the paragraph stays visible; busy state does not hide them. The tree toolbar copy action is likewise hidden without saved meaningful feedback and disabled, not hidden, while busy with feedback. The empty-review archive list remains available independently of the hidden copy controls. An optional unavailable-state diagnostic can ask you to open a local project folder in a Git repository; it does not offer a repository picker or silently choose another scope. Files outside the first workspace folder and nested separate repositories are unsupported, even if Git discovers them.
+For a file-specific note, select lines in a text file or diff and press **Ctrl+Alt+M** (**Cmd+Alt+M** on macOS). With no selection, the current line is used. **Add Review Note** is also available in the editor context menu and Command Palette. Type your feedback in the native comment composer and submit it.
 
-Adding `REVIEW-NOTES.md` to the opened folder's `.gitignore` is optional and requires your approval. The one-time suggestion is scoped per opened folder and current scratch filename, so another folder or a previous filename's dismissal does not suppress it.
+The shortcut captures the file, lines, snippet, and comparison context **before you type**. You can also click **+** in the native comment gutter, but gutter notes capture source text at submission. If the comparison side is ambiguous, DejaReview asks rather than guessing.
 
-### Archives And Recovery
+For feedback that is not tied to code, use **Add General Review Note** in the toolbar inside the Review Notes panel. A floating editor opens in the panel with **Save** and **Cancel**; **Escape** cancels. No file or text selection is required, but a supported local project folder in Git is still required.
 
-The opened folder's root `REVIEW-NOTES.md` remains the sole source of the current review. Archives persist across reloads and restarts but do not populate current comments until explicitly recovered. Use **Recover** or **Recover Archived Review** (`dejareview.restoreArchive`) to write the archive's exact original raw text, including its original base SHA, back to `REVIEW-NOTES.md`. Recovery never merges with or overwrites active feedback, dirty buffers, or known in-flight drafts/edits, and keeps the archived copy. Finish or cancel input first; native gutter drafts still have the limitations below.
+### Refine The Review
 
-Archives live outside the repository in VS Code's user-local extension storage. They contain the exact saved feedback (including captured code snippets), the copy/creation date, and the parsed review note count. Existing Git-root archives stay accessible when that root is opened; opening a subfolder uses separate history. Historical contents are never rewritten. Only the latest 10 appear in the UI; older batches are retained, with no automatic purge or archive-delete action. This is local recovery storage, not conversation history, synced storage, or an encrypted backup. DejaReview does not sync or encrypt these files; account for the retained code and feedback when managing local storage.
+The panel shows file-specific and general notes together in saved order, with a combined note count and a short two-line preview of each.
 
-### Hand-Edited Notes
+- Click a file note to open its code or captured comparison. If its snippet can no longer be located, the card opens the saved note in `REVIEW-NOTES.md` instead.
+- Click a general note to edit it.
+- Hover any card or move keyboard focus into it to reveal **Edit Review Note**, followed by **Delete Review Note**. Edit opens the floating editor for either kind of note; deletion asks for confirmation.
+- Use **Save** to apply an edit, or **Cancel** / **Escape** to leave the saved note unchanged. File-note edits change the feedback, not its captured location or comparison context. Native gutter editing remains available for file notes.
 
-You can edit and save `REVIEW-NOTES.md` directly. Notes are a flat list of `##` blocks with readable metadata, an optional captured code fence, and feedback prose:
+The panel editor keeps your input when the panel refreshes or is hidden and reopened during the session. A failed save keeps your text so you can resolve the problem and retry. Finish or cancel this editor before copying a review or recovering an archive. Unsaved input is not guaranteed to survive a VS Code reload.
+
+Saved feedback lives in `REVIEW-NOTES.md` at the opened folder's root. It is created only when you first save a note or explicitly recover a review. You do not need to manage this file yourself, but hand-editing and saving it is supported. Use the panel title's **Refresh Review Notes** action if needed.
+
+### Review Changed Files
+
+**Files to Review**, above the note cards, helps you find files that still need attention. It lists unstaged changes and untracked files in the opened folder that have no saved file-specific note on their path.
+
+- A saved file note hides that path even if it refers to an older revision or can no longer be located. A general note, an unsaved draft, or a note mentioning a file only as the other comparison endpoint does not hide it. Malformed notes are not used to guess file associations.
+- Fully staged files are absent; partially staged files can remain while unstaged changes exist. The list updates with Git changes. After handoff or deletion of a file's last note, that file can reappear for the next pass.
+- Click a tracked file for its unstaged diff, an untracked file to open it, or a deleted file to see its staged version.
+- Hover or focus a row to reveal **Revert File**, then **Stage File**. Neither button opens the file. Actions are disabled while a staging or revert operation, including its confirmation, is in progress. Failures are reported, and the list follows Git's actual state rather than assuming success.
+
+**Stage File** stages that whole file's saved disk state without a confirmation dialog, including remaining unstaged changes or a deletion. It does not save or stage unsaved editor text. Use VS Code Source Control to stage selected hunks instead.
+
+**Revert File** asks before discarding that file's unstaged disk changes. Tracked files are restored from the staging area, **not HEAD**, leaving staged changes intact. This restores an unstaged deletion, not a staged deletion. For untracked files, confirmation warns that the file will be removed and **Git cannot recover it**. A file with unsaved editor changes cannot be reverted; the extension never saves or discards those buffers for you. Conflicts, intent-to-add, and other unsupported states are refused rather than risking staged work.
+
+Line counts compare the staging area with saved working-tree content, not unsaved editor text. New untracked text files are counted up to **5 MiB**. Binary, over-limit, or unavailable results show **Stats unavailable**; standard binary files, new files, and deletions can still be staged or reverted subject to the safeguards above.
+
+This is a files-only aid, **not approval or completion tracking**. An empty list means no current candidates, not that the review is complete. Neither staging nor reverting adds a note or marks work approved. Other workspace roots, nested separate repositories, the review file, and archives are excluded.
+
+### Send The Review
+
+1. Finish saving your notes and edits. Stage changes you approve using Source Control or **Stage File**; staging and leaving feedback are independent.
+2. Select **Copy Review Notes & Clear** in the panel, or use the command with that name. It appears when there is meaningful saved feedback, including free-form or malformed text even if the parsed note count is zero.
+3. Paste into your AI tool. The clipboard includes the saved review and instructions to use its context, never stage or unstage anything, and summarize changes in the conversation.
+4. Review the resulting changes and begin the next pass. Your previous review is archived locally, not permanently discarded.
+
+Copy exports **saved feedback only**, never unsaved editor text. An open dashboard editor must be finished or cancelled first. Known native drafts and native edits retain their existing choice: finish first, cancel the handoff, or explicitly discard that input **only after a successful copy-and-clear**. Unsubmitted gutter drafts that VS Code cannot expose are left alone for the next pass.
+
+## Safety And Privacy
+
+**You control staging and discarding.** Git access is read-only except for your explicit, single-file Stage File action or confirmed Revert File action. DejaReview never automatically or bulk stages or reverts, unstages, stashes, commits, or otherwise changes source code. Coding agents must not stage, unstage, stash, or invoke revert on workspace changes; the panel's reviewer actions do not grant agents that permission.
+
+**Copy comes before clearing.** DejaReview copies the saved text, durably archives that exact review, then checks for unsaved or concurrent changes before removing the live review file. Clipboard failure leaves feedback intact. Archive failure also keeps it, though the clipboard may already contain the review. Concurrent changes or a clearing failure leave live feedback in place and report the partial result; a successfully created archive is retained.
+
+Save direct edits to `REVIEW-NOTES.md` before changing saved feedback through the extension. Unsaved review-file edits block writes with **Save and retry** / **Cancel**. Temporary-file writes protect against partial-write failures, and checks catch observed external changes, but cannot eliminate every race with another program writing the same file. Failed cleanup can leave a `.REVIEW-NOTES.md.*.tmp` file containing feedback.
+
+**Your review stays local until you share it.** DejaReview has no AI service, account, or remote upload. The review file and local archives include your feedback and captured code snippets; the clipboard sends that text wherever you choose to paste it. These files are not encrypted or synced by DejaReview. Adding `REVIEW-NOTES.md` to the opened folder's `.gitignore` is optional and requires your approval; the suggestion is remembered per folder and filename.
+
+No agent configuration is required. If you maintain agent instructions, tell the agent to use the pasted feedback, preserve unrelated work, and summarize in the conversation. Do not have it read, recreate, or reply in `REVIEW-NOTES.md`, inspect local archives, or recover feedback without a separate explicit request. DejaReview does not edit your agent instructions.
+
+## Archives And Recovery
+
+Archive history is **hidden by default**, including after a handoff. Open **More actions (...)** in the toolbar inside the panel, then choose **Recent Archives**. While saved feedback is active, selecting this unavailable item explains that you must finish your review and use **Copy Review Notes & Clear** first. History hides when new saved feedback becomes active and does not reopen automatically after clearing. Close it with its close control when you are finished. Files to Review candidates do not prevent viewing history.
+
+History shows the latest **10** valid batches, newest first, with local dates, total review-note counts including general notes, and **Recover** actions. **Recover Archived Review** also remains available in the Command Palette.
+
+Recovery restores the exact saved text and its original review base into an absent or unchanged whitespace-only `REVIEW-NOTES.md`. It keeps the archive and never merges with or overwrites active feedback. Finish or cancel drafts and edits, including the dashboard editor, and resolve unsaved review-file changes first. Archives never become current notes automatically, even after a reload or when the review file is missing.
+
+Archives live outside the repository in VS Code's user-local extension storage and survive restarts. Each opened folder has separate history: opening a repository subfolder does not show the parent folder's archives. Existing repository-root history stays available when that root is opened. Older batches are retained even though only the latest 10 are displayed; there is no purge or archive-delete action. Counts describe the archived batch, not a fresh recount. This is local recovery storage, not conversation history or an encrypted backup; account for the retained code and feedback when managing local storage. Previously named scratch files are not scanned or migrated.
+
+## Limitations
+
+- File-specific capture supports local text files and Git text revisions in the first workspace folder. Untitled buffers, arbitrary virtual documents, remote repository schemes, notebook/custom/merge editors, other roots, nested separate repositories, and cross-boundary comparisons are unsupported. General notes need no file, but still require the supported folder and containing Git repository.
+- Paths through symbolic links below the containing Git root are rejected, even when the link points inside the project. On macOS/Linux, filenames containing literal backslashes are also unsupported rather than confused with directory separators. These restrictions apply to file capture, reads, and Files to Review actions.
+- Native gutter drafts cannot reliably record the moment you clicked the gutter or expose every unsubmitted draft. Prefer the shortcut to freeze context before typing. If a revision changes during capture or composition, you may need to recapture; failed validation preserves your input. Native drafts and dashboard input are transient, not reload-persistent storage.
+- Inline diffs do not reliably show Original-side native notes. Use the native **Open Side-by-Side Comparison** action when needed; normal card navigation does not change your diff layout. When both panes show the same resource, VS Code may display a note on both sides even though its saved context identifies the selected side.
+- Snippets capture whole lines: up to 20 verbatim, or the first 10 and last 5 for longer selections, with an explicit omission marker. Locations may become stale. DejaReview adjusts display positions when it can find the snippet, but does not automatically rewrite saved lines, snippets, or remove stale feedback. A changed review base makes HEAD/staging-area notes stale rather than silently rebasing them. **Rewrite Line Numbers from Anchors** is an explicit action for file notes.
+- Settings are limited to `dejareview.decorationStyle` (`badge` or `none`, default `badge`) and `dejareview.searchRadius` (0-10000, default `50`). There is no AI integration, PR workflow, reply thread, or review-completion model.
+
+## Optional Markdown
+
+You can hand-edit and save `REVIEW-NOTES.md`, but the panel and native composer handle this format for you. General notes have the exact heading `## General Review Note` and a body, with no file path, location, or captured snippet. File notes include their captured context:
 
 ````md
-## File: `src/client.ts`; Lines: 42; Origin: changed; Side: right
+## General Review Note
+
+Add regression tests for the error-handling changes before the next pass.
+
+## `src/client.ts`:42
+Comparison: HEAD -> Staging area
+Selected: Modified (Staging area)
 
 ```ts
 const response = await fetch(url);
 ```
 
-Comparison: Left: `src/client.ts` (staged); Right: `src/client.ts` (changed)
-
 Handle request failures before using the response.
 ````
 
-Paths are relative to the opened folder. Line ranges are 1-based and inclusive, belonging to the selected origin and side, not necessarily the working tree. A regular-editor note uses `Side: document` without a `Comparison:` line. Keep the anchor fence immediately after the header and comparison metadata immediately after the anchor (blank lines are allowed). Use `###` rather than `##` for headings inside feedback, and balance Markdown fences.
+<details>
+<summary>Hand-editing details</summary>
 
-Unknown sections and malformed blocks are preserved and copied even when they cannot appear as anchored notes. Missing anchors use line hints with low confidence. Snippets that cannot be found appear under **Stale** and are still copied; stale notes are never automatically deleted. If the optional review base differs from the current HEAD, index/HEAD notes are marked stale rather than rebased automatically.
+Paths are relative to the opened folder. File-note ranges are 1-based and inclusive in the selected revision. A regular-editor note uses `Selected: Working tree`, `Selected: Staging area`, `Selected: HEAD`, or `Selected: Commit <full-sha>` (40 or 64 hexadecimal characters). A comparison records Original then Modified endpoints and always names the selected side and its revision, as above.
 
-### Agent Guidance
+Same-file comparisons omit endpoint paths. Different-file comparisons name both, for example ``Comparison: `old.ts` (HEAD) -> `new.ts` (Working tree)`` with `Selected: Modified (Working tree)` under a `new.ts` heading. The selected endpoint must match the heading's path and selected revision. Keep file metadata directly after the heading and any captured code fence directly after `Selected:`; blank lines are allowed. General notes have none of this metadata, and code fences in their body are feedback, not anchors.
 
-No agent configuration is required: clipboard feedback is self-contained. If you maintain instructions for your AI tool, you can also tell it:
+Composers accept arbitrary text, including `##` headings, metadata examples, unfinished fences, and significant surrounding whitespace. When necessary, the saved body uses `Body: fenced` followed by a `markdown` backtick fence longer than any backtick run in the feedback. Editors show the original body without the wrapper; copy and archives preserve the saved representation. When hand-editing, keep wrappers intact. Outside a wrapper, use `###` for body headings and balance fences: an unfenced `##` starts another block. A broken fence can block further submissions until repaired. Empty or whitespace-only new notes cannot be submitted.
 
-- Only the reviewer manages staging; never stage or unstage changes.
-- Use pasted feedback and captured snippets to locate code; line numbers may be stale, and Original/Modified context matters.
-- Do not read, recreate, or reply in `REVIEW-NOTES.md`, or inspect local review archives. Recovery is the reviewer's explicit action.
-- Address the requested changes, leave unrelated work alone, and summarize results in the conversation.
+Long file selections use `; Snippet: elided` in the heading and a bare `...` between the first 10 and last 5 snippet lines. Without that label, an ellipsis is literal code. File notes without snippets use line hints rather than a reliable match.
 
-DejaReview does not create or edit agent instructions in reviewed projects.
+Unknown sections, malformed blocks, duplicate notes, and original formatting are preserved rather than guessed or discarded. Old compact file-context formats are not parsed or automatically migrated, but remain copyable. Edits target the selected body; they do not regenerate the whole review file.
 
-### v0.1 Limits
-
-- Only local Git repositories and their `file:` / `git:` text resources are supported. No untitled buffers, arbitrary virtual documents, remote repository schemes, notebook/custom/merge editors, or cross-repository comparisons.
-- Stable VS Code APIs cannot observe a native gutter draft's initial context or enumerate those unsubmitted drafts. Copy exports submitted, saved comments only, plus all saved raw notes and malformed blocks, never unsaved composer text. Known shortcut drafts and open edits prompt you to finish first or explicitly discard them on successful copy-and-clear. Unsubmitted native gutter drafts are preserved, not silently destroyed, and remain available for the next pass; they are not persisted in `REVIEW-NOTES.md` until submitted.
-- Save hand-edited review notes before copying or making other changes through the extension. Dirty review buffers block writes with **Save and retry** / **Cancel**. Snapshot checks protect observed concurrent changes, but clearing and recovery cannot be transactional against external filesystem writers. Native drafts are transient and are not guaranteed to survive reloads.
-- Inline diffs do not reliably display original-side native threads. Explicitly invoke **Open Side-by-Side Comparison** on a comparison comment as a fallback. Only this action invokes `toggle.diff.renderSideBySide` when the diff is inline; ordinary navigation does not change the layout. If both sides use the same URI, VS Code may show a comment on both sides despite its preserved capture label.
-- Comment bodies require balanced Markdown fences and no unfenced `##` headings, which delimit review blocks. Use `###` for body headings. Anchors capture whole lines: up to 20 verbatim; longer selections use the first 10 lines, a bare `...`, and the last 5, retaining the full range. This limit is fixed, not a setting.
-- Re-anchoring updates display positions, not the saved snippets or line numbers. **Rewrite Line Numbers from Anchors** is explicit. Settings are limited to `dejareview.decorationStyle` (`badge` or `none`, default `badge`) and `dejareview.searchRadius` (0-10000, default `50`).
-
-### Tests And Status
-
-`npm test` runs the pure parser, writer, anchor, handoff, and dashboard tests. Run the extension-host suite, including archive persistence and recovery tests, with:
-
-```sh
-npm run test:integration
-```
-
-The runner uses the system macOS executable at `/Applications/Visual Studio Code.app/Contents/MacOS/Code`. For another installation, set its actual VS Code executable path:
-
-```sh
-VSCODE_EXECUTABLE_PATH="/path/to/VS Code executable" npm run test:integration
-```
-
-Integration tests use disposable Git fixtures, isolated user-data and extensions directories, and restore the previous clipboard **text** in cleanup (not other clipboard formats). They exercise commands, resource capture, persistence, watchers, clipboard handoff, and archive recovery. Separate root and subfolder hosts cover opened-folder storage, parent-Git delegation, and outside-folder resource rejection. Tests do not verify visual gutter clicking, physical shortcuts, native draft prompts, or inline/same-URI placement; manual UI validation remains pending.
-
-For architecture, persistence contracts, development commands, and contributor constraints, see `AGENTS.md` in the source repository (not included in the VSIX).
-
-There are zero runtime npm dependencies. Development and packaging tools have transitive dependencies; run `npm audit` for their current findings rather than assuming the development dependency tree is audit-clean.
+</details>
