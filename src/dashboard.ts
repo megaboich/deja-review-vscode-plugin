@@ -20,7 +20,7 @@ export interface DashboardState {
   busy: boolean;
   files: Array<{
     id: string; path: string; insertions?: number; deletions?: number;
-    visible?: boolean; pending?: 'stage' | 'revert';
+    visible?: boolean; pending?: 'stage' | 'revert'; statisticsPending?: boolean;
   }>;
   filesError?: string;
   notes: DashboardNote[];
@@ -167,7 +167,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
   }
 
   private projectState(state: DashboardState): DashboardState {
-    const files = state.files.map(({ id, path, insertions, deletions, visible, pending }) => {
+    const files = state.files.map(({ id, path, insertions, deletions, visible, pending, statisticsPending }) => {
       const file: DashboardState['files'][number] = { id, path };
       if (typeof insertions === "number" && Number.isSafeInteger(insertions) && insertions >= 0) {
         file.insertions = insertions;
@@ -177,6 +177,9 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
       }
       if (typeof visible === "boolean") {
         file.visible = visible;
+      }
+      if (typeof statisticsPending === "boolean") {
+        file.statisticsPending = statisticsPending;
       }
       if (pending === 'stage' || pending === 'revert') {
         file.pending = pending;

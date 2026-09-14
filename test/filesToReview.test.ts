@@ -30,9 +30,13 @@ class Uri implements vscode.Uri {
 }
 
 class EventEmitter {
-  event = () => ({ dispose() {} });
-  fire(): void {}
-  dispose(): void {}
+  readonly listeners = new Set<() => void>();
+  event = (listener: () => void) => {
+    this.listeners.add(listener);
+    return { dispose: () => { this.listeners.delete(listener); } };
+  };
+  fire(): void { this.listeners.forEach(listener => listener()); }
+  dispose(): void { this.listeners.clear(); }
 }
 
 const GitStatus = {
@@ -53,7 +57,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
   let repository!: Repository;
   let repositories: Repository[] = [];
   let markers = new Map<string, number | Error>();
-  let files = new Map<string, { type: number; size: number; bytes: Uint8Array }>();
+  let files = new Map<string, { type: number; size: number; mtime?: number; bytes: Uint8Array }>();
   let diffs = new Map<string, string | Error>();
   let reads: string[] = [];
   let diffCalls: string[] = [];
@@ -70,6 +74,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
   let closedHandles: string[] = [];
   let readChunk = Number.MAX_SAFE_INTEGER;
   let onOpen: (target: string) => void = () => {};
+  let gitChanged = new EventEmitter();
   const workspace = {
     workspaceFolders: [{ uri: Uri.file('/repo') }],
     get textDocuments() {
@@ -90,7 +95,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
           }
           throw missing();
         }
-        return { type: entry.type, size: entry.size };
+        return { type: entry.type, size: entry.size, mtime: entry.mtime };
       },
       readFile: async (uri: Uri) => {
         reads.push(uri.path);
@@ -157,9 +162,18 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     readChunk = Number.MAX_SAFE_INTEGER;
     onOpen = () => {};
     workspace.workspaceFolders = [{ uri: Uri.file('/repo') }];
+    gitChanged = new EventEmitter();
+    let workingTreeChanges: Repository['state']['workingTreeChanges'] = [];
+    let untrackedChanges: Repository['state']['untrackedChanges'] = [];
     repository = {
       rootUri: file('/repo'),
-      state: { workingTreeChanges: [], untrackedChanges: [], indexChanges: [], onDidChange: () => ({ dispose() {} }) },
+      state: {
+        get workingTreeChanges() { return workingTreeChanges; },
+        set workingTreeChanges(value) { workingTreeChanges = value; gitChanged.fire(); },
+        get untrackedChanges() { return untrackedChanges; },
+        set untrackedChanges(value) { untrackedChanges = value; gitChanged.fire(); },
+        indexChanges: [], onDidChange: gitChanged.event,
+      },
       getCommit: async () => assert.fail('no commit lookups'),
       show: async () => assert.fail('no revision reads'),
       async add(paths) {
@@ -189,25 +203,824 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     repositories = [repository];
     git = new GitResources();
   };
-  const put = (target: string, content: string | Uint8Array, type = 1, size?: number) => {
+  const put = (target: string, content: string | Uint8Array, type = 1, size?: number, mtime?: number) => {
     const bytes = typeof content === 'string' ? new TextEncoder().encode(content) : content;
-    files.set(target, { bytes, type, size: size ?? bytes.length });
+    files.set(target, { bytes, type, size: size ?? bytes.length, mtime });
   };
-  const list = async (noted: ReadonlySet<string> = new Set()): ReturnType<GitResources['filesToReview']> => {
+  const discover = async (noted: ReadonlySet<string> = new Set()): ReturnType<GitResources['filesToReview']> => {
+    // Older statistics fixtures describe tracked disk files by their synthetic diff.
+    // Materialize their metadata now that candidate discovery validates file leaves.
+    for (const entry of repository.state.workingTreeChanges ?? []) {
+      if (entry.status !== GitStatus.Deleted && entry.status !== GitStatus.Untracked
+        && !files.has(entry.uri.fsPath) && !repository.state.untrackedChanges?.some(change => change.uri.toString() === entry.uri.toString())) {
+        put(entry.uri.fsPath, 'source\n');
+      }
+    }
     const repo = await git.workspaceRepository();
     assert.ok(repo);
     return git.filesToReview(repo, noted);
   };
+  const list = async (noted: ReadonlySet<string> = new Set()): Promise<{ path: string; insertions?: number; deletions?: number }[]> => {
+    const candidates = await discover(noted);
+    const repo = await git.workspaceRepository();
+    if (!repo) { return candidates.map(candidate => ({ path: candidate.path })); }
+    const statistics = await git.fileStatistics(repo, candidates, () => true);
+    return candidates.map(candidate => ({ path: candidate.path, ...statistics.get(candidate.path) }));
+  };
+
+  for (const root of ['/repo', '/repo/packages/app']) {
+    await t.test(`statistics cache reuses 64 unchanged files after one of 65 is staged under ${root}`, async () => {
+      reset();
+      workspace.workspaceFolders = [{ uri: Uri.file(root) }];
+      const changes = Array.from({ length: 65 }, (_, index) => change(`${root}/src/file-${index}.ts`, GitStatus.Modified));
+      for (const entry of changes) { put(entry.uri.fsPath, 'source\n', 1, undefined, 100); }
+      repository.state.workingTreeChanges = changes;
+      const objects: string[] = [];
+      repository.getObjectDetails = async function (ref, target) {
+        assert.equal(this, repository);
+        assert.equal(ref, '', 'the index, never HEAD');
+        assert.ok(target.startsWith(`${root}/src/`), 'containing Git receives the absolute subfolder path');
+        objects.push(target);
+        return { object: 'a'.repeat(40), mode: '100644', size: 7 };
+      };
+
+      assert.equal((await list()).length, 65);
+      assert.equal(diffCalls.length, 65);
+      assert.equal(objects.length, 130, 'capture and recheck each index identity');
+      diffCalls = [];
+      // Simulate reviewer staging through Git state, never invoke workspace Git.
+      repository.state.workingTreeChanges = changes.slice(1);
+      repository.state.indexChanges = [changes[0]];
+      for (let event = 0; event < 3; event++) {
+        gitChanged.fire();
+        repository = { ...repository }; // vscode.git allocates fresh wrappers.
+        repositories = [repository];
+        const rows = await list();
+        assert.equal(rows.length, 64);
+        assert.ok(rows.every(row => row.insertions === 2 && row.deletions === 1));
+        assert.deepEqual(diffCalls, [], 'unrelated status events do not rerun unchanged diffs');
+      }
+
+      repository.state.workingTreeChanges = changes;
+      await list();
+      assert.deepEqual(diffCalls, [changes[0].uri.fsPath], 'removed candidates were evicted');
+      assert.deepEqual(reads, []);
+      assert.deepEqual(addCalls, []);
+      assert.deepEqual(cleanCalls, []);
+    });
+  }
+
+  await t.test('direct statistics calls refresh mtime, size, index object and mode changes, and support force', async () => {
+    reset();
+    const target = '/repo/source.ts';
+    put(target, 'source\n', 1, undefined, 100);
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    let object = 'a'.repeat(40);
+    let mode = '100644';
+    repository.getObjectDetails = async () => ({ object, mode, size: 7 });
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    const candidates = [{ path: 'source.ts', uri: file(target), untracked: false }];
+    const expected = new Map([['source.ts', { insertions: 2, deletions: 1 }]]);
+    assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), expected);
+    assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), expected);
+    assert.equal(diffCalls.length, 1);
+
+    for (const mutation of ['mtime', 'size', 'object', 'mode', 'force'] as const) {
+      switch (mutation) {
+        case 'mtime': put(target, 'source\n', 1, undefined, 101); break;
+        case 'size': put(target, 'source!\n', 1, undefined, 101); break;
+        case 'object': object = 'b'.repeat(40); break;
+        case 'mode': mode = '100755'; break;
+      }
+      diffCalls = [];
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => true, mutation === 'force'), expected);
+      assert.deepEqual(diffCalls, [target], mutation);
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), expected);
+      assert.equal(diffCalls.length, 1, 'the successful fresh result is reusable');
+    }
+    assert.equal(repository.state.workingTreeChanges?.[0].status, GitStatus.Modified);
+  });
+
+  for (const kind of ['no API', 'lookup failure', 'unknown object', 'unknown mode', 'no mtime', 'invalid mtime',
+    'missing disk', 'diff failure', 'binary', 'no diff API'] as const) {
+    await t.test(`statistics cache falls back without reuse for ${kind}`, async () => {
+      reset();
+      const target = '/repo/source.ts';
+      put(target, 'source\n', 1, undefined, 100);
+      repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+      repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      const candidates = [{ path: 'source.ts', uri: file(target), untracked: false }];
+      await git.fileStatistics(repo, candidates, () => true);
+      diffCalls = [];
+      switch (kind) {
+        case 'no API': repository.getObjectDetails = undefined; break;
+        case 'lookup failure': repository.getObjectDetails = async () => { throw new Error('index unavailable'); }; break;
+        case 'unknown object': repository.getObjectDetails = async () => ({ object: '', mode: '100644', size: 7 }); break;
+        case 'unknown mode': repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '', size: 7 }); break;
+        case 'no mtime': put(target, 'source\n'); break;
+        case 'invalid mtime': put(target, 'source\n', 1, undefined, NaN); break;
+        case 'missing disk': files.delete(target); break;
+        case 'diff failure': diffs.set(target, new Error('diff unavailable')); break;
+        case 'binary': diffs.set(target, 'Binary files a/source.ts and b/source.ts differ\n'); break;
+        case 'no diff API': repository.diffWithHEAD = undefined; break;
+      }
+      const unavailable = kind === 'diff failure' || kind === 'binary' || kind === 'no diff API';
+      // Force first to exercise failures even when their source signature stayed equal.
+      for (const force of [true, false, false]) {
+        assert.deepEqual(await git.fileStatistics(repo, candidates, () => true, force),
+          new Map([['source.ts', unavailable ? {} : { insertions: 2, deletions: 1 }]]));
+      }
+      assert.equal(diffCalls.length, kind === 'no diff API' ? 0 : 3);
+    });
+  }
+
+  await t.test('untracked cache needs complete disk metadata and never consults the index', async () => {
+    reset();
+    const target = '/repo/new.ts';
+    put(target, 'one\ntwo\n', 1, undefined, 100);
+    repository.state.untrackedChanges = [change(target, GitStatus.Untracked)];
+    repository.getObjectDetails = async () => assert.fail('untracked files have no index signature');
+    assert.deepEqual(await list(), [{ path: 'new.ts', insertions: 2, deletions: 0 }]);
+    gitChanged.fire();
+    await list();
+    assert.deepEqual(reads, [target]);
+
+    put(target, 'one two\n', 1, undefined, 101);
+    assert.deepEqual(await list(), [{ path: 'new.ts', insertions: 1, deletions: 0 }]);
+    assert.deepEqual(reads, [target, target]);
+    put(target, 'one two\n');
+    await list();
+    await list();
+    assert.equal(reads.length, 4, 'absent mtime always reads fresh');
+  });
+
+  for (const mutation of ['disk', 'index', 'untracked'] as const) {
+    await t.test(`${mutation} change while counts are read cannot cache counts under the new signature`, async () => {
+      reset();
+      const target = '/repo/source.ts';
+      const untracked = mutation === 'untracked';
+      put(target, 'one\ntwo\n', 1, undefined, 100);
+      repository.state.workingTreeChanges = [change(target, untracked ? GitStatus.Untracked : GitStatus.Modified)];
+      let object = 'a'.repeat(40);
+      repository.getObjectDetails = async () => ({ object, mode: '100644', size: 8 });
+      const mutate = async (): Promise<void> => {
+        if (mutation === 'index') { object = 'b'.repeat(40); }
+        else { put(target, 'one two\n', 1, undefined, 101); }
+      };
+      if (untracked) { onRead = mutate; }
+      else { onDiff = mutate; }
+      await list();
+      onRead = async () => {};
+      onDiff = async () => {};
+      diffs.set(target, '@@ -1 +1 @@\n-old\n+new\n');
+      assert.deepEqual(await list(), [{ path: 'source.ts', insertions: 1, deletions: untracked ? 0 : 1 }]);
+      await list();
+      assert.equal(untracked ? reads.length : diffCalls.length, 2, 'only the stable second read can be reused');
+    });
+  }
+
+  await t.test('cache hit rechecks metadata after index awaits and falls back to fresh counts on a race', async () => {
+    reset();
+    const target = '/repo/source.ts';
+    put(target, 'source\n', 1, undefined, 100);
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+    await list();
+    let lookups = 0;
+    repository.getObjectDetails = async () => {
+      if (++lookups === 2) { put(target, 'source!\n', 1, undefined, 101); }
+      return { object: 'a'.repeat(40), mode: '100644', size: 7 };
+    };
+    diffs.set(target, '@@ -1 +1 @@\n-old\n+new\n');
+    assert.deepEqual(await list(), [{ path: 'source.ts', insertions: 1, deletions: 1 }]);
+    assert.equal(diffCalls.length, 2);
+    await list();
+    assert.equal(diffCalls.length, 3, 'the raced retry was not cached');
+    await list();
+    assert.equal(diffCalls.length, 3);
+  });
+
+  for (const mutation of ['ownership failure', 'membership', 'cancel', 'dispose'] as const) {
+    await t.test(`cached statistics still reject ${mutation} during index validation`, async () => {
+      reset();
+      const target = '/repo/src/source.ts';
+      put(target, 'source\n', 1, undefined, 100);
+      repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+      repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+      const candidates = await discover();
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      await git.fileStatistics(repo, candidates, () => true);
+      let current = true;
+      const failure = Object.assign(new Error('boundary unavailable'), { code: 'NoPermissions' });
+      repository.getObjectDetails = async () => {
+        switch (mutation) {
+          case 'ownership failure': markers.set('/repo/src/.git', failure); break;
+          case 'membership': repository.state.workingTreeChanges = []; break;
+          case 'cancel': current = false; break;
+          case 'dispose': git.dispose(); break;
+        }
+        return { object: 'a'.repeat(40), mode: '100644', size: 7 };
+      };
+      const work = git.fileStatistics(repo, candidates, () => current);
+      if (mutation === 'ownership failure') { await assert.rejects(work, { cause: failure }); }
+      else { assert.deepEqual(await work, new Map()); }
+      assert.equal(diffCalls.length, 1, 'cache validation never launches another diff');
+      assert.equal(gitChanged.listeners.size, 0);
+    });
+  }
+
+  await t.test('cache is isolated by folder and repository lifetime and cleared on disposal', async () => {
+    reset();
+    const target = '/repo/packages/app/src/source.ts';
+    put(target, 'source\n', 1, undefined, 100);
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+    await list();
+    await list();
+    assert.equal(diffCalls.length, 1);
+
+    workspace.workspaceFolders = [{ uri: Uri.file('/repo/packages/app') }];
+    assert.deepEqual(await list(), [{ path: 'src/source.ts', insertions: 2, deletions: 1 }]);
+    assert.equal(diffCalls.length, 2, 'opening a subfolder does not reuse the parent projection cache');
+    repository.state = { ...repository.state, onDidChange: new EventEmitter().event };
+    await list();
+    assert.equal(diffCalls.length, 3, 'a new underlying repository event identity invalidates the cache');
+    git.dispose();
+    git = new GitResources();
+    await list();
+    assert.equal(diffCalls.length, 4);
+  });
+
+  await t.test('cache pruning follows saved-note and archive exclusions without reading excluded metadata', async () => {
+    reset();
+    const target = '/repo/src/source.ts';
+    put(target, 'source\n', 1, undefined, 100);
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+    await list();
+    assert.deepEqual(await list(new Set(['src/source.ts'])), []);
+    await list();
+    assert.equal(diffCalls.length, 2, 'saved-note exclusions evict old source statistics');
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    stats = [];
+    const candidates = await git.filesToReview(repo, new Set(), [file('/repo/src')]);
+    assert.deepEqual(candidates, []);
+    assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), new Map());
+    assert.deepEqual(stats, [], 'excluded archive location gets no metadata or content reads');
+    await list();
+    assert.equal(diffCalls.length, 3);
+  });
+
+  await t.test('nonstandard tracked statuses always compute fresh even with valid metadata and object identity', async () => {
+    reset();
+    const target = '/repo/source.ts';
+    put(target, 'source\n', 1, undefined, 100);
+    repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    await list();
+    for (const status of [undefined, GitStatus.IntentToAdd, GitStatus.TypeChanged, GitStatus.BothModified]) {
+      repository.state.workingTreeChanges = [change(target, status)];
+      diffCalls = [];
+      await list();
+      await list();
+      assert.deepEqual(diffCalls, [target, target]);
+    }
+  });
+
+  await t.test('an older overlapping statistics batch cannot repopulate a newer candidate subset', async () => {
+    reset();
+    const target = '/repo/source.ts';
+    put(target, 'source\n', 1, undefined, 100);
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    const candidates = [{ path: 'source.ts', uri: file(target), untracked: false }];
+    let release = (): void => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let started = (): void => {};
+    const diffStarted = new Promise<void>(resolve => { started = resolve; });
+    onDiff = async () => { started(); await gate; };
+    const older = git.fileStatistics(repo, candidates, () => true);
+    try {
+      await diffStarted;
+      assert.deepEqual(await git.fileStatistics(repo, [], () => true), new Map());
+    } finally {
+      release();
+    }
+    await older;
+    onDiff = async () => {};
+    await git.fileStatistics(repo, candidates, () => true);
+    assert.equal(diffCalls.length, 2, 'the older completed counts were not retained');
+  });
+
+  await t.test('a Git event cancelling cache-hit validation retains unchanged entries for the next refresh', async () => {
+    reset();
+    const targets = ['/repo/a.ts', '/repo/b.ts'];
+    for (const target of targets) { put(target, 'source\n', 1, undefined, 100); }
+    repository.state.workingTreeChanges = targets.map(target => change(target, GitStatus.Modified));
+    repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+    const candidates = await discover();
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    const expected = new Map([
+      ['a.ts', { insertions: 2, deletions: 1 }],
+      ['b.ts', { insertions: 2, deletions: 1 }],
+    ]);
+    assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), expected);
+    diffCalls = [];
+
+    let release = (): void => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let started = (): void => {};
+    const validationStarted = new Promise<void>(resolve => { started = resolve; });
+    let lookups = 0;
+    repository.getObjectDetails = async () => {
+      // All initial lookups finish before the final validation batch starts.
+      if (++lookups === 3) { started(); await gate; }
+      return { object: 'a'.repeat(40), mode: '100644', size: 7 };
+    };
+    let current = true;
+    const listener = gitChanged.event(() => { current = false; });
+    const pending = git.fileStatistics(repo, candidates, () => current);
+    try {
+      await validationStarted;
+      gitChanged.fire();
+      assert.deepEqual(await git.filesToReview(repo, new Set()), candidates);
+    } finally {
+      release();
+      listener.dispose();
+    }
+    assert.deepEqual(await pending, new Map(), 'the obsolete job must not publish');
+    assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), expected);
+    assert.deepEqual(diffCalls, [], 'cancellation does not consume valid cached counts');
+    assert.equal(gitChanged.listeners.size, 0);
+  });
+
+  for (const refresh of ['identical', 'classification', 'folder'] as const) {
+    await t.test(`${refresh} discovery during a blocked initial diff preserves only matching snapshot jobs`, async () => {
+      reset();
+      const target = '/repo/packages/app/src/source.ts';
+      put(target, 'source\n', 1, undefined, 100);
+      repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+      repository.getObjectDetails = async () => ({ object: 'a'.repeat(40), mode: '100644', size: 7 });
+      const candidates = await discover();
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      let release = (): void => {};
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let started = (): void => {};
+      const diffStarted = new Promise<void>(resolve => { started = resolve; });
+      onDiff = async () => { started(); await gate; };
+      const pending = git.fileStatistics(repo, candidates, () => true);
+      try {
+        await diffStarted;
+        switch (refresh) {
+          case 'identical':
+            assert.deepEqual(await git.filesToReview(repo, new Set()), candidates);
+            assert.deepEqual(await git.filesToReview(repo, new Set()), candidates);
+            break;
+          case 'classification':
+            repository.state.workingTreeChanges = [change(target, GitStatus.Untracked)];
+            assert.deepEqual(await git.filesToReview(repo, new Set()), [{ ...candidates[0], untracked: true }]);
+            repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+            assert.deepEqual(await git.filesToReview(repo, new Set()), candidates);
+            break;
+          case 'folder': {
+            workspace.workspaceFolders = [{ uri: Uri.file('/repo/packages/app') }];
+            const subfolder = await git.workspaceRepository();
+            assert.ok(subfolder);
+            assert.deepEqual(await git.filesToReview(subfolder, new Set()), [
+              { path: 'src/source.ts', uri: file(target), untracked: false },
+            ]);
+            workspace.workspaceFolders = [{ uri: Uri.file('/repo') }];
+            assert.deepEqual(await git.filesToReview(repo, new Set()), candidates);
+            break;
+          }
+        }
+      } finally {
+        release();
+      }
+      const expected = new Map([['packages/app/src/source.ts', { insertions: 2, deletions: 1 }]]);
+      assert.deepEqual(await pending, expected);
+      onDiff = async () => {};
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), expected);
+      assert.equal(diffCalls.length, refresh === 'identical' ? 1 : 2,
+        'only identical scoped candidate snapshots let the blocked job populate the active cache');
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), expected);
+      assert.equal(diffCalls.length, refresh === 'identical' ? 1 : 2);
+    });
+  }
+
+  await t.test('candidate discovery performs no tracked diff or untracked content read', async () => {
+    reset();
+    put('/repo/tracked.ts', 'tracked\n');
+    put('/repo/new.ts', 'new\n');
+    repository.state.workingTreeChanges = [change('/repo/tracked.ts', GitStatus.Modified)];
+    repository.state.untrackedChanges = [change('/repo/new.ts', GitStatus.Untracked)];
+    onDiff = async () => assert.fail('discovery must not await a diff');
+    onOpen = () => assert.fail('discovery must not open source contents');
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+
+    assert.deepEqual(await git.filesToReview(repo, new Set()), [
+      { path: 'new.ts', uri: file('/repo/new.ts'), untracked: true },
+      { path: 'tracked.ts', uri: file('/repo/tracked.ts'), untracked: false },
+    ]);
+    assert.deepEqual(diffCalls, []);
+    assert.deepEqual(reads, []);
+  });
+
+  await t.test('discovery bounds ownership checks and enumerates snapshot maps only twice', async child => {
+    reset();
+    const changes = Array.from({ length: 65 }, (_, index) => change(`/repo/file-${index}.ts`, GitStatus.Modified));
+    for (const entry of changes) { put(entry.uri.fsPath, 'source\n'); }
+    const untracked: GitChange[] = [];
+    repository.state.workingTreeChanges = changes;
+    repository.state.untrackedChanges = untracked;
+    let enumerations = 0;
+    for (const entries of [changes, untracked]) {
+      const iterator = entries[Symbol.iterator].bind(entries);
+      entries[Symbol.iterator] = () => {
+        enumerations++;
+        return iterator();
+      };
+    }
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    const repositoryFor = git.repositoryFor.bind(git);
+    let active = 0;
+    let peak = 0;
+    let release = (): void => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let batchStarted = (): void => {};
+    const started = new Promise<void>(resolve => { batchStarted = resolve; });
+    child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+      active++;
+      peak = Math.max(peak, active);
+      if (active === 8) { batchStarted(); }
+      await gate;
+      try { return await repositoryFor(uri); }
+      finally { active--; }
+    });
+
+    const result = git.filesToReview(repo, new Set());
+    try {
+      await started;
+      assert.equal(active, 8);
+    } finally {
+      release();
+    }
+    assert.equal((await result).length, 65);
+    assert.equal(peak, 8);
+    assert.equal(active, 0);
+    assert.equal(enumerations, 4, 'each Git group is enumerated for capture and final membership only');
+    assert.deepEqual(diffCalls, []);
+    assert.deepEqual(reads, []);
+  });
+
+  await t.test('candidate discovery rejects unsupported leaves but keeps all Git-listed missing paths', async () => {
+    reset();
+    for (const [name, type] of [['directory', 2], ['unknown', 0], ['symlink', 65]] as const) {
+      put(`/repo/${name}`, '', type);
+    }
+    repository.state.workingTreeChanges = [
+      change('/repo/directory', GitStatus.Modified), change('/repo/unknown', GitStatus.Modified),
+      change('/repo/symlink', GitStatus.Modified), change('/repo/missing', GitStatus.Modified),
+      change('/repo/deleted', GitStatus.Deleted),
+    ];
+    repository.state.untrackedChanges = [change('/repo/untracked-missing', GitStatus.Untracked)];
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+
+    assert.deepEqual(await git.filesToReview(repo, new Set()), [
+      { path: 'deleted', uri: file('/repo/deleted'), untracked: false },
+      { path: 'missing', uri: file('/repo/missing'), untracked: false },
+      { path: 'untracked-missing', uri: file('/repo/untracked-missing'), untracked: true },
+    ]);
+    assert.deepEqual(diffCalls, []);
+    assert.deepEqual(reads, []);
+  });
+
+  for (const untracked of [false, true]) {
+    await t.test(`${untracked ? 'untracked' : 'tracked'} URI-key work scales linearly with fresh API arrays and state wrappers`, async () => {
+      const measurements: { discovery: number; statistics: number }[] = [];
+      for (const count of [32, 128]) {
+        reset();
+        let comparisons = 0;
+        let arrayReads = 0;
+        const changes = Array.from({ length: count }, (_, index) => {
+          const uri = new class extends Uri {
+            override toString(): string { comparisons++; return super.toString(); }
+          }();
+          uri.path = `/repo/file-${index}.ts`;
+          put(uri.fsPath, 'source\n');
+          return { uri, status: untracked ? GitStatus.Untracked : GitStatus.Modified } satisfies GitChange;
+        });
+        Object.defineProperty(repository, 'state', {
+          get: () => ({
+            get workingTreeChanges() { arrayReads++; return changes.map(entry => ({ ...entry })); },
+            get untrackedChanges() { arrayReads++; return []; },
+            onDidChange: gitChanged.event,
+          } satisfies Repository['state']),
+        });
+        const repo = await git.workspaceRepository();
+        assert.ok(repo);
+
+        const candidates = await git.filesToReview(repo, new Set());
+        const discovery = comparisons;
+        assert.equal(candidates.length, count);
+        assert.equal(arrayReads, 4, 'one union capture and one forced final capture');
+        comparisons = 0;
+        arrayReads = 0;
+        assert.equal((await git.fileStatistics(repo, candidates, () => true)).size, count);
+        measurements.push({ discovery, statistics: comparisons });
+        assert.equal(arrayReads, 4, 'statistics reuse the full Git list between state events');
+        assert.equal(gitChanged.listeners.size, 0);
+      }
+      for (const phase of ['discovery', 'statistics'] as const) {
+        assert.ok(measurements[1][phase] <= measurements[0][phase] * 4.2,
+          `${phase}: quadrupling files must not quadruple repeated full-list scans: ${JSON.stringify(measurements)}`);
+      }
+    });
+  }
+
+  for (const mutation of ['remove', 'classification', 'event source'] as const) {
+    await t.test(`${mutation} invalidates local membership before an untracked content read`, async child => {
+      reset();
+      const target = '/repo/source.ts';
+      put(target, 'source\n');
+      const changes = [change(target, GitStatus.Untracked)];
+      repository.state.workingTreeChanges = changes;
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      const candidates = await git.filesToReview(repo, new Set());
+      const repositoryFor = git.repositoryFor.bind(git);
+      let changed = false;
+      const replacementEvents = new EventEmitter();
+      child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+        const owner = await repositoryFor(uri);
+        if (!changed) {
+          changed = true;
+          if (mutation === 'event source') {
+            repository.state = { ...repository.state, workingTreeChanges: [], onDidChange: replacementEvents.event };
+          } else {
+            // Same array identity, including a same-length classification change.
+            changes.splice(0, 1, ...(mutation === 'classification' ? [change(target, GitStatus.Modified)] : []));
+            gitChanged.fire();
+          }
+        }
+        return owner;
+      });
+
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), new Map());
+      assert.deepEqual(reads, []);
+      assert.deepEqual(diffCalls, []);
+      assert.equal(gitChanged.listeners.size, 0);
+      assert.equal(replacementEvents.listeners.size, 0);
+    });
+  }
+
+  for (const phase of ['candidates', 'statistics'] as const) {
+    await t.test(`${phase} live state getter failures reject and dispose membership listeners`, async child => {
+      reset();
+      const target = '/repo/source.ts';
+      put(target, 'source\n');
+      repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      const candidates = await git.filesToReview(repo, new Set());
+      const state = repository.state;
+      const failure = new Error('Synthetic live state access failure');
+      let fail = false;
+      Object.defineProperty(repository, 'state', { get: () => {
+        if (fail) { throw failure; }
+        return state;
+      } });
+      const repositoryFor = git.repositoryFor.bind(git);
+      child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+        const owner = await repositoryFor(uri);
+        fail = true;
+        return owner;
+      });
+
+      const result = phase === 'candidates' ? git.filesToReview(repo, new Set()) : git.fileStatistics(repo, candidates, () => true);
+      await assert.rejects(result, error => error === failure);
+      assert.equal(gitChanged.listeners.size, 0);
+      assert.deepEqual(diffCalls, []);
+      assert.deepEqual(reads, []);
+    });
+  }
+
+  for (const untracked of [false, true]) {
+    await t.test(`missing ${untracked ? 'untracked' : 'tracked'} disk content cannot confirm candidate removal`, async () => {
+      reset();
+      const target = '/repo/source.ts';
+      put(target, 'source\n');
+      repository.state.workingTreeChanges = [change(target, untracked ? GitStatus.Untracked : GitStatus.Modified)];
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      const candidates = await git.filesToReview(repo, new Set());
+      assert.equal(candidates.length, 1);
+
+      files.delete(target);
+      diffs.set(target, new Error('Synthetic unavailable diff'));
+      assert.deepEqual(await git.filesToReview(repo, new Set()), candidates, 'wait for Git state, not disk disappearance');
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), new Map([['source.ts', {}]]));
+      assert.equal(candidates.length, 1);
+
+      repository.state.workingTreeChanges = [];
+      assert.deepEqual(await git.filesToReview(repo, new Set()), [], 'Git confirmation removes the candidate');
+    });
+  }
+
+  for (const phase of ['initial', 'final'] as const) {
+    await t.test(`obsolete discovery drains its ${phase} ownership batch and stops further work`, async child => {
+      reset();
+      const changes = Array.from({ length: 65 }, (_, index) => change(`/repo/file-${index}.ts`, GitStatus.Modified));
+      repository.state.workingTreeChanges = changes;
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      let current = true;
+      let active = 0;
+      let calls = 0;
+      let release = (): void => {};
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let batchStarted = (): void => {};
+      const started = new Promise<void>(resolve => { batchStarted = resolve; });
+      const repositoryFor = git.repositoryFor.bind(git);
+      child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+        calls++;
+        const owner = await repositoryFor(uri);
+        if (phase === 'initial' || calls > 65) {
+          active++;
+          if (active === 8) { batchStarted(); }
+          await gate;
+          active--;
+        }
+        return owner;
+      });
+      let settled = false;
+      const result = git.filesToReview(repo, new Set(), [], () => current).finally(() => { settled = true; });
+      try {
+        await started;
+        current = false;
+        assert.equal(settled, false);
+        stats = [];
+      } finally {
+        release();
+      }
+
+      assert.deepEqual(await result, []);
+      assert.equal(active, 0);
+      assert.equal(calls, phase === 'initial' ? 8 : 73);
+      assert.equal(gitChanged.listeners.size, 0, 'cancelled discovery releases its local listener');
+      assert.deepEqual(stats, [], 'no leaf validation follows cancelled ownership awaits');
+      assert.deepEqual(diffCalls, []);
+      assert.deepEqual(reads, []);
+      child.mock.method(git, 'workspaceRepository', async () => assert.fail('obsolete discovery must not initialize'));
+      assert.deepEqual(await git.filesToReview(repo, new Set(), [], () => false), []);
+    });
+  }
+
+  await t.test('discovery cancelled during workspace validation never launches candidate ownership work', async child => {
+    reset();
+    repository.state.workingTreeChanges = [change('/repo/source.ts', GitStatus.Modified)];
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    let current = true;
+    child.mock.method(git, 'workspaceRepository', async () => {
+      current = false;
+      return repo;
+    });
+    child.mock.method(git, 'repositoryFor', async () => assert.fail('cancelled discovery must not validate candidates'));
+
+    assert.deepEqual(await git.filesToReview(repo, new Set(), [], () => current), []);
+    assert.deepEqual(stats, []);
+  });
+
+  for (const untracked of [false, true]) {
+    await t.test(`cancelled background ${untracked ? 'reads' : 'diffs'} drain the batch and launch no further work`, async () => {
+      reset();
+      const changes = Array.from({ length: 65 }, (_, index) => change(`/repo/file-${index}.ts`,
+        untracked ? GitStatus.Untracked : GitStatus.Modified));
+      for (const entry of changes) { put(entry.uri.fsPath, 'source\n'); }
+      repository.state.workingTreeChanges = changes;
+      const candidates = await discover();
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      let current = true;
+      let active = 0;
+      let operations = 0;
+      let release = (): void => {};
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let batchStarted = (): void => {};
+      const started = new Promise<void>(resolve => { batchStarted = resolve; });
+      const wait = async (): Promise<void> => {
+        operations++;
+        active++;
+        if (active === 8) { batchStarted(); }
+        await gate;
+        active--;
+      };
+      if (untracked) { onRead = wait; }
+      else { onDiff = wait; }
+      let settled = false;
+      const result = git.fileStatistics(repo, candidates, () => current).finally(() => { settled = true; });
+      try {
+        await started;
+        current = false;
+        assert.equal(settled, false);
+        assert.equal(active, 8);
+      } finally {
+        release();
+      }
+
+      assert.deepEqual(await result, new Map());
+      assert.equal(operations, 8, 'no second read or later batch begins');
+      assert.equal(active, 0);
+      assert.equal(candidates.length, 65, 'cancellation cannot alter the candidate snapshot');
+      assert.equal(gitChanged.listeners.size, 0, 'cancelled statistics release their local listener');
+      if (untracked) { assert.equal(closedHandles.length, 8); }
+      stats = [];
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => false), new Map());
+      assert.deepEqual(stats, [], 'already obsolete work does not even validate ownership');
+    });
+  }
+
+  for (const phase of ['ownership', 'stat', 'open', 'final'] as const) {
+    await t.test(`background cancellation during ${phase} prevents further asynchronous work`, async child => {
+      reset();
+      const target = '/repo/src/new.ts';
+      put(target, 'source\n');
+      repository.state.untrackedChanges = [change(target, GitStatus.Untracked)];
+      const candidates = await discover();
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      let current = true;
+      let ownershipChecks = 0;
+      const repositoryFor = git.repositoryFor.bind(git);
+      child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+        ownershipChecks++;
+        const owner = await repositoryFor(uri);
+        if (phase === 'ownership' || (phase === 'final' && ownershipChecks === 5)) { current = false; }
+        return owner;
+      });
+      let leafStats = 0;
+      onStat = async uri => {
+        if (uri.fsPath === target && ++leafStats === 3 && phase === 'stat') { current = false; }
+      };
+      onOpen = () => {
+        if (phase === 'open') { current = false; }
+      };
+
+      assert.deepEqual(await git.fileStatistics(repo, candidates, () => current), new Map());
+      assert.equal(current, false, 'the requested cancellation phase was reached');
+      assert.deepEqual(diffCalls, []);
+      if (phase === 'ownership' || phase === 'stat') {
+        assert.deepEqual(reads, []);
+        assert.equal(ownershipChecks, 1, 'untracked validation callback observes cancellation');
+      } else {
+        assert.deepEqual(closedHandles, [target]);
+      }
+      if (phase !== 'final') { assert.deepEqual(readBudget, new Map()); }
+    });
+  }
+
+  await t.test('discovery final ownership rejects a boundary introduced after the initial validation', async child => {
+    reset();
+    const target = '/repo/src/a.ts';
+    put(target, 'source\n');
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    const repositoryFor = git.repositoryFor.bind(git);
+    let checks = 0;
+    child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+      if (++checks === 2) { markers.set('/repo/src/.git', 2); }
+      return repositoryFor(uri);
+    });
+
+    assert.deepEqual(await git.filesToReview(repo, new Set()), []);
+    assert.equal(checks, 2);
+    assert.deepEqual(diffCalls, []);
+  });
 
   await t.test('archive storage inside an opened folder is excluded before any stats reads', async () => {
     reset();
     repository.state.workingTreeChanges = [change('/repo/storage/reviews/batch.json'), change('/repo/source.ts')];
     repository.state.untrackedChanges = [change('/repo/storage/reviews/new.json', GitStatus.Untracked)];
+    put('/repo/source.ts', 'source\n');
     const repo = await git.workspaceRepository();
     assert.ok(repo);
     const result = await git.filesToReview(repo, new Set(), [file('/repo/storage')]);
     assert.deepEqual(result.map(row => row.path), ['source.ts']);
-    assert.deepEqual(diffCalls, ['/repo/source.ts']);
+    assert.deepEqual(diffCalls, []);
     assert.deepEqual(reads, []);
     assert.ok(stats.every(target => !target.startsWith('/repo/storage')));
   });
@@ -244,12 +1057,217 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
       { path: 'A.ts', insertions: 2, deletions: 1 }, { path: 'a.ts', insertions: 2, deletions: 0 },
       { path: 'new.ts', insertions: 1, deletions: 0 }, { path: 'z.ts', insertions: 2, deletions: 1 },
     ]);
-    assert.deepEqual(diffCalls, ['/repo/z.ts', '/repo/A.ts']);
-    assert.deepEqual(reads, ['/repo/new.ts', '/repo/a.ts']);
+    assert.deepEqual(diffCalls, ['/repo/A.ts', '/repo/z.ts']);
+    assert.deepEqual(reads, ['/repo/a.ts', '/repo/new.ts']);
     repository.state.workingTreeChanges = undefined;
     repository.state.untrackedChanges = undefined;
     assert.deepEqual(await list(), []);
   });
+
+  for (const untracked of [false, true]) {
+    await t.test(`65 ${untracked ? 'untracked reads' : 'tracked diffs'} overlap with bounded concurrency`, async () => {
+      reset();
+      const targets = Array.from({ length: 65 }, (_, index) => `/repo/file-${String(index).padStart(2, '0')}.ts`);
+      const changes = targets.map(target => change(target, untracked ? GitStatus.Untracked : GitStatus.Modified));
+      if (untracked) {
+        repository.state.untrackedChanges = changes;
+        for (const target of targets) { put(target, 'source\n'); }
+      } else {
+        repository.state.workingTreeChanges = changes;
+      }
+      let release = (): void => {};
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let batchStarted = (): void => {};
+      const started = new Promise<void>(resolve => { batchStarted = resolve; });
+      let active = 0;
+      let peak = 0;
+      const wait = async (): Promise<void> => {
+        active++;
+        peak = Math.max(peak, active);
+        if (active === 8) { batchStarted(); }
+        await gate;
+        active--;
+      };
+      if (untracked) { onRead = wait; }
+      else { onDiff = wait; }
+
+      const result = list();
+      try {
+        await started;
+        assert.equal(active, 8, 'multiple independent files progress before the first completes');
+      } finally {
+        release();
+      }
+
+      assert.deepEqual(await result, targets.map(target => ({
+        path: target.slice('/repo/'.length), insertions: untracked ? 1 : 2, deletions: untracked ? 0 : 1,
+      })));
+      assert.equal(peak, 8, 'large lists do not start unbounded Git processes or allocate unbounded read buffers');
+      assert.equal(active, 0);
+      assert.deepEqual(untracked ? reads : diffCalls, targets);
+      if (untracked) { assert.deepEqual(closedHandles, targets); }
+    });
+  }
+
+  await t.test('a failed parallel ownership check drains outstanding reads and starts no later batch', async () => {
+    reset();
+    repository.state.workingTreeChanges = Array.from({ length: 65 }, (_, index) => change(`/repo/file-${index}.ts`));
+    const candidates = await discover();
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    const failure = Object.assign(new Error('Synthetic boundary failure'), { code: 'NoPermissions' });
+    let release = (): void => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let batchStarted = (): void => {};
+    const started = new Promise<void>(resolve => { batchStarted = resolve; });
+    let failed = false;
+    onStat = async uri => {
+      if (uri.path === '/repo/file-0.ts') {
+        failed = true;
+        throw failure;
+      }
+    };
+    let active = 0;
+    onDiff = async () => {
+      active++;
+      if (active === 7) { batchStarted(); }
+      await gate;
+      active--;
+    };
+    let settled = false;
+    const result = git.fileStatistics(repo, candidates, () => true).finally(() => { settled = true; });
+    const rejected = assert.rejects(result, { cause: failure });
+    try {
+      await started;
+      assert.equal(failed, true);
+      assert.equal(settled, false, 'refresh cannot finish while its other reads are still running');
+    } finally {
+      release();
+    }
+    await rejected;
+    assert.equal(active, 0);
+    assert.equal(diffCalls.length, 7, 'failure stops work before the next batch');
+    assert.deepEqual(addCalls, []);
+    assert.deepEqual(cleanCalls, []);
+  });
+
+  await t.test('final ownership pass rejects a boundary that changed after statistics validation', async child => {
+    reset();
+    const target = '/repo/src/a.ts';
+    repository.state.workingTreeChanges = [change(target)];
+    const candidates = await discover();
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    const repositoryFor = git.repositoryFor.bind(git);
+    let checks = 0;
+    child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+      if (uri?.fsPath === target && ++checks === 3) {
+        markers.set('/repo/src/.git', 2);
+      }
+      return repositoryFor(uri);
+    });
+
+    assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), new Map());
+    assert.deepEqual(candidates.map(candidate => candidate.path), ['src/a.ts'], 'statistics cannot remove the published candidate');
+    assert.equal(checks, 3);
+    assert.deepEqual(diffCalls, [target]);
+  });
+
+  for (const phase of ['candidates', 'statistics'] as const) {
+    await t.test(`${phase} final membership excludes a validated result removed while a sibling final check waits`, async child => {
+      reset();
+      let changes = [change('/repo/a.ts'), change('/repo/b.ts')];
+      repository.state.workingTreeChanges = changes;
+      const candidates = await discover();
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      const finalCheck = phase === 'candidates' ? 2 : 3;
+      const repositoryFor = git.repositoryFor.bind(git);
+      const checks = new Map<string, number>();
+      let firstChecked = (): void => {};
+      const first = new Promise<void>(resolve => { firstChecked = resolve; });
+      let firstOwnershipFinished = false;
+      repository.state = {
+        ...repository.state,
+        get workingTreeChanges() { return changes; },
+      };
+      onStat = async uri => {
+        // Release only when a's final ownership walk has returned to leaf validation.
+        if (uri.path === '/repo/a.ts' && firstOwnershipFinished) { firstChecked(); }
+      };
+      child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+        assert.ok(uri);
+        const count = (checks.get(uri.fsPath) ?? 0) + 1;
+        checks.set(uri.fsPath, count);
+        if (uri.fsPath === '/repo/b.ts' && count === finalCheck) {
+          await first;
+          // Deliberately omit an event: the forced final read must still catch it.
+          changes = [change('/repo/b.ts')];
+        }
+        const owner = await repositoryFor(uri);
+        if (uri.fsPath === '/repo/a.ts' && count === finalCheck) { firstOwnershipFinished = true; }
+        return owner;
+      });
+
+      if (phase === 'candidates') {
+        assert.deepEqual((await git.filesToReview(repo, new Set())).map(candidate => candidate.path), ['b.ts']);
+        assert.deepEqual(diffCalls, []);
+      } else {
+        assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), new Map([['b.ts', { insertions: 2, deletions: 1 }]]));
+      }
+      assert.deepEqual(candidates.map(candidate => candidate.path), ['a.ts', 'b.ts']);
+      assert.equal(checks.get('/repo/a.ts'), finalCheck);
+      assert.equal(checks.get('/repo/b.ts'), finalCheck);
+    });
+  }
+
+  for (const phase of ['candidates', 'statistics'] as const) {
+    await t.test(`${phase} final ownership failure drains sibling checks without starting another validation batch`, async child => {
+      reset();
+      repository.state.workingTreeChanges = Array.from({ length: 65 }, (_, index) => change(`/repo/file-${index}.ts`));
+      const candidates = await discover();
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
+      const finalCheck = phase === 'candidates' ? 2 : 3;
+      const repositoryFor = git.repositoryFor.bind(git);
+      const checks = new Map<string, number>();
+      const failure = new Error('Synthetic final ownership failure');
+      let release = (): void => {};
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let batchStarted = (): void => {};
+      const started = new Promise<void>(resolve => { batchStarted = resolve; });
+      let active = 0;
+      child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+        assert.ok(uri);
+        const count = (checks.get(uri.fsPath) ?? 0) + 1;
+        checks.set(uri.fsPath, count);
+        if (count === finalCheck) {
+          if (uri.fsPath === '/repo/file-0.ts') { throw failure; }
+          active++;
+          if (active === 7) { batchStarted(); }
+          await gate;
+          active--;
+        }
+        return repositoryFor(uri);
+      });
+      let settled = false;
+      const work = phase === 'candidates' ? git.filesToReview(repo, new Set()) : git.fileStatistics(repo, candidates, () => true);
+      const result = work.finally(() => { settled = true; });
+      const rejected = assert.rejects(result, error => error === failure);
+      try {
+        await started;
+        assert.equal(settled, false);
+        assert.equal(diffCalls.length, phase === 'candidates' ? 0 : 65);
+      } finally {
+        release();
+      }
+      await rejected;
+      assert.equal(active, 0);
+      assert.equal([...checks.values()].filter(count => count === finalCheck).length, 8);
+      const laterPath = phase === 'candidates' ? '/repo/file-8.ts' : candidates[8].uri.fsPath;
+      assert.equal(checks.get(laterPath), finalCheck - 1, 'no later validation batch starts');
+    });
+  }
 
   await t.test('excludes review filenames and temporary siblings anywhere, not metadata-like source names', async () => {
     reset();
@@ -260,7 +1278,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     repository.state.workingTreeChanges = [...excluded, ...allowed].map(name => change(`/repo/${name}`));
     repository.state.untrackedChanges = excluded.map(name => change(`/repo/${name}`, GitStatus.Untracked));
     assert.deepEqual((await list()).map(row => row.path), [...allowed].sort());
-    assert.deepEqual(diffCalls, allowed.map(name => `/repo/${name}`));
+    assert.deepEqual([...diffCalls].sort(), allowed.map(name => `/repo/${name}`).sort());
     assert.deepEqual(reads, []);
     assert.ok(stats.every(target => !excluded.some(name => target === `/repo/${name}`)), 'no review data is statted or read');
   });
@@ -326,7 +1344,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
           return changes;
         },
       };
-      onDiff = async () => { armed = true; };
+      onDiff = async () => { armed = true; gitChanged.fire(); };
 
       await assert.rejects(list(), error => error === failure);
       assert.equal(failures, 1);
@@ -359,33 +1377,38 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
         }
       };
 
-      await assert.rejects(git.filesToReview(adapter, new Set()), { cause: failure });
+      await assert.rejects(list(), { cause: failure });
       assert.equal(failures, 1);
-      assert.deepEqual(await git.filesToReview(adapter, new Set()), [
+      assert.deepEqual(await list(), [
         { path: 'src/a.ts', insertions: 2, deletions: 1 },
         { path: 'src/b.ts', insertions: 2, deletions: 1 },
       ], 'A later refresh can retry, but the failed batch must not publish partial rows');
     });
   }
 
-  for (const fileStat of [3, 4]) {
-    await t.test(`untracked ownership failure at file stat ${fileStat} is not swallowed as unavailable statistics`, async () => {
+  for (const phase of ['after stat', 'after open'] as const) {
+    await t.test(`untracked ownership failure ${phase} is not swallowed as unavailable statistics`, async child => {
       reset();
       const target = '/repo/src/new.ts';
       put(target, 'source\n');
       repository.state.untrackedChanges = [change(target, GitStatus.Untracked)];
+      const candidates = await discover();
+      const repo = await git.workspaceRepository();
+      assert.ok(repo);
       const failure = Object.assign(new Error('Synthetic ownership failure'), { code: 'Unavailable' });
-      let fileStats = 0;
-      onStat = async uri => {
-        if (uri.path === target && ++fileStats === fileStat) {
-          throw failure;
+      const repositoryFor = git.repositoryFor.bind(git);
+      let checks = 0;
+      child.mock.method(git, 'repositoryFor', async (uri?: vscode.Uri) => {
+        if (++checks === (phase === 'after stat' ? 2 : 3)) {
+          markers.set(target, failure);
         }
-      };
+        return repositoryFor(uri);
+      });
 
-      await assert.rejects(list(), { cause: failure });
-      assert.equal(fileStats, fileStat);
+      await assert.rejects(git.fileStatistics(repo, candidates, () => true), { cause: failure });
       assert.deepEqual(readBudget, new Map());
-      assert.deepEqual(closedHandles, fileStat === 4 ? [target] : []);
+      assert.deepEqual(closedHandles, phase === 'after open' ? [target] : []);
+      markers.delete(target);
       assert.deepEqual(await list(), [{ path: 'src/new.ts', insertions: 1, deletions: 0 }]);
     });
   }
@@ -395,14 +1418,18 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     const target = '/repo/src/new.ts';
     put(target, 'source\n');
     repository.state.untrackedChanges = [change(target, GitStatus.Untracked)];
+    const candidates = await discover();
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
     let fileStats = 0;
     onStat = async uri => {
-      if (uri.path === target && ++fileStats === 2) {
+      if (uri.path === target && ++fileStats === 3) {
         throw Object.assign(new Error('Synthetic statistics failure'), { code: 'Unavailable' });
       }
     };
 
-    assert.deepEqual(await list(), [{ path: 'src/new.ts' }]);
+    assert.deepEqual(await git.fileStatistics(repo, candidates, () => true), new Map([['src/new.ts', {}]]));
+    assert.deepEqual(candidates.map(candidate => candidate.path), ['src/new.ts']);
     assert.deepEqual(reads, []);
   });
 
@@ -435,13 +1462,13 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     repository = { ...repository, diffWithHEAD: undefined };
     repositories = [repository];
     assert.equal(adapter.diffWithHEAD, undefined);
-    assert.deepEqual(await git.filesToReview(adapter, new Set()), ['binary', 'empty', 'failure', 'patch'].map(path => ({ path })));
+    assert.deepEqual(await list(), ['binary', 'empty', 'failure', 'patch'].map(path => ({ path })));
     repository.diffWithHEAD = async function (target) {
       assert.equal(this, repository);
       assert.ok(target.startsWith('/repo/'));
       return patch;
     };
-    assert.ok((await git.filesToReview(adapter, new Set())).every(row => row.insertions === 2));
+    assert.ok((await list()).every(row => row.insertions === 2));
   });
 
   await t.test('untracked status 7 in mixed working groups uses bounded disk byte statistics', async () => {
@@ -474,7 +1501,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     assert.deepEqual(diffCalls, []);
   });
 
-  await t.test('untracked directories and symlinks are rejected, stat/read errors preserve unknown rows', async () => {
+  await t.test('untracked directories and symlinks are rejected; missing leaves and read errors preserve rows', async () => {
     reset();
     for (const [name, type] of [['directory', 2], ['symlink', 64], ['symlinkFile', 65], ['symlinkDir', 66], ['unknown', 0]] as const) {
       put(`/repo/${name}`, 'never read', type);
@@ -601,6 +1628,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
         put(target, 'disk\n');
         const adapter = await git.workspaceRepository();
         assert.ok(adapter);
+        const candidates = operation === 'read' || operation === 'diff' ? await git.filesToReview(adapter, new Set()) : undefined;
         let triggered = false;
         const mutate = async () => {
           if (triggered) { return; }
@@ -628,7 +1656,11 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
         if (operation === 'read') { onRead = mutate; }
         if (operation === 'diff') { onDiff = mutate; }
         if (mutation === 'boundaryError') {
-          await assert.rejects(git.filesToReview(adapter, new Set()), /Cannot validate Git repository boundaries/);
+          const result = candidates ? git.fileStatistics(adapter, candidates, () => true) : git.filesToReview(adapter, new Set());
+          await assert.rejects(result, /Cannot validate Git repository boundaries/);
+        } else if (candidates) {
+          assert.deepEqual(await git.fileStatistics(adapter, candidates, () => true), new Map());
+          assert.deepEqual(candidates.map(candidate => candidate.path), ['src/a.ts']);
         } else {
           assert.deepEqual(await git.filesToReview(adapter, new Set()), []);
         }
@@ -641,7 +1673,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     }
   }
 
-  await t.test('final membership check drops earlier rows staged while another file awaits', async () => {
+  await t.test('final statistics membership drops counts, not earlier candidates staged while another file awaits', async () => {
     reset();
     repository.state.workingTreeChanges = [change('/repo/a.ts'), change('/repo/b.ts')];
     onDiff = async target => {
@@ -651,7 +1683,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
         repository.state.indexChanges = [change('/repo/a.ts')];
       }
     };
-    assert.deepEqual(await list(), [{ path: 'b.ts', insertions: 2, deletions: 1 }]);
+    assert.deepEqual(await list(), [{ path: 'a.ts' }, { path: 'b.ts', insertions: 2, deletions: 1 }]);
   });
 
   await t.test('changed tracking classification invalidates statistics and disposal invalidates the batch', async () => {
@@ -666,7 +1698,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
           repository.state.workingTreeChanges = [change('/repo/a.ts')];
         }
       };
-      assert.deepEqual(await list(), []);
+      assert.deepEqual(await list(), [{ path: 'a.ts' }]);
     }
   });
   for (const root of ['/repo', '/repo/packages/app']) {

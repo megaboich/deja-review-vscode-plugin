@@ -50,6 +50,8 @@ Saved feedback lives in `REVIEW-NOTES.md` at the opened folder's root. It is cre
 
 The section heading shows the file count. Once the Review Notes view has initialized, its native Activity Bar badge shows the same count; the badge tooltip includes both files to review and saved Review Notes. The badge is hidden when there are no candidate files. VS Code controls its theme colors and visibility.
 
+The validated file list appears before addition/deletion counts finish loading. New rows show Loading stats while counts are fetched in the background; file actions do not wait for those counts. Existing rows keep their last displayed counts or Stats unavailable during revalidation, without blinking back to loading. Git notifications recheck stats inputs and reuse counts when file metadata and the tracked file's index object are unchanged. Editor-only changes retain current counts. Explicit refresh forces recomputation; use it if an external tool changes content while preserving file timestamps and size.
+
 - A saved file note hides that path even if it refers to an older revision or can no longer be located. A general note, an unsaved draft, or a note mentioning a file only as the other comparison endpoint does not hide it. Malformed notes are not used to guess file associations.
 - Fully staged files are absent; partially staged files can remain while unstaged changes exist. The list updates with Git changes. After handoff or deletion of a file's last note, that file can reappear for the next pass.
 - Click a tracked file for its unstaged diff, an untracked file to open it, or a deleted file to see its staged version.

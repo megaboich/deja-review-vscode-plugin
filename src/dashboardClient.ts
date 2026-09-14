@@ -26,11 +26,12 @@ export function isDashboardHostMessage(value: unknown): value is DashboardHostMe
     return typeof data === 'number' && Number.isSafeInteger(data) && data >= 0;
   }
   function file(data: unknown): boolean {
-    return record(data) && keys(data, ['id', 'path'], ['insertions', 'deletions', 'visible', 'pending'])
+    return record(data) && keys(data, ['id', 'path'], ['insertions', 'deletions', 'visible', 'pending', 'statisticsPending'])
       && text(data.id) && typeof data.path === 'string'
       && (data.insertions === undefined || count(data.insertions))
       && (data.deletions === undefined || count(data.deletions))
       && (data.visible === undefined || typeof data.visible === 'boolean')
+      && (data.statisticsPending === undefined || typeof data.statisticsPending === 'boolean')
       && (data.pending === undefined || data.pending === 'stage' || data.pending === 'revert');
   }
   function note(data: unknown): boolean {
@@ -467,9 +468,10 @@ export function dashboardClient(
         row[key].textContent = '';
       }
     }
+    row.unknown.textContent = file.statisticsPending ? 'Loading stats' : 'Stats unavailable';
     row.unknown.hidden = labels.length === 2;
     if (!row.unknown.hidden) {
-      labels.push('Stats unavailable');
+      labels.push(row.unknown.textContent);
     }
     if (file.visible) {
       labels.push('Visible in editor');

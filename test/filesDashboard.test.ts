@@ -30,6 +30,7 @@ const GitStatus = {
 } as const;
 
 type GitChange = NonNullable<Repository['state']['workingTreeChanges']>[number];
+type StatisticsMethod = import('../src/git').GitResources['fileStatistics'];
 
 const disposable = () => ({ dispose() {} });
 const file = (value: string): vscode.Uri => Uri.file(value);
@@ -56,9 +57,15 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   const opened: vscode.Uri[] = [];
   const shown: Array<{ document: { uri: vscode.Uri }; options: unknown }> = [];
   const messages: DashboardState[] = [];
+  const stateListeners = new Set<(state: DashboardState) => void>();
+  const statisticsJobs: ReturnType<StatisticsMethod>[] = [];
   const errors: string[] = [];
   const sources = new Map<string, string>();
   const index = new Map<string, string>();
+  const mtimes = new Map<string, number>();
+  const indexObjects = new Map<string, string>();
+  const fileDiffs = new Map<string, string>();
+  const diffPaths: string[] = [];
   const missing = new Set<string>();
   const adds: string[][] = [];
   const cleans: string[][] = [];
@@ -72,6 +79,10 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   let onOpen = async (_uri: vscode.Uri) => {};
   let onValidate = async (_origin: Origin) => {};
   let onDiff = async () => {};
+  let onCandidates = async () => {};
+  let onStatistics: (...args: Parameters<StatisticsMethod>) => Promise<Awaited<ReturnType<StatisticsMethod>> | undefined> = async () => undefined;
+  let activeStatistics = 0;
+  let maxActiveStatistics = 0;
   let onStat = async (_uri: vscode.Uri) => {};
   let onAdd = async () => {};
   let onClean = async () => {};
@@ -239,7 +250,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         if ([...sources.keys()].some(target => target.startsWith(`${uri.path}/`))) {
           return { type: 2, size: 0 };
         }
-        return { type: 1, size: Buffer.byteLength(sourceText(uri.path)) };
+        return { type: 1, size: Buffer.byteLength(sourceText(uri.path)), mtime: mtimes.get(uri.path) };
       },
       async readFile(uri: vscode.Uri) {
         return Buffer.from(sourceText(uri.path));
@@ -341,6 +352,30 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     return load.call(this, request, ...args);
   });
   const { GitResources } = require('../src/git') as typeof import('../src/git');
+  const filesToReview = GitResources.prototype.filesToReview;
+  t.mock.method(GitResources.prototype, 'filesToReview', async function (
+    this: InstanceType<typeof GitResources>, ...args: Parameters<typeof filesToReview>
+  ) {
+    await onCandidates();
+    return filesToReview.apply(this, args);
+  });
+  const fileStatistics = GitResources.prototype.fileStatistics;
+  t.mock.method(GitResources.prototype, 'fileStatistics', function (
+    this: InstanceType<typeof GitResources>, ...args: Parameters<StatisticsMethod>
+  ): ReturnType<StatisticsMethod> {
+    const job = (async () => {
+      activeStatistics++;
+      maxActiveStatistics = Math.max(maxActiveStatistics, activeStatistics);
+      try {
+        const result = await onStatistics(...args);
+        return result ?? await fileStatistics.apply(this, args);
+      } finally {
+        activeStatistics--;
+      }
+    })();
+    statisticsJobs.push(job);
+    return job;
+  });
   const workspaceRepository = GitResources.prototype.workspaceRepository;
   t.mock.method(GitResources.prototype, 'workspaceRepository', async function (this: InstanceType<typeof GitResources>) {
     await onWorkspaceRepository();
@@ -370,6 +405,37 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     return key;
   };
   const paths = () => state().files.map(row => row.path);
+  function waitForState(predicate: (value: DashboardState) => boolean): Promise<void> {
+    if (messages.length && predicate(state())) {
+      return Promise.resolve();
+    }
+    return new Promise(resolve => {
+      const listener = (value: DashboardState): void => {
+        if (predicate(value)) {
+          stateListeners.delete(listener);
+          resolve();
+        }
+      };
+      stateListeners.add(listener);
+    });
+  }
+  async function statisticsPublished(): Promise<void> {
+    // Settled display rows remain non-pending during revalidation. Drain the
+    // background work rather than mistaking retained counts for completion.
+    await settle();
+    await statisticsFinished();
+    await waitForState(value => value.files.every(row => row.statisticsPending === false));
+  }
+  async function statisticsFinished(): Promise<void> {
+    // The host registered its continuation before these waits. This also drains
+    // rejected/obsolete jobs that deliberately produce no dashboard publication.
+    let completed = 0;
+    do {
+      const jobs = statisticsJobs.slice(completed);
+      completed = statisticsJobs.length;
+      await Promise.allSettled(jobs);
+    } while (completed < statisticsJobs.length);
+  }
   function currentEditor(): NonNullable<DashboardState['editor']> {
     const editor = state().editor;
     assert.ok(editor, 'Expected an active host-held editor');
@@ -408,7 +474,12 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         cspSource: 'test-webview:',
         asWebviewUri() { return assert.fail('Dashboard must not load external resources'); },
         async postMessage(message: DashboardHostMessage) {
-          if (message.type === 'state') { messages.push(message.state); }
+          if (message.type === 'state') {
+            messages.push(message.state);
+            for (const listener of stateListeners) {
+              listener(message.state);
+            }
+          }
           return true;
         },
       },
@@ -422,10 +493,17 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   };
   const reset = async (status: number = GitStatus.Modified, group: 'workingTreeChanges' | 'untrackedChanges' = 'workingTreeChanges') => {
     subscriptions.forEach(item => item.dispose());
+    await statisticsFinished();
+    statisticsJobs.length = 0;
+    stateListeners.clear();
     subscriptions = [];
     sources.clear();
     missing.clear();
     index.clear();
+    mtimes.clear();
+    indexObjects.clear();
+    fileDiffs.clear();
+    diffPaths.length = 0;
     stores.clear();
     batches.clear();
     clipboard.length = 0;
@@ -444,6 +522,10 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     onOpen = async () => {};
     onValidate = async () => {};
     onDiff = async () => {};
+    onCandidates = async () => {};
+    onStatistics = async () => undefined;
+    activeStatistics = 0;
+    maxActiveStatistics = 0;
     onStat = async () => {};
     onAdd = async () => {};
     onClean = async () => {};
@@ -493,6 +575,12 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         return sourceText(target);
       },
       async getCommit() { return { hash: 'b'.repeat(40) }; },
+      async getObjectDetails(ref, target) {
+        assert.equal(ref, '', 'Statistics signatures must use the index, not HEAD');
+        const object = indexObjects.get(target);
+        assert.ok(object, `No synthetic index signature: ${target}`);
+        return { mode: '100644', object, size: Buffer.byteLength(index.get(target) ?? '') };
+      },
       async add(paths) {
         assert.equal(paths.length, 1, 'Only one literal file may reach the synthetic Git boundary');
         assert.ok(path.isAbsolute(paths[0]));
@@ -519,13 +607,15 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       async diffWithHEAD(target) {
         assert.ok(sources.has(target), `Unexpected diff: ${target}`);
         diffCalls++;
+        diffPaths.push(target);
         await onDiff();
-        return diffText;
+        return fileDiffs.get(target) ?? diffText;
       },
     };
     repositories = [repository];
     const api = await activate(activationContext(subscriptions, () => ignoreSuggested));
     await mountView();
+    await statisticsPublished();
     assert.deepEqual(paths(), ['src/a.ts']);
     assert.deepEqual(errors, []);
     return api;
@@ -1735,6 +1825,145 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   }
   const visiblePaths = (): string[] => state().files.filter(row => row.visible).map(row => row.path);
 
+  await t.test('editor-only refreshes reuse blocked statistics and retain completed counts without restarting work', async () => {
+    const api = await reset();
+    const started = deferred();
+    const release = deferred();
+    let jobs = 0;
+    let currentAtCompletion: boolean | undefined;
+    onStatistics = async (_repo, _candidates, isCurrent) => {
+      jobs++;
+      started.resolve();
+      await release.promise;
+      currentAtCompletion = isCurrent();
+      return new Map([['src/a.ts', { insertions: 7, deletions: 3 }]]);
+    };
+    try {
+      await api.refresh();
+      await started.promise;
+      const first = visibleEditor(file('/synthetic/repo/src/a.ts'));
+      const other = visibleEditor(file('/synthetic/repo/src/other.ts'));
+      const pending = [{ id: 'src/a.ts', path: 'src/a.ts', visible: false,
+        statisticsPending: false, insertions: 2, deletions: 1 }];
+      const completed = [{
+        id: 'src/a.ts', path: 'src/a.ts', visible: false,
+        statisticsPending: false, insertions: 7, deletions: 3,
+      }];
+      assert.deepEqual(state().files, pending);
+
+      for (const phase of ['pending', 'completed'] as const) {
+        const expected = phase === 'pending' ? pending : completed;
+        for (const editor of [first, other, first]) {
+          mock.window.visibleTextEditors = [editor];
+          const beforeVisibility = messages.length;
+          visibleEditorsChanged.fire();
+          await waitForState(() => messages.length > beforeVisibility);
+          assert.ok(messages.slice(beforeVisibility).every(message =>
+            message.files[0].statisticsPending === false));
+          assert.deepEqual(state().files, expected.map(row => ({ ...row, visible: editor === first })));
+
+          const beforeDocument = messages.length;
+          documentsChanged.fire({ document: editor.document });
+          t.mock.timers.tick(1000);
+          await waitForState(() => messages.length > beforeDocument);
+          assert.ok(messages.slice(beforeDocument).every(message =>
+            message.files[0].statisticsPending === false));
+          assert.deepEqual(state().files, expected.map(row => ({ ...row, visible: editor === first })));
+          assert.equal(jobs, 1, 'Editor refreshes must reuse the original statistics job');
+        }
+        if (phase === 'pending') {
+          assert.equal(activeStatistics, 1);
+          release.resolve();
+          await statisticsPublished();
+          assert.equal(currentAtCompletion, true, 'Editor-only generations must not invalidate the statistics snapshot');
+          assert.deepEqual(state().files, completed.map(row => ({ ...row, visible: true })));
+        }
+      }
+      await statisticsFinished();
+      assert.equal(jobs, 1, 'No replacement statistics job may run after the original completes');
+      assert.equal(maxActiveStatistics, 1);
+      assert.deepEqual(errors, []);
+    } finally {
+      release.resolve();
+      await statisticsFinished();
+    }
+  });
+
+  await t.test('editor discovery failure clears pending stats, updates retained eyes and rejects late completion', async () => {
+    const api = await reset();
+    repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+    mock.window.visibleTextEditors = [visibleEditor(file('/synthetic/repo/src/a.ts'))];
+    const started = deferred();
+    const release = deferred();
+    let jobs = 0;
+    let currentAtCompletion: boolean | undefined;
+    onStatistics = async (_repo, _candidates, isCurrent) => {
+      jobs++;
+      started.resolve();
+      await release.promise;
+      currentAtCompletion = isCurrent();
+      return new Map([['src/a.ts', { insertions: 999, deletions: 999 }]]);
+    };
+    try {
+      await api.refresh();
+      await started.promise;
+      assert.deepEqual(visiblePaths(), ['src/a.ts']);
+      assert.deepEqual(state().files.map(row => row.statisticsPending), [false, true]);
+      const client = scriptFixture();
+      client.update(state());
+      const rows = [...client.element('files').children];
+      onCandidates = async () => {
+        throw new Error('Synthetic editor-refresh candidate failure');
+      };
+
+      for (const visible of [true, false]) {
+        mock.window.visibleTextEditors = visible ? [visibleEditor(file('/synthetic/repo/src/other.ts'))] : [];
+        const before = messages.length;
+        visibleEditorsChanged.fire();
+        await waitForState(() => messages.length > before);
+
+        assert.deepEqual(state().files, [
+          { id: 'src/a.ts', path: 'src/a.ts', visible: false, statisticsPending: false, insertions: 2, deletions: 1 },
+          { id: 'src/other.ts', path: 'src/other.ts', visible, statisticsPending: false },
+        ]);
+        assert.match(state().filesError ?? '', /could not be refreshed/);
+        assert.equal(state().busy, false);
+        assert.equal(jobs, 1);
+        client.update(state());
+        assert.equal(client.element('files-title').textContent, 'Files to Review (2)');
+        assert.equal(client.element('files-error').hidden, false);
+        assert.deepEqual(client.element('files').children, rows);
+        assert.ok(rows.every(row => row.animations.length === 0 && !row.inert));
+      }
+
+      const beforeCompletion = messages.length;
+      release.resolve();
+      await statisticsFinished();
+      assert.equal(currentAtCompletion, false, 'Candidate failure must revoke the old statistics snapshot');
+      assert.equal(messages.length, beforeCompletion, 'Late statistics must not publish or clear the candidate error');
+      assert.match(state().filesError ?? '', /could not be refreshed/);
+      assert.deepEqual(state().files.map(row => [row.statisticsPending, row.insertions]), [[false, 2], [false, undefined]]);
+
+      onCandidates = async () => {};
+      onStatistics = async () => {
+        jobs++;
+        return undefined;
+      };
+      const beforeRetry = messages.length;
+      visibleEditorsChanged.fire();
+      await waitForState(() => messages.length > beforeRetry);
+      await statisticsPublished();
+      assert.equal(jobs, 2, 'An editor-only retry must create a new snapshot after discovery failure');
+      assert.equal(state().filesError, undefined);
+      assert.deepEqual(paths(), ['src/a.ts', 'src/other.ts']);
+      assert.ok(state().files.every(row => row.insertions === 2 && row.deletions === 1));
+      assert.deepEqual(errors, []);
+    } finally {
+      release.resolve();
+      await statisticsFinished();
+    }
+  });
+
   await t.test('visibility follows visible split panes, moves and closes, not hidden documents or focus alone', async () => {
     await reset();
     repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
@@ -1860,6 +2089,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         await reset();
         repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
         await registeredCommand('dejareview.refresh')();
+        await statisticsPublished();
         const started = deferred();
         const release = deferred();
         const refreshing = deferred();
@@ -1893,7 +2123,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         const pending = incoming(operation === 'stage' ? stageAction() : revertAction()).then(() => { settled = true; });
         checkPending();
         await started.promise;
-        onDiff = async () => {
+        onCandidates = async () => {
           refreshing.resolve();
           await finishRefresh.promise;
         };
@@ -1910,6 +2140,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         assert.ok(state().files.every(row => row.pending === undefined));
         assert.deepEqual(paths(), outcome === 'success' ? ['src/other.ts'] : ['src/a.ts', 'src/other.ts']);
         assert.equal(errors.length, outcome === 'failure' ? 1 : 0);
+        await statisticsPublished();
         const before = diffCalls;
         t.mock.timers.tick(1000);
         await settle();
@@ -1988,6 +2219,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       workspace.workspaceFolders = [{ uri: file('/synthetic/repo/src') }];
       repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
       await api.refresh();
+      await statisticsPublished();
       const previous = state().files;
       const client = scriptFixture();
       client.update(state());
@@ -1995,7 +2227,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       assert.equal(client.element('files-title').textContent, 'Files to Review (2)');
       let armed = phase === 'resource ownership';
       let failures = 0;
-      const before = diffCalls;
+      let armedStats = 0;
+      const backgroundFailure = phase === 'post-stat ownership' || phase === 'final batch ownership';
       onRead = async () => {
         // Arm after the extension's outer discovery, before filesToReview's own discovery.
         if (phase === 'workspace discovery') {
@@ -2003,23 +2236,39 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         }
       };
       onDiff = async () => {
-        if (phase === 'post-stat ownership' || (phase === 'final batch ownership' && diffCalls === before + 2)) {
+        if (backgroundFailure) {
           armed = true;
         }
       };
       onStat = async uri => {
         const target = phase === 'workspace discovery' ? '/synthetic/repo/src' : '/synthetic/repo/src/a.ts';
         if (armed && failures === 0 && uri.path === target) {
+          armedStats++;
+          // A validation stats the leaf during the ownership walk and once more
+          // afterward. The third call is the final statistics batch validation.
+          if (phase === 'final batch ownership' && armedStats < 3) {
+            return;
+          }
           failures++;
           throw Object.assign(new Error('Synthetic boundary access failure'), { code: 'Unavailable' });
         }
       };
 
       await api.refresh();
+      if (backgroundFailure) {
+        await statisticsPublished();
+      }
 
       assert.equal(failures, 1, 'The real Git ownership walk must encounter the lower-level rejection');
-      assert.deepEqual(state().files, previous);
-      assert.match(state().filesError ?? '', /could not be refreshed/);
+      if (backgroundFailure) {
+        assert.deepEqual(state().files, previous.map(({ id, path, visible }) => ({
+          id, path, visible, statisticsPending: false,
+        })));
+        assert.match(state().filesError ?? '', /statistics could not be loaded/);
+      } else {
+        assert.deepEqual(state().files, previous);
+        assert.match(state().filesError ?? '', /could not be refreshed/);
+      }
       client.update(state());
       assert.equal(client.element('files-title').textContent, 'Files to Review (2)');
       assert.equal(client.element('files-error').hidden, false);
@@ -2077,6 +2326,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       if (kind === 'deleted') { missing.add('/synthetic/repo/src/a.ts'); }
       await registeredCommand('dejareview.refresh')();
       assert.deepEqual(paths(), ['src/a.ts']);
+      await statisticsPublished();
       if (kind.includes('binary') || kind === 'unknown stats') {
         assert.equal(state().files[0].insertions, undefined);
         assert.equal(state().files[0].deletions, undefined);
@@ -2146,6 +2396,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         repository.state.workingTreeChanges = [...repository.state.workingTreeChanges, change('/synthetic/repo/src/other.ts')];
       }
       await registeredCommand('dejareview.refresh')();
+      await statisticsPublished();
       if (kind.includes('binary') || kind === 'unknown stats') {
         assert.equal(state().files[0].insertions, undefined);
         assert.equal(state().files[0].deletions, undefined);
@@ -2569,9 +2820,10 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     const before = diffCalls;
     gitChanged.fire();
     await automaticRefresh();
+    await statisticsPublished();
     assert.ok(diffCalls > before, 'Git event must request fresh statistics');
     assert.deepEqual(state().files, [{ id: 'src/a.ts', path: 'src/a.ts', insertions: 2, deletions: 1,
-      visible: false }]);
+      visible: false, statisticsPending: false }]);
     repository.state.workingTreeChanges = [];
     gitChanged.fire();
     await automaticRefresh();
@@ -2807,33 +3059,468 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     }
   }
 
-  for (const mutation of ['Git state', 'saved notes'] as const) {
-    await t.test(`${mutation} invalidates an awaited statistics refresh without publishing its old candidates`, async () => {
-      await reset();
+  const staleStatisticsCases = (['Git state', 'saved notes', 'folder', 'disposal'] as const).flatMap(mutation =>
+    (['before replacement', 'after replacement'] as const).map(completion => ({ mutation, completion })));
+  for (const { mutation, completion } of staleStatisticsCases) {
+    await t.test(`${mutation} rejects background statistics ${completion}`, async () => {
+      const api = await reset();
       const started = deferred();
       const release = deferred();
-      onDiff = async () => { started.resolve(); await release.promise; };
-      const refreshing = registeredCommand('dejareview.refresh')();
-      await started.promise;
-      const before = messages.length;
-      if (mutation === 'Git state') {
-        repository.state.workingTreeChanges = [];
-        repository.state.indexChanges = [change('/synthetic/repo/src/a.ts')];
-        gitChanged.fire();
-      } else {
-        store().save(appendComment('', { path: 'src/a.ts', origin: 'staged', side: 'document',
-          startLine: 1, endLine: 1, anchorText: 'missing old anchor', body: 'Synthetic feedback',
-        }));
+      onStatistics = async () => {
+        onStatistics = async () => undefined;
+        started.resolve();
+        await release.promise;
+        // Deliberately ignore the helper's cancellation callback to exercise the
+        // extension's independent post-await publication guard.
+        return new Map([['src/a.ts', { insertions: 999, deletions: 999 }]]);
+      };
+      try {
+        await api.refresh();
+        await started.promise;
+        assert.equal(state().files[0].statisticsPending, false);
+        assert.equal(state().files[0].insertions, 2);
+        switch (mutation) {
+          case 'Git state':
+            repository.state.workingTreeChanges = [];
+            repository.state.indexChanges = [change('/synthetic/repo/src/a.ts')];
+            gitChanged.fire();
+            break;
+          case 'saved notes':
+            store().save(appendComment('', { path: 'src/a.ts', origin: 'staged', side: 'document',
+              startLine: 1, endLine: 1, anchorText: 'missing old anchor', body: 'Synthetic feedback',
+            }));
+            break;
+          case 'folder':
+            switchFolder();
+            break;
+          case 'disposal':
+            subscriptions.forEach(item => item.dispose());
+            break;
+        }
+        // Invalidation itself must revoke publication, even before the debounce
+        // can replace the row array. A Git helper may still return old results.
+        if (completion === 'before replacement') {
+          const invalidated = messages.length;
+          release.resolve();
+          await statisticsFinished();
+          assert.equal(messages.length, invalidated, 'Invalidation must reject stats before replacement publication');
+        }
+        await api.refresh();
+        const before = messages.length;
+        if (mutation !== 'folder' && mutation !== 'disposal') {
+          assert.deepEqual(paths(), []);
+          assert.equal(state().commentCount, mutation === 'saved notes' ? 1 : 0);
+        }
+        release.resolve();
+        await statisticsFinished();
+        if (mutation === 'folder') {
+          await statisticsPublished();
+          assert.equal(state().repoKey, file('/synthetic/other').toString());
+          assert.deepEqual(paths(), ['src/a.ts']);
+          assert.equal(state().files[0].insertions, 2);
+        } else {
+          assert.equal(messages.length, before, 'Obsolete completion must not publish at all');
+        }
+        assert.ok(messages.slice(before).every(message =>
+          message.files.every(row => row.insertions !== 999 && row.deletions !== 999)));
+        assert.deepEqual(errors, []);
+      } finally {
+        release.resolve();
+        await statisticsFinished();
       }
-      release.resolve();
-      await refreshing;
-      assert.ok(messages.length > before, 'The awaited refresh must publish its replacement projection');
-      assert.ok(messages.slice(before).every(message => message.files.length === 0),
-        'No publication may contain the invalidated candidates');
-      onDiff = async () => {};
-      await automaticRefresh();
-      assert.deepEqual(paths(), []);
-      assert.equal(state().commentCount, mutation === 'saved notes' ? 1 : 0);
     });
   }
+
+  await t.test('65 settled files retain counts through staging and delayed Git events, while disk changes and forced refresh recompute stats', async () => {
+    const api = await reset();
+    const targets = ['src/a.ts', ...Array.from({ length: 64 }, (_, i) => `src/file-${i}.ts`)];
+    for (const target of targets) {
+      const absolute = `/synthetic/repo/${target}`;
+      sources.set(absolute, 'disk content\n');
+      index.set(absolute, 'index content\n');
+      mtimes.set(absolute, 1000);
+      indexObjects.set(absolute, 'b'.repeat(40));
+    }
+    repository.state.workingTreeChanges = targets.map(target => change(`/synthetic/repo/${target}`));
+    await api.refresh();
+    await statisticsPublished();
+    assert.equal(state().files.length, 65);
+    assert.ok(state().files.every(row => row.statisticsPending === false && row.insertions === 2 && row.deletions === 1));
+    const before = messages.length;
+    const beforeDiffs = diffCalls;
+    const beforeJobs = statisticsJobs.length;
+    onAdd = async () => {
+      repository.state.workingTreeChanges = targets.slice(1).map(target => change(`/synthetic/repo/${target}`));
+      repository.state.indexChanges = [change('/synthetic/repo/src/a.ts', GitStatus.IndexModified)];
+      gitChanged.fire();
+    };
+
+    await incoming(stageAction());
+    await statisticsPublished();
+    for (let notification = 0; notification < 2; notification++) {
+      t.mock.timers.tick(2000);
+      gitChanged.fire();
+      await automaticRefresh();
+      await statisticsPublished();
+    }
+
+    assert.deepEqual(adds, [['/synthetic/repo/src/a.ts']]);
+    assert.deepEqual(cleans, []);
+    assert.deepEqual(paths(), targets.slice(1).sort());
+    assert.ok(statisticsJobs.length >= beforeJobs + 3, 'Post-action and both delayed events must revalidate signatures');
+    assert.equal(diffCalls, beforeDiffs, 'All 64 unchanged disk/index signatures must reuse cached diffs');
+    assert.ok(messages.length > before);
+    for (const publication of messages.slice(before)) {
+      const unaffected = publication.files.filter(row => row.path !== 'src/a.ts');
+      assert.equal(unaffected.length, 64);
+      assert.ok(unaffected.every(row => row.statisticsPending === false && row.insertions === 2 && row.deletions === 1),
+        'No publication may replace settled counts with loading or unavailable');
+    }
+
+    const changed = '/synthetic/repo/src/file-0.ts';
+    mtimes.set(changed, 2000);
+    sources.set(changed, 'new content!\n');
+    fileDiffs.set(changed, '@@ -1 +1,3 @@\n-index content\n+new content!\n+second\n+third\n');
+    const beforeChange = diffPaths.length;
+    gitChanged.fire();
+    await automaticRefresh();
+    await statisticsPublished();
+    assert.deepEqual(diffPaths.slice(beforeChange), [changed], 'Only the changed disk signature needs a new diff');
+    assert.equal(state().files.find(row => row.path === 'src/file-0.ts')?.insertions, 3);
+    assert.ok(messages.slice(before).every(publication => publication.files.every(row => row.statisticsPending === false)));
+
+    const beforeForce = diffPaths.length;
+    fileDiffs.set(changed, '@@ -1 +1 @@\n-index content\n+forced content\n');
+    await registeredCommand('dejareview.refresh')();
+    await statisticsPublished();
+    assert.deepEqual(diffPaths.slice(beforeForce).sort(), targets.slice(1).map(target => `/synthetic/repo/${target}`).sort(),
+      'Explicit refresh bypasses every otherwise matching signature');
+    assert.equal(state().files.find(row => row.path === 'src/file-0.ts')?.insertions, 1);
+    assert.ok(messages.slice(before).every(publication => publication.files.every(row => row.statisticsPending === false)));
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('a residual staged target refreshes its changed index identity without blinking or rediffing its neighbor', async () => {
+    const api = await reset();
+    const target = '/synthetic/repo/src/a.ts';
+    const other = '/synthetic/repo/src/other.ts';
+    for (const absolute of [target, other]) {
+      mtimes.set(absolute, 1000);
+      indexObjects.set(absolute, 'b'.repeat(40));
+    }
+    repository.state.workingTreeChanges = [change(target), change(other)];
+    await api.refresh();
+    await statisticsPublished();
+    const before = messages.length;
+    const beforeDiffs = diffPaths.length;
+    onAdd = async () => {
+      indexObjects.set(target, 'c'.repeat(40));
+      index.set(target, 'new index baseline\n');
+      fileDiffs.set(target, '@@ -1 +1 @@\n-new index baseline\n+residual disk content\n');
+      repository.state.indexChanges = [change(target, GitStatus.IndexModified)];
+      gitChanged.fire();
+    };
+
+    await incoming(stageAction());
+    await statisticsPublished();
+
+    assert.deepEqual(adds, [[target]]);
+    assert.deepEqual(diffPaths.slice(beforeDiffs), [target]);
+    assert.deepEqual(state().files.map(row => [row.path, row.insertions, row.deletions]),
+      [['src/a.ts', 1, 1], ['src/other.ts', 2, 1]]);
+    assert.ok(messages.slice(before).every(publication => publication.files.length === 2
+      && publication.files.every(row => row.statisticsPending === false)));
+    assert.equal(state().busy, false);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('existing unavailable statistics stay unavailable during blocked Git revalidation and failure', async () => {
+    const api = await reset();
+    diffText = 'Binary files a/src/a.ts and b/src/a.ts differ\n';
+    await api.refresh();
+    await statisticsPublished();
+    assert.equal(state().files[0].insertions, undefined);
+    assert.equal(state().files[0].statisticsPending, false);
+    const before = messages.length;
+    const started = deferred();
+    const release = deferred();
+    onStatistics = async () => {
+      started.resolve();
+      await release.promise;
+      throw new Error('Synthetic unavailable statistics retry failed');
+    };
+    try {
+      gitChanged.fire();
+      await automaticRefresh();
+      await started.promise;
+      assert.equal(activeStatistics, 1);
+      assert.equal(state().files[0].statisticsPending, false);
+      release.resolve();
+      await statisticsPublished();
+      assert.match(state().filesError ?? '', /statistics could not be loaded/);
+      for (const publication of messages.slice(before)) {
+        assert.equal(publication.files.length, 1);
+        assert.equal(publication.files[0].statisticsPending, false);
+        assert.equal(publication.files[0].insertions, undefined);
+        assert.equal(publication.files[0].deletions, undefined);
+      }
+      assert.deepEqual(errors, []);
+    } finally {
+      release.resolve();
+      await statisticsFinished();
+    }
+  });
+
+  for (const operation of ['stage', 'revert'] as const) {
+    await t.test(`${operation} confirms candidates for 65 files without waiting for blocked statistics`, async () => {
+      const api = await reset();
+      const targets = ['src/a.ts', ...Array.from({ length: 64 }, (_, i) => `src/file-${i}.ts`)];
+      for (const target of targets) {
+        sources.set(`/synthetic/repo/${target}`, 'disk content\n');
+        index.set(`/synthetic/repo/${target}`, 'index content\n');
+      }
+      repository.state.workingTreeChanges = targets.map(target => change(`/synthetic/repo/${target}`));
+      const started = deferred();
+      const release = deferred();
+      onDiff = async () => {
+        started.resolve();
+        await release.promise;
+      };
+      try {
+        const before = messages.length;
+        await api.refresh();
+        await started.promise;
+        assert.deepEqual(paths(), [...targets].sort());
+        assert.equal(state().files[0].statisticsPending, false);
+        assert.equal(state().files[0].insertions, 2);
+        assert.ok(state().files.slice(1).every(row => row.statisticsPending === true));
+        const client = scriptFixture();
+        client.update(state());
+        assert.equal(client.element('files-title').textContent, 'Files to Review (65)');
+        assert.ok(messages.slice(before).every(message => message.files.every(row =>
+          !('uri' in row) && !('untracked' in row))));
+
+        const mutate = async (): Promise<void> => {
+          repository.state.workingTreeChanges = targets.slice(1).map(target => change(`/synthetic/repo/${target}`));
+          gitChanged.fire();
+        };
+        onAdd = mutate;
+        onClean = mutate;
+        await incoming(operation === 'stage' ? stageAction() : revertAction());
+
+        assert.deepEqual(adds, operation === 'stage' ? [['/synthetic/repo/src/a.ts']] : []);
+        assert.deepEqual(cleans, operation === 'revert' ? [['/synthetic/repo/src/a.ts']] : []);
+        assert.equal(warnings.length, operation === 'revert' ? 1 : 0);
+        assert.deepEqual(paths(), targets.slice(1).sort());
+        assert.equal(state().busy, false);
+        assert.ok(state().files.every(row => row.pending === undefined && row.statisticsPending === true));
+        client.update(state());
+        assert.equal(client.element('files-title').textContent, 'Files to Review (64)');
+        assert.equal(activeStatistics, 1, 'The obsolete job is still blocked, not awaited by the action');
+        assert.equal(maxActiveStatistics, 1);
+
+        onDiff = async () => {};
+        release.resolve();
+        await statisticsPublished();
+        assert.ok(state().files.every(row => row.insertions === 2 && row.deletions === 1));
+        assert.deepEqual(paths(), targets.slice(1).sort());
+        assert.equal(maxActiveStatistics, 1);
+        assert.ok(messages.slice(before).every(message => message.files.every(row =>
+          !('uri' in row) && !('untracked' in row))));
+        assert.deepEqual(errors, []);
+      } finally {
+        release.resolve();
+        await statisticsFinished();
+      }
+    });
+  }
+
+  await t.test('automatic Git refresh preserves a queued explicit force request until current statistics publish', async () => {
+    const api = await reset();
+    const target = '/synthetic/repo/src/a.ts';
+    mtimes.set(target, 1000);
+    indexObjects.set(target, 'b'.repeat(40));
+    await api.refresh();
+    await statisticsPublished();
+    const primedDiffs = diffPaths.length;
+    gitChanged.fire();
+    await automaticRefresh();
+    await statisticsPublished();
+    assert.equal(diffPaths.length, primedDiffs, 'Prove the unchanged disk/index signature is cached');
+
+    const started = deferred();
+    const release = deferred();
+    const forceFlags: Array<boolean | undefined> = [];
+    onStatistics = async (_repo, _candidates, isCurrent, force) => {
+      forceFlags.push(force);
+      if (forceFlags.length === 1) {
+        started.resolve();
+        await release.promise;
+        assert.equal(isCurrent(), false, 'The blocked pass must be obsolete before it completes');
+        return new Map([['src/a.ts', { insertions: 999, deletions: 999 }]]);
+      }
+      return undefined;
+    };
+    const before = messages.length;
+    try {
+      gitChanged.fire();
+      await automaticRefresh();
+      await started.promise;
+      assert.deepEqual(forceFlags, [false]);
+
+      await registeredCommand('dejareview.refresh')();
+      const queuedPublication = messages.length;
+      gitChanged.fire();
+      await automaticRefresh();
+      assert.ok(messages.length > queuedPublication, 'An automatic projection must supersede the queued explicit refresh');
+      assert.deepEqual(forceFlags, [false], 'Both replacements wait behind the blocked statistics job');
+      assert.equal(diffPaths.length, primedDiffs);
+
+      // Leave the signature unchanged so only the surviving explicit force
+      // request can discover this new synthetic diff result.
+      fileDiffs.set(target, '@@ -1 +1 @@\n-index content\n+fresh content\n');
+      release.resolve();
+      await statisticsPublished();
+
+      assert.deepEqual(forceFlags, [false, true], 'The automatic replacement inherits the unconsumed force request');
+      assert.deepEqual(diffPaths.slice(primedDiffs), [target]);
+      assert.equal(state().files[0].insertions, 1);
+      assert.equal(state().files[0].deletions, 1);
+      assert.ok(messages.slice(before).every(publication => publication.files.every(row =>
+        row.statisticsPending === false && row.insertions !== 999)));
+
+      gitChanged.fire();
+      await automaticRefresh();
+      await statisticsPublished();
+      assert.deepEqual(forceFlags, [false, true, false], 'Publication consumes force so later automatic refreshes can reuse the cache');
+      assert.deepEqual(diffPaths.slice(primedDiffs), [target]);
+      assert.equal(maxActiveStatistics, 1);
+      assert.deepEqual(errors, []);
+      assert.deepEqual(adds, []);
+      assert.deepEqual(cleans, []);
+    } finally {
+      release.resolve();
+      await statisticsFinished();
+    }
+  });
+
+  await t.test('background statistics jobs serialize, skip obsolete queued generations and enrich only the newest rows', async () => {
+    const api = await reset();
+    const started = deferred();
+    const release = deferred();
+    let jobs = 0;
+    onStatistics = async () => {
+      jobs++;
+      if (jobs === 1) {
+        started.resolve();
+        await release.promise;
+        return new Map([['src/a.ts', { insertions: 999, deletions: 999 }]]);
+      }
+      return new Map([['src/a.ts', { insertions: 7, deletions: 3 }]]);
+    };
+    try {
+      await api.refresh();
+      await started.promise;
+      await api.refresh();
+      await api.refresh();
+      assert.equal(jobs, 1, 'Queued refreshes must not start overlapping statistics I/O');
+      assert.equal(state().files[0].statisticsPending, false);
+      assert.equal(state().files[0].insertions, 2);
+      const before = messages.length;
+      release.resolve();
+      await statisticsPublished();
+
+      assert.equal(jobs, 2, 'The obsolete queued generation must skip statistics I/O');
+      assert.equal(maxActiveStatistics, 1);
+      assert.deepEqual(state().files, [{
+        id: 'src/a.ts', path: 'src/a.ts', visible: false,
+        insertions: 7, deletions: 3, statisticsPending: false,
+      }]);
+      assert.ok(messages.slice(before).every(message => message.files.every(row => row.insertions !== 999)));
+    } finally {
+      release.resolve();
+      await statisticsFinished();
+    }
+  });
+
+  await t.test('statistics completion during pending stage preserves the authorized target and pending state', async () => {
+    const api = await reset();
+    const statsStarted = deferred();
+    const releaseStats = deferred();
+    const validationStarted = deferred();
+    const releaseValidation = deferred();
+    onStatistics = async () => {
+      statsStarted.resolve();
+      await releaseStats.promise;
+      return new Map([['src/a.ts', { insertions: 4, deletions: 2 }]]);
+    };
+    try {
+      await api.refresh();
+      await statsStarted.promise;
+      const request = stageAction();
+      onValidate = async () => {
+        validationStarted.resolve();
+        await releaseValidation.promise;
+      };
+      const pending = incoming(request);
+      await validationStarted.promise;
+      assert.equal(state().files[0].pending, 'stage');
+      assert.deepEqual(adds, []);
+
+      releaseStats.resolve();
+      await statisticsPublished();
+      assert.equal(state().busy, true);
+      assert.equal(state().files[0].pending, 'stage');
+      assert.equal(state().files[0].insertions, 4);
+      assert.equal(state().files[0].id, request.fileId);
+      releaseValidation.resolve();
+      await pending;
+      await statisticsPublished();
+
+      assert.deepEqual(adds, [['/synthetic/repo/src/a.ts']]);
+      assert.equal(state().busy, false);
+      assert.equal(state().files[0].pending, undefined);
+      assert.deepEqual(errors, [], 'Stats enrichment must not invalidate host-held row identity');
+    } finally {
+      releaseStats.resolve();
+      releaseValidation.resolve();
+      await statisticsFinished();
+    }
+  });
+
+  await t.test('statistics failure retains newly published candidates and permits a successful retry', async () => {
+    const api = await reset();
+    repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+    const started = deferred();
+    const release = deferred();
+    onStatistics = async () => {
+      started.resolve();
+      await release.promise;
+      throw new Error('Synthetic background statistics failure');
+    };
+    try {
+      await api.refresh();
+      await started.promise;
+      const candidates = state().files;
+      assert.deepEqual(paths(), ['src/a.ts', 'src/other.ts']);
+      assert.deepEqual(candidates.map(row => row.statisticsPending), [false, true]);
+      assert.equal(candidates[0].insertions, 2);
+      release.resolve();
+      await statisticsPublished();
+      assert.deepEqual(state().files, candidates.map(({ id, path, visible }) => ({ id, path, visible, statisticsPending: false })));
+      assert.match(state().filesError ?? '', /statistics could not be loaded/);
+      assert.equal(state().busy, false);
+
+      onStatistics = async () => undefined;
+      await api.refresh();
+      await statisticsPublished();
+      assert.equal(state().filesError, undefined);
+      assert.deepEqual(paths(), ['src/a.ts', 'src/other.ts']);
+      assert.ok(state().files.every(row => row.insertions === 2 && row.deletions === 1));
+      assert.deepEqual(errors, []);
+    } finally {
+      release.resolve();
+      await statisticsFinished();
+    }
+  });
 });

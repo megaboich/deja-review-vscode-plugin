@@ -16,9 +16,16 @@ const GitStatus = {
   Untracked: 7,
 };
 
-type FileCandidate = { uri: vscode.Uri; untracked: boolean };
+type FileCandidate = { uri: vscode.Uri; untracked: boolean; status?: number };
+export type FileReviewCandidate = { path: string; uri: vscode.Uri; untracked: boolean };
 type FileStatistics = { insertions?: number; deletions?: number };
-type FileReviewRow = FileStatistics & { path: string };
+type CachedStatistics = { signature: string; statistics: FileStatistics };
+type StatisticsCache = {
+  repo: Repository;
+  event: vscode.Event<void>;
+  candidates: Map<string, { path: string; untracked: boolean }>;
+  entries: Map<string, CachedStatistics>;
+};
 
 export interface Repository {
   rootUri: vscode.Uri;
@@ -52,17 +59,41 @@ interface GitExtension {
   getAPI(version: 1): GitAPI;
 }
 
-function unstagedCandidates(repo: Repository): Map<string, FileCandidate> {
+function unstagedCandidates(state: Repository['state']): Map<string, FileCandidate> {
   const entries = new Map<string, FileCandidate>();
-  for (const change of repo.state.workingTreeChanges ?? []) {
+  for (const change of state.workingTreeChanges ?? []) {
     const key = change.uri.toString();
     const untracked = change.status === GitStatus.Untracked || entries.get(key)?.untracked === true;
-    entries.set(key, { uri: change.uri, untracked });
+    entries.set(key, { uri: change.uri, untracked, status: change.status });
   }
-  for (const change of repo.state.untrackedChanges ?? []) {
-    entries.set(change.uri.toString(), { uri: change.uri, untracked: true });
+  for (const change of state.untrackedChanges ?? []) {
+    entries.set(change.uri.toString(), { uri: change.uri, untracked: true, status: change.status });
   }
   return entries;
+}
+
+function candidateMembership(repo: Repository): {
+  read: (force?: boolean) => ReadonlyMap<string, FileCandidate>;
+  dispose: () => void;
+} {
+  let entries: Map<string, FileCandidate> | undefined;
+  let onDidChange: vscode.Event<void> | undefined;
+  let listener: vscode.Disposable | undefined;
+  const read = (force = false): ReadonlyMap<string, FileCandidate> => {
+    // API wrappers and change arrays are freshly allocated by vscode.git 1.96.
+    // Its event identity, not array identity, identifies the underlying state.
+    // Always access live state so repository/access errors cannot be cached away.
+    const state = repo.state;
+    if (state.onDidChange !== onDidChange) {
+      listener?.dispose();
+      onDidChange = state.onDidChange;
+      listener = onDidChange(() => { entries = undefined; });
+      entries = undefined;
+    }
+    if (force || !entries) { entries = unstagedCandidates(state); }
+    return entries;
+  };
+  return { read, dispose: () => listener?.dispose() };
 }
 
 function revisionRef(origin: Exclude<Resource['origin'], 'changed'>): string {
@@ -116,10 +147,42 @@ async function trackedStatistics(repo: Repository, uri: vscode.Uri): Promise<Fil
   return binary ? {} : { insertions, deletions };
 }
 
-// Undefined rejects the candidate; empty statistics retain it with unavailable counts.
+async function statisticsSignature(
+  repo: Repository, candidate: FileReviewCandidate, stat: vscode.FileStat | undefined, isCurrent: () => boolean,
+): Promise<string | undefined> {
+  // Missing metadata (including deleted files) cannot prove unchanged disk input.
+  if (!stat || stat.type !== vscode.FileType.File || !Number.isFinite(stat.mtime)
+    || !Number.isSafeInteger(stat.size) || stat.size < 0 || !isCurrent()) {
+    return undefined;
+  }
+  const disk = [stat.type, stat.mtime, stat.size];
+  if (candidate.untracked) { return JSON.stringify(['untracked', ...disk]); }
+
+  // Resolve the live adapter outside the lookup catch: repository access errors
+  // are ownership failures, not an optional statistics capability failure.
+  const getObjectDetails = repo.getObjectDetails;
+  if (!getObjectDetails || !repo.diffWithHEAD) { return undefined; }
+  let details: Awaited<ReturnType<NonNullable<Repository['getObjectDetails']>>>;
+  try {
+    // VS Code 1.96 getObjectDetails('') uses ls-files --stage, not HEAD.
+    details = await getObjectDetails.call(repo, '', candidate.uri.fsPath);
+  } catch {
+    // An unavailable index identity only disables reuse; still request a fresh diff.
+    return undefined;
+  }
+  const { object, mode } = details;
+  if (!isCurrent() || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(object)
+    || !/^100(?:644|755)$/.test(mode)) {
+    return undefined;
+  }
+  return JSON.stringify(['tracked', ...disk, object, mode]);
+}
+
+// Undefined invalidates only these statistics, never the published candidate list.
 async function untrackedStatistics(
-  uri: vscode.Uri, statistics: FileStatistics, validate: () => Promise<boolean>,
+  uri: vscode.Uri, statistics: FileStatistics, validate: () => Promise<boolean>, isCurrent: () => boolean,
 ): Promise<FileStatistics | undefined> {
+  if (!isCurrent()) { return undefined; }
   const stat = await vscode.workspace.fs.stat(uri);
   if (!await validate()) { return undefined; }
   if (stat.type !== vscode.FileType.File) { return undefined; }
@@ -129,8 +192,10 @@ async function untrackedStatistics(
   const limit = 5 * 1024 * 1024;
   if (!(stat.size <= limit)) { return {}; }
 
+  if (!isCurrent()) { return undefined; }
   const handle = await open(uri.fsPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
+    if (!isCurrent()) { return undefined; }
     const opened = await handle.stat();
     if (!opened.isFile()) { return undefined; }
     if (opened.size > limit) { throw new Error('Untracked statistics exceed the read limit.'); }
@@ -139,7 +204,9 @@ async function untrackedStatistics(
     const buffer = Buffer.alloc(limit + 1);
     let length = 0;
     while (length < buffer.length) {
+      if (!isCurrent()) { return undefined; }
       const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (!isCurrent()) { return undefined; }
       if (!bytesRead) { break; }
       length += bytesRead;
     }
@@ -213,6 +280,7 @@ export class GitResources implements vscode.Disposable {
   private stopWaiting: (() => void) | undefined;
   private disposed = false;
   private readonly workspaceAdapters = new Map<string, Repository>();
+  private statisticsCache: StatisticsCache | undefined;
 
   async initialize(): Promise<void> {
     if (this.disposed) { throw new Error('Git resources have been disposed.'); }
@@ -388,75 +456,269 @@ export class GitResources implements vscode.Disposable {
     }
   }
 
-  async filesToReview(repo: Repository, notedPaths: ReadonlySet<string>, excludedFolders: readonly vscode.Uri[] = []): Promise<FileReviewRow[]> {
-    const noted = new Set([...notedPaths].map(value => value.replace(/\\/g, '/')));
-    const isCurrentCandidate = (uri: vscode.Uri, untracked: boolean): boolean => {
-      return !this.disposed && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString()
-        && unstagedCandidates(repo).get(uri.toString())?.untracked === untracked;
-    };
-    const validateCandidate = async (uri: vscode.Uri, untracked: boolean): Promise<boolean> => {
-      if (this.disposed) { return false; }
-      return await this.repositoryFor(uri) === repo && isCurrentCandidate(uri, untracked);
-    };
+  private currentFileScope(repo: Repository): boolean {
+    return !this.disposed && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString()
+      && this.containingRepository(repo.rootUri) !== undefined;
+  }
 
-    if (await this.workspaceRepository() !== repo) { return []; }
-    const candidates = unstagedCandidates(repo);
+  private async validateFileCandidate(
+    repo: Repository, candidate: FileReviewCandidate, isCurrent: () => boolean,
+    observeStat?: (stat: vscode.FileStat) => void,
+  ): Promise<boolean> {
+    const current = (): boolean => isCurrent() && this.currentFileScope(repo);
+    if (!current()) { return false; }
+    if (await this.repositoryFor(candidate.uri) !== repo || !current()) { return false; }
 
-    const rows: (FileCandidate & { row: FileReviewRow })[] = [];
-    for (const { uri, untracked } of candidates.values()) {
-      if (excludedFolders.some(rootUri => relative(uri, { ...repo, rootUri }) !== undefined)) { continue; }
-      let resource: Resource | undefined;
-      try {
-        if (uri.scheme !== 'file') { continue; }
-        const name = path.basename(uri.fsPath);
-        if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
-        const value = source(uri);
-        const filePath = value && relative(value.file, repo);
-        if (!filePath) { continue; }
-        resource = normalizeResource({ path: filePath, origin: 'changed' });
-      } catch {
-        // Unsupported URI/path shapes are exclusions, not failed discovery.
-        continue;
+    // Recheck the leaf after walking parents: source directories and unsupported
+    // leaves are not candidates, even when Git still reports a change for them.
+    try {
+      const stat = await vscode.workspace.fs.stat(candidate.uri);
+      observeStat?.(stat);
+      return current() && stat.type === vscode.FileType.File;
+    } catch (error) {
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'FileNotFound') {
+        throw new Error('Cannot validate Git repository boundaries. Check filesystem access and retry.', { cause: error });
       }
-      if (noted.has(resource.path) || !await validateCandidate(uri, untracked)) { continue; }
-      const name = path.posix.basename(resource.path);
-      if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
-      const row: FileReviewRow = { path: resource.path };
-      let validationFailure: { error: unknown } | undefined;
-      try {
-        let statistics: FileStatistics | undefined;
-        if (untracked) {
-          statistics = await untrackedStatistics(uri, row, async () => {
-            try {
-              return await validateCandidate(uri, untracked);
-            } catch (error) {
-              validationFailure = { error };
-              throw error;
-            }
-          });
-        } else {
-          statistics = await trackedStatistics(repo, uri);
+      // Disk disappearance is not Git confirmation of removal from this list.
+      // Mutation guards separately reject missing nondeleted action targets.
+      return current();
+    }
+  }
+
+  private retainStatistics(repo: Repository, candidates: readonly FileReviewCandidate[]): StatisticsCache {
+    const event = repo.state.onDidChange;
+    const previous = this.statisticsCache;
+    const snapshot = new Map(candidates.map(candidate => [
+      candidate.uri.toString(), { path: candidate.path, untracked: candidate.untracked },
+    ]));
+    const entries = new Map<string, CachedStatistics>();
+    if (previous?.repo === repo && previous.event === event) {
+      let identical = previous.candidates.size === snapshot.size;
+      for (const [key, candidate] of snapshot) {
+        const old = previous.candidates.get(key);
+        if (old?.path !== candidate.path || old.untracked !== candidate.untracked) {
+          identical = false;
+          continue;
         }
-        if (!statistics) { continue; }
-        Object.assign(row, statistics);
-      } catch {
-        // Ownership failures invalidate the batch, even if a later retry would succeed.
-        if (validationFailure) { throw validationFailure.error; }
-        // Statistics failures must not hide an otherwise reviewable file.
+        const cached = previous.entries.get(key);
+        if (cached) { entries.set(key, cached); }
       }
-      if (await validateCandidate(uri, untracked)) { rows.push({ uri, untracked, row }); }
+      if (identical) { return previous; }
     }
-    // Later files can await while earlier entries are staged, removed, or change ownership.
-    const verified: typeof rows = [];
-    for (const entry of rows) {
-      if (await validateCandidate(entry.uri, entry.untracked)) { verified.push(entry); }
+    // Only a changed snapshot replaces identity, so identical editor refreshes
+    // let current jobs finish caching while removed/reclassified paths stay evicted.
+    const cache = { repo, event, candidates: snapshot, entries };
+    this.statisticsCache = cache;
+    return cache;
+  }
+
+  /** Host-only candidates; discovery never waits for diffs or source-content reads. */
+  async filesToReview(
+    repo: Repository, notedPaths: ReadonlySet<string>, excludedFolders: readonly vscode.Uri[] = [],
+    isCurrent: () => boolean = () => true,
+  ): Promise<FileReviewCandidate[]> {
+    if (!isCurrent()) { return []; }
+    const noted = new Set([...notedPaths].map(value => value.replace(/\\/g, '/')));
+    if (await this.workspaceRepository() !== repo || !isCurrent()) { return []; }
+    const current = (): boolean => isCurrent() && this.currentFileScope(repo);
+    const membership = candidateMembership(repo);
+    try {
+      const pending: FileReviewCandidate[] = [];
+      for (const { uri, untracked } of membership.read().values()) {
+        if (excludedFolders.some(rootUri => relative(uri, { ...repo, rootUri }) !== undefined)) { continue; }
+        try {
+          if (uri.scheme !== 'file') { continue; }
+          const name = path.basename(uri.fsPath);
+          if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
+          const value = source(uri);
+          const filePath = value && relative(value.file, repo);
+          if (!filePath) { continue; }
+          const resource = normalizeResource({ path: filePath, origin: 'changed' });
+          if (!noted.has(resource.path)) { pending.push({ path: resource.path, uri, untracked }); }
+        } catch {
+          // Unsupported URI/path shapes are exclusions, not failed discovery.
+          continue;
+        }
+      }
+
+      const validate = async (candidate: FileReviewCandidate): Promise<FileReviewCandidate | undefined> => {
+        const valid = (): boolean => current()
+          && membership.read().get(candidate.uri.toString())?.untracked === candidate.untracked;
+        return await this.validateFileCandidate(repo, candidate, valid) ? candidate : undefined;
+      };
+      const rows: FileReviewCandidate[] = [];
+      for (let offset = 0; offset < pending.length && current(); offset += 8) {
+        const results = await Promise.allSettled(pending.slice(offset, offset + 8).map(validate));
+        for (const result of results) {
+          if (result.status === 'rejected') { throw result.reason; }
+          if (result.value) { rows.push(result.value); }
+        }
+      }
+
+      // Later batches may await while earlier files change ownership or membership.
+      const verified: FileReviewCandidate[] = [];
+      for (let offset = 0; offset < rows.length && current(); offset += 8) {
+        const results = await Promise.allSettled(rows.slice(offset, offset + 8).map(validate));
+        for (const result of results) {
+          if (result.status === 'rejected') { throw result.reason; }
+          if (result.value) { verified.push(result.value); }
+        }
+      }
+      if (!current()) { return []; }
+      // Git can update optimistically before its status event. Never publish using
+      // only the event-invalidated lookup; capture the actual groups again here.
+      const finalMembership = membership.read(true);
+      const candidates = verified.filter(entry => finalMembership.get(entry.uri.toString())?.untracked === entry.untracked)
+        .sort((a, b) => {
+          if (a.path < b.path) { return -1; }
+          if (a.path > b.path) { return 1; }
+          return 0;
+        });
+      this.retainStatistics(repo, candidates);
+      return candidates;
+    } finally {
+      membership.dispose();
     }
-    return verified.filter(entry => isCurrentCandidate(entry.uri, entry.untracked)).map(entry => entry.row)
-      .sort((a, b) => {
-        if (a.path < b.path) { return -1; }
-        if (a.path > b.path) { return 1; }
-        return 0;
-      });
+  }
+
+  /** Missing counts do not remove candidates. force bypasses reuse for explicit refresh. */
+  async fileStatistics(
+    repo: Repository, candidates: readonly FileReviewCandidate[], isCurrent: () => boolean,
+    force = false,
+  ): Promise<Map<string, FileStatistics>> {
+    const current = (): boolean => isCurrent() && this.currentFileScope(repo);
+    if (!current()) { return new Map(); }
+    const cache = this.retainStatistics(repo, candidates);
+    if (force) { cache.entries.clear(); }
+    const signatures = new Map<string, string>();
+    const reused = new Set<string>();
+    const membership = candidateMembership(repo);
+    try {
+      const readCandidate = async (candidate: FileReviewCandidate, fresh = force): Promise<FileStatistics | undefined> => {
+        const key = candidate.uri.toString();
+        const valid = (): boolean => current()
+          && membership.read().get(candidate.uri.toString())?.untracked === candidate.untracked;
+        let stat: vscode.FileStat | undefined;
+        if (!await this.validateFileCandidate(repo, candidate, valid, value => { stat = value; })) { return; }
+        // getObjectDetails does not expose the merge stage. Nonstandard working
+        // states cannot prove the index object is the diff's complete baseline.
+        if (!candidate.untracked && membership.read().get(key)?.status !== GitStatus.Modified) { stat = undefined; }
+        const signature = await statisticsSignature(repo, candidate, stat, valid);
+        if (!valid()) { return; }
+        if (!candidate.untracked && stat && Number.isFinite(stat.mtime)
+          && !await this.validateFileCandidate(repo, candidate, valid)) { return; }
+        const cached = cache.entries.get(key);
+        signatures.delete(key);
+        reused.delete(key);
+        if (!fresh && signature && cached?.signature === signature) {
+          signatures.set(key, signature);
+          reused.add(key);
+          return { ...cached.statistics };
+        }
+        // A miss invalidates the old signature; a hit remains reusable if this
+        // job is later cancelled before its final validation completes.
+        cache.entries.delete(key);
+
+        const statistics: FileStatistics = {};
+        let succeeded = false;
+        let validationFailure: { error: unknown } | undefined;
+        try {
+          if (candidate.untracked) {
+            const result = await untrackedStatistics(candidate.uri, statistics, async () => {
+              try {
+                return await this.validateFileCandidate(repo, candidate, valid);
+              } catch (error) {
+                validationFailure = { error };
+                throw error;
+              }
+            }, current);
+            if (!result) { return; }
+          } else {
+            Object.assign(statistics, await trackedStatistics(repo, candidate.uri));
+          }
+          succeeded = true;
+        } catch {
+          // Ownership failures invalidate the batch, even if a later retry would succeed.
+          if (validationFailure) { throw validationFailure.error; }
+          // Statistics failures must not hide an otherwise reviewable file.
+        }
+        if (!await this.validateFileCandidate(repo, candidate, valid)) { return; }
+        if (succeeded && signature && statistics.insertions !== undefined && statistics.deletions !== undefined) {
+          signatures.set(key, signature);
+        }
+        return statistics;
+      };
+
+      // Drain each bounded batch on errors or cancellation before returning.
+      const statistics = new Map<string, FileStatistics>();
+      for (let offset = 0; offset < candidates.length && current(); offset += 8) {
+        const batch = candidates.slice(offset, offset + 8);
+        const results = await Promise.allSettled(batch.map(candidate => readCandidate(candidate)));
+        for (const [index, result] of results.entries()) {
+          if (result.status === 'rejected') { throw result.reason; }
+          if (result.value) { statistics.set(batch[index].path, result.value); }
+        }
+      }
+      const pending = candidates.filter(candidate => statistics.has(candidate.path));
+      const verified: FileReviewCandidate[] = [];
+      for (let offset = 0; offset < pending.length && current(); offset += 8) {
+        const results = await Promise.allSettled(pending.slice(offset, offset + 8).map(async candidate => {
+          const valid = (): boolean => current()
+            && membership.read().get(candidate.uri.toString())?.untracked === candidate.untracked;
+          const key = candidate.uri.toString();
+          let stat: vscode.FileStat | undefined;
+          if (!await this.validateFileCandidate(repo, candidate, valid, value => { stat = value; })) { return; }
+          if (!candidate.untracked && membership.read().get(key)?.status !== GitStatus.Modified) { stat = undefined; }
+          const before = signatures.get(key);
+          if (before) {
+            const after = await statisticsSignature(repo, candidate, stat, valid);
+            const observed = stat;
+            let finalStat: vscode.FileStat | undefined;
+            if (!await this.validateFileCandidate(repo, candidate, valid, value => { finalStat = value; })) { return; }
+            // Index lookup awaits too: recheck disk metadata and ownership after it.
+            if (before !== after || !finalStat || !observed || finalStat.type !== observed.type
+              || finalStat.mtime !== observed.mtime || finalStat.size !== observed.size) {
+              signatures.delete(key);
+              if (cache.entries.get(key)?.signature === before) { cache.entries.delete(key); }
+              if (reused.has(key)) {
+                const fresh = await readCandidate(candidate, true);
+                signatures.delete(key); // A raced cache hit is retried, never cached this pass.
+                if (!fresh) { return; }
+                statistics.set(candidate.path, fresh);
+              }
+            }
+          }
+          return candidate;
+        }));
+        for (const result of results) {
+          if (result.status === 'rejected') { throw result.reason; }
+          if (result.value) { verified.push(result.value); }
+        }
+      }
+      if (!current()) { return new Map(); }
+      const finalMembership = membership.read(true);
+      const result = new Map<string, FileStatistics>();
+      for (const key of cache.entries.keys()) {
+        if (finalMembership.get(key)?.untracked !== cache.candidates.get(key)?.untracked) {
+          cache.entries.delete(key);
+        }
+      }
+      for (const candidate of verified) {
+        if (finalMembership.get(candidate.uri.toString())?.untracked === candidate.untracked) {
+          const counts = statistics.get(candidate.path) ?? {};
+          result.set(candidate.path, counts);
+          const key = candidate.uri.toString();
+          const signature = signatures.get(key);
+          const cacheable = candidate.untracked || finalMembership.get(key)?.status === GitStatus.Modified;
+          if (signature && cacheable && this.statisticsCache === cache && repo.state.onDidChange === cache.event) {
+            cache.entries.set(key, { signature, statistics: { ...counts } });
+          }
+        }
+      }
+      return result;
+    } finally {
+      membership.dispose();
+    }
   }
 
   /** Reviewer-authorized whole-file staging; validate rechecks the host's live action guard. */
@@ -644,6 +906,7 @@ export class GitResources implements vscode.Disposable {
     this.stopWaiting?.();
     this.api = undefined;
     this.workspaceAdapters.clear();
+    this.statisticsCache = undefined;
     this.subscriptions.forEach(item => item.dispose());
     this.repositoryChanges.dispose();
   }

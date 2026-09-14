@@ -670,6 +670,46 @@ for (const type of ['stageFile', 'revertFile'] as const) test(`${type} publishes
   dashboard.dispose();
 });
 
+test("settled counts and unavailable rows retain keyed display while only new rows load statistics", () => {
+  const client = scriptFixture();
+  const files = [
+    { id: "known", path: "src/known.ts", insertions: 2, deletions: 1, statisticsPending: false },
+    { id: "unavailable", path: "image.png", statisticsPending: false },
+  ];
+  client.update(state({ files }));
+  const rows = [...client.element("files").children];
+  const known = rows[0].children[0];
+  const unavailable = rows[1].children[0];
+  rows[1].children[2].focus();
+
+  for (const busy of [true, false, false]) {
+    client.update(state({ busy, files: [...files, { id: "new", path: "new.ts", statisticsPending: true }] }));
+    assert.equal(client.element("files").children[0], rows[0]);
+    assert.equal(client.element("files").children[1], rows[1]);
+    assert.equal(client.document.activeElement, rows[1].children[2]);
+    assert.equal(known.children[1].textContent, "+2");
+    assert.equal(known.children[2].textContent, "-1");
+    assert.equal(known.children[3].hidden, true);
+    assert.equal(unavailable.children[3].textContent, "Stats unavailable");
+    assert.equal(unavailable.attributes.get("aria-label"), "Open file: image.png, Stats unavailable");
+    const added = client.element("files").children[2].children[0];
+    assert.equal(added.children[3].textContent, "Loading stats");
+    assert.equal(added.attributes.get("aria-label"), "Open file: new.ts, Loading stats");
+  }
+
+  client.update(state({ files: [
+    { ...files[0], insertions: undefined, deletions: undefined },
+    files[1],
+    { id: "new", path: "new.ts", insertions: 3, deletions: 0, statisticsPending: false },
+  ] }));
+  assert.equal(client.element("files").children[0], rows[0]);
+  assert.equal(known.children[1].hidden, true);
+  assert.equal(known.children[2].hidden, true);
+  assert.equal(known.children[3].textContent, "Stats unavailable");
+  assert.equal(known.attributes.get("aria-label"), "Open file: src/known.ts, Stats unavailable");
+  assert.equal(client.element("files").children[2].children[0].children[1].textContent, "+3");
+});
+
 test("provider whitelists file metadata, snapshots it and leaves unknown counts optional", () => {
   const dashboard = new ReviewDashboard(() => {});
   const fixture = viewFixture();
@@ -2426,6 +2466,13 @@ test("files without feedback render text-only stats and sibling accessible rever
   assert.equal(unknown.children[3].hidden, false);
   assert.equal(unknown.children[3].textContent, "Stats unavailable");
   assert.equal(unknown.attributes.get("aria-label"), "Open file: assets/image.png, Stats unavailable");
+  update({ ...current, files: files.map(file => ({ ...file, statisticsPending: true })) });
+  assert.equal(unknown.children[3].textContent, "Loading stats");
+  assert.equal(unknown.attributes.get("aria-label"), "Open file: assets/image.png, Loading stats");
+  assert.equal(rows[1].children[1].disabled, false, "background stats do not block file actions");
+  assert.equal(rows[1].children[2].disabled, false);
+  update(current);
+  assert.equal(unknown.children[3].textContent, "Stats unavailable");
   const partial = rows[2].children[0];
   assert.equal(partial.children[1].textContent, "+0");
   assert.equal(partial.children[1].hidden, false);

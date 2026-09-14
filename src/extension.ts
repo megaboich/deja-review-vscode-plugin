@@ -204,6 +204,10 @@ class ReviewExtension implements vscode.Disposable {
   private files: DashboardState['files'] = [];
   private filesError?: string;
   private filesGeneration = 0;
+  private statisticsWork: Promise<void> = Promise.resolve();
+  private statisticsRevision = 0;
+  private forceStatistics = false;
+  private statisticsSnapshot?: { revision: number; repo: Repository; candidates: RefreshProjection['files']; force: boolean };
   private pendingFileAction?: { repo: Repository; file: DashboardState['files'][number]; action: 'stage' | 'revert' };
   private get fileActionBusy(): boolean {
     return this.pendingFileAction !== undefined;
@@ -265,7 +269,7 @@ class ReviewExtension implements vscode.Disposable {
         this.lastTab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
       }),
       vscode.window.onDidChangeVisibleTextEditors(() => {
-        void this.refresh().catch(error => this.error(error));
+        void this.refresh(false).catch(error => this.error(error));
       }),
       vscode.workspace.onDidOpenTextDocument(() => this.schedule()),
       vscode.workspace.onDidChangeWorkspaceFolders(() => this.schedule(true)),
@@ -544,13 +548,14 @@ class ReviewExtension implements vscode.Disposable {
     this.generation++;
     if (invalidateFiles) {
       this.filesGeneration++;
+      this.statisticsRevision++;
     }
     if (this.timer) {
       clearTimeout(this.timer);
     }
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.refresh().catch(error => this.error(error));
+      void this.refresh(false).catch(error => this.error(error));
     }, 300);
   }
 
@@ -595,7 +600,7 @@ class ReviewExtension implements vscode.Disposable {
     this.warnedBase = undefined;
   }
 
-  async refresh(): Promise<void> {
+  async refresh(invalidateStatistics = true): Promise<void> {
     if (this.disposed) {
       return;
     }
@@ -605,6 +610,10 @@ class ReviewExtension implements vscode.Disposable {
     }
     this.generation++;
     this.filesGeneration++;
+    if (invalidateStatistics) {
+      this.statisticsRevision++;
+      this.forceStatistics = true;
+    }
     if (!this.refreshing) {
       // All callers await the latest requested projection, not an obsolete pass
       // abandoned by a watcher or startup discovery notification.
@@ -661,7 +670,7 @@ class ReviewExtension implements vscode.Disposable {
     if (!currentRequest() || store !== this.store || repo !== this.repo) {
       return;
     }
-    const projection = await this.computeRefreshProjection(store, repo, loaded);
+    const projection = await this.computeRefreshProjection(store, repo, loaded, currentRequest);
 
     // Publish only the request and scope that produced this complete projection.
     if (!currentRequest() || store !== this.store || repo !== this.repo) {
@@ -720,6 +729,7 @@ class ReviewExtension implements vscode.Disposable {
     store: ReviewStore,
     repo: Repository,
     { text, parsed }: Awaited<ReturnType<ReviewStore['load']>>,
+    currentRequest: () => boolean,
   ): Promise<RefreshProjection> {
     const visibleDocuments = vscode.window.visibleTextEditors.map(editor => editor.document);
     const visibleUris = new Set(visibleDocuments.map(document => document.uri.toString()));
@@ -758,7 +768,7 @@ class ReviewExtension implements vscode.Disposable {
     let filesError: string | undefined;
     try {
       files = await this.git.filesToReview(repo, new Set(parsed.comments.map(comment => comment.path)),
-        [this.context.globalStorageUri]);
+        [this.context.globalStorageUri], currentRequest);
     } catch {
       filesError = 'Files to Review could not be refreshed. Refresh and retry.';
     }
@@ -793,9 +803,33 @@ class ReviewExtension implements vscode.Disposable {
     this.savedEntries = [...entries, ...parsed.generalNotes.map(comment => ({ comment, repo, snapshot: text ?? '' }))]
       .sort((a, b) => a.comment.startOffset - b.comment.startOffset);
     // A failed candidate read is not evidence that the previous rows disappeared.
-    this.files = (filesError ? this.files : files).map(file => ({
-      ...file, id: file.path, visible: visiblePaths.has(file.path),
-    }));
+    const snapshot = this.statisticsSnapshot;
+    const reuseStatistics = snapshot?.repo === repo && snapshot.revision === this.statisticsRevision
+      && files.length === snapshot.candidates.length && files.every((file, index) => {
+        const previous = snapshot.candidates[index];
+        return file.path === previous.path && file.uri.toString() === previous.uri.toString()
+          && file.untracked === previous.untracked;
+      });
+    if (filesError) {
+      this.statisticsSnapshot = undefined;
+      for (const file of this.files) { file.statisticsPending = false; }
+    } else if (!reuseStatistics) {
+      const previousRows = new Map(this.files.map(file => [file.path, file]));
+      const previousCandidates = new Map(snapshot?.repo === repo
+        ? snapshot.candidates.map(file => [file.path, file]) : []);
+      this.files = files.map(file => {
+        const previous = previousCandidates.get(file.path);
+        const row = previousRows.get(file.path);
+        if (row && previous?.uri.toString() === file.uri.toString() && previous.untracked === file.untracked) {
+          // Keep the last display result during revalidation, including unavailable
+          // counts. Only a new row needs a loading placeholder.
+          return { ...row };
+        }
+        return { path: file.path, id: file.path, statisticsPending: true };
+      });
+      this.statisticsSnapshot = { revision: this.statisticsRevision, repo, candidates: files, force: this.forceStatistics };
+    }
+    for (const file of this.files) { file.visible = visiblePaths.has(file.path); }
     this.filesError = filesError;
     this.archives = archives;
     this.hasFeedback = !!text?.trim();
@@ -814,6 +848,39 @@ class ReviewExtension implements vscode.Disposable {
       void vscode.window.showWarningMessage('Review base changed. HEAD and index review notes are marked stale; their captured feedback is preserved.');
     }
     this.publishEditors(entries, resources, repo);
+    if (!filesError && !reuseStatistics) { this.loadFileStatistics(); }
+  }
+
+  private loadFileStatistics(): void {
+    const snapshot = this.statisticsSnapshot;
+    if (!snapshot) { return; }
+    const { candidates, repo, revision, force } = snapshot;
+    const rows = this.files;
+    const current = (): boolean => !this.disposed && this.statisticsSnapshot === snapshot
+      && revision === this.statisticsRevision && this.repo === repo && this.files === rows
+      && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString();
+    // Serialize background jobs so repeated refreshes cannot multiply Git processes
+    // or untracked buffers. Obsolete queued jobs skip I/O entirely.
+    this.statisticsWork = this.statisticsWork.then(async () => {
+      if (!current() || !rows.length) { return; }
+      let statistics: Awaited<ReturnType<GitResources['fileStatistics']>> = new Map();
+      try {
+        statistics = await this.git.fileStatistics(repo, candidates, current, force);
+      } catch {
+        if (!current()) { return; }
+        this.filesError = 'Files to Review statistics could not be loaded. Refresh and retry.';
+      }
+      if (!current()) { return; }
+      if (force) { this.forceStatistics = false; }
+      // Enrich existing rows, preserving host-held action identity and membership.
+      for (const row of rows) {
+        const result = statistics.get(row.path);
+        row.insertions = result?.insertions;
+        row.deletions = result?.deletions;
+        row.statisticsPending = false;
+      }
+      this.updateDashboard();
+    }).catch(error => this.error(error));
   }
 
   private publishEditors(entries: Entry[], resources: Map<string, vscode.Uri[]>, repo: Repository): void {
@@ -1222,7 +1289,7 @@ class ReviewExtension implements vscode.Disposable {
     try {
       // Keep the captured row pending until current Git candidates are published,
       // including cancellation and failures. Never remove a row optimistically.
-      await this.refresh();
+      await this.refresh(false);
     } catch (error) {
       failure ??= { error };
     } finally {
