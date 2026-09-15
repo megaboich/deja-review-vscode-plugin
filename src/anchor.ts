@@ -14,6 +14,9 @@ function normalize(lines: string[], ignoreIndent: boolean): string[] {
 }
 
 export function resolveAnchor(comment: ReviewComment, content: string, radius = 50): ResolvedAnchor | undefined {
+  if (comment.wholeFile) {
+    return undefined;
+  }
   const { startLine, endLine } = comment;
   if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine) {
     return undefined;

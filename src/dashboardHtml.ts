@@ -109,15 +109,12 @@ export function renderDashboard(nonce: string, instanceKey = nonce): string {
     .file-exiting { display: block; overflow: hidden; min-height: 0; pointer-events: none; }
     .file-in-editor { background: var(--vscode-list-inactiveSelectionBackground, var(--vscode-list-hoverBackground)); }
     .file-pending { box-shadow: inset 2px 0 var(--vscode-progressBar-background); }
-    .file-visible { color: var(--vscode-icon-foreground); flex: 0 0 16px; }
-    .file-visible svg { display: block; width: 16px; height: 16px; fill: currentColor; }
     /* Announce progress without adding a line or changing the row's measured size. */
     .file-progress {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
       overflow: hidden; clip-path: inset(50%); white-space: nowrap;
     }
     .file-open {
-      padding-right: 70px;
       display: flex;
       flex-wrap: wrap;
       align-items: center;
@@ -132,19 +129,22 @@ export function renderDashboard(nonce: string, instanceKey = nonce): string {
     .file-action {
       position: absolute;
       right: 4px;
-      top: 50%;
-      transform: translateY(-50%);
+      top: 4px;
       width: 28px;
       height: 28px;
       padding: 6px;
       opacity: 0;
+      pointer-events: none;
       color: var(--vscode-icon-foreground);
       background: var(--vscode-sideBar-background);
     }
-    .file-revert { right: 36px; }
-    .file-row:hover .file-action, .file-row:focus-within .file-action { opacity: 1; }
+    .file-revert { right: 68px; }
+    .file-note { right: 36px; }
+    .file-row:hover .file-action, .file-row:focus-within .file-action { opacity: 1; pointer-events: auto; }
     .file-action svg { display: block; width: 14px; height: 14px; fill: currentColor; }
     .file-label { display: flex; align-items: center; gap: 8px; flex: 1 1 100px; min-width: 0; }
+    .file-change-kind { order: 1; color: var(--vscode-descriptionForeground); }
+    .file-insertions, .file-deletions, .file-open > .muted { order: 2; }
     .file-name { flex: 1; min-width: 0; }
     .file-insertions { color: var(--vscode-gitDecoration-addedResourceForeground, #2ea043); }
     .file-deletions { color: var(--vscode-gitDecoration-deletedResourceForeground, #f85149); }
@@ -257,7 +257,7 @@ export function renderDashboard(nonce: string, instanceKey = nonce): string {
   <template id="delete-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 1h4l1 2h3v1H2V3h3l1-2zm0 2h4l-.5-1h-3L6 3zM3 5h1v9h8V5h1v9l-1 1H4l-1-1V5zm3 1h1v6H6V6zm3 0h1v6H9V6z"/></svg></template>
   <template id="revert-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M5 2 1 6l4 4V7h5a2 2 0 0 1 0 4H7v2h3a4 4 0 0 0 0-8H5V2z"/></svg></template>
   <template id="stage-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></svg></template>
-  <template id="eye-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3C4 3 1 6 0 8c1 2 4 5 8 5s7-3 8-5c-1-2-4-5-8-5zm0 1c3 0 5.5 2 6.8 4C13.5 10 11 12 8 12S2.5 10 1.2 8C2.5 6 5 4 8 4zm0 1a3 3 0 1 0 0 6 3 3 0 0 0 0-6zm0 1a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/></svg></template>
+  <template id="note-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 2h12v9H6l-4 3V2zm1 1v9l2.7-2H13V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7z"/></svg></template>
   <script nonce="${nonce}">
     (${dashboardClient.toString()})(acquireVsCodeApi, "${instanceKey}", ${isDashboardHostMessage.toString()});
   </script>

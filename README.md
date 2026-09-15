@@ -31,11 +31,13 @@ The shortcut captures the file, lines, snippet, and comparison context **before 
 
 For feedback that is not tied to code, use **Add General Review Note** in the toolbar inside the Review Notes panel. A floating editor opens in the panel with **Save** and **Cancel**; **Escape** cancels. No file or text selection is required, but a supported local project folder in Git is still required.
 
+For feedback on an entire changed file, use the note-bubble **Add File Review Note** button in its **Files to Review** row. The same floating editor opens for that file, without needing an active editor or selection. Whole-file notes have a file path but no line range or snippet, and work for binary, untracked, and deleted files too. Saving the note hides that path from Files to Review.
+
 ### Refine The Review
 
 The panel shows file-specific and general notes together in saved order, with a combined note count and a short two-line preview of each.
 
-- Click a file note to open its code or captured comparison. If its snippet can no longer be located, the card opens the saved note in `REVIEW-NOTES.md` instead.
+- Click a file note to open its code or captured comparison. If its snippet can no longer be located, the card opens the saved note in `REVIEW-NOTES.md` instead. Whole-file cards show just the filename and open the file, or its staged version for an unstaged deletion.
 - Click a general note to edit it.
 - Hover any card or move keyboard focus into it to reveal **Edit Review Note**, followed by **Delete Review Note**. Edit opens the floating editor for either kind of note; deletion asks for confirmation.
 - Use **Save** to apply an edit, or **Cancel** / **Escape** to leave the saved note unchanged. File-note edits change the feedback, not its captured location or comparison context. Native gutter editing remains available for file notes.
@@ -54,16 +56,20 @@ The validated file list appears before addition/deletion counts finish loading. 
 
 - A saved file note hides that path even if it refers to an older revision or can no longer be located. A general note, an unsaved draft, or a note mentioning a file only as the other comparison endpoint does not hide it. Malformed notes are not used to guess file associations.
 - Fully staged files are absent; partially staged files can remain while unstaged changes exist. The list updates with Git changes. After handoff or deletion of a file's last note, that file can reappear for the next pass.
-- Click a tracked file for its unstaged diff, an untracked file to open it, or a deleted file to see its staged version.
-- An eye icon before the filename and a subtle background highlight mark files currently visible in an editor, including a diff pane. Hidden tabs do not count; split editors can mark multiple files. The indicator follows visible panes as you switch or close them.
-- Hover or focus a row to reveal **Revert File**, then **Stage File**. Neither button opens the file. Actions are disabled while a staging or revert operation, including its confirmation, is in progress. Failures are reported, and the list follows Git's actual state rather than assuming success.
+- Click a tracked file for its unstaged diff, with VS Code's native Stage Hunk/Selection actions, an untracked file to open it, or a deleted file to see its staged version.
+- A subtle background highlight marks files currently visible in an editor, including a diff pane. Hidden tabs do not count; split editors can mark multiple files. The highlight follows visible panes as you switch or close them.
+- Hover or focus a row to reveal **Revert File**, **Add File Review Note**, then **Stage File**. These buttons overlay the top-right corner without reserving row space. Actions are disabled while a staging or revert operation, including its confirmation, is in progress. Failures are reported, and the list follows Git's actual state rather than assuming success.
 - The affected row immediately shows an inset progress accent and stays read-only through verification, without adding a loading line or changing its height. Staging/reverting status remains available to screen readers. The panel refreshes immediately after the action, without the normal debounce delay. A row briefly collapses only after Git confirms it is no longer a candidate, never on an optimistic timeout. Reduced-motion preferences skip the animation. Failed candidate refreshes retain the last known list and show an error.
 
 **Stage File** stages that whole file's saved disk state without a confirmation dialog, including remaining unstaged changes or a deletion. It does not save or stage unsaved editor text. Use VS Code Source Control to stage selected hunks instead.
 
+When you stage the **first row**, DejaReview automatically opens the next remaining file after refreshed Git state confirms the staged file has disappeared. It uses the same editor/diff behavior as clicking that next row. Staging any other row or reverting does not advance. Failed staging, residual unstaged changes, and an empty remaining list do not open another file. Another dashboard action cancels a pending advance.
+
 **Revert File** asks before discarding that file's unstaged disk changes. Tracked files are restored from the staging area, **not HEAD**, leaving staged changes intact. This restores an unstaged deletion, not a staged deletion. For untracked files, confirmation warns that the file will be removed and **Git cannot recover it**. A file with unsaved editor changes cannot be reverted; the extension never saves or discards those buffers for you. Conflicts, intent-to-add, and other unsupported states are refused rather than risking staged work.
 
 Line counts compare the staging area with saved working-tree content, not unsaved editor text. New untracked text files are counted up to **5 MiB**. Binary, over-limit, or unavailable results show **Stats unavailable**; standard binary files, new files, and deletions can still be staged or reverted subject to the safeguards above.
+
+File rows label Git-reported additions, removals, and renames relative to the **staging area**: for example **Added +60**, **Removed -60**, or **Renamed +2 -1**. Redundant zero counts are hidden on these labelled rows; modified files keep the usual **+N -N** display. Labels remain visible while statistics load or are unavailable. Once an addition or rename is staged, further edits show ordinary modified-file counts; the earlier staged change does not determine the label. A move appears as **Renamed** only when Git identifies an unstaged rename; otherwise it appears as separate added and removed files.
 
 This is a files-only aid, **not approval or completion tracking**. An empty list means no current candidates, not that the review is complete. Neither staging nor reverting adds a note or marks work approved. Other workspace roots, nested separate repositories, the review file, and archives are excluded.
 
@@ -116,6 +122,11 @@ You can hand-edit and save `REVIEW-NOTES.md`, but the panel and native composer 
 
 Add regression tests for the error-handling changes before the next pass.
 
+## `src/client.ts`:file
+Selected: Working tree
+
+Split this file into smaller modules.
+
 ## `src/client.ts`:42
 Comparison: HEAD -> Staging area
 Selected: Modified (Staging area)
@@ -136,7 +147,7 @@ Same-file comparisons omit endpoint paths. Different-file comparisons name both,
 
 Composers accept arbitrary text, including `##` headings, metadata examples, unfinished fences, and significant surrounding whitespace. When necessary, the saved body uses `Body: fenced` followed by a `markdown` backtick fence longer than any backtick run in the feedback. Editors show the original body without the wrapper; copy and archives preserve the saved representation. When hand-editing, keep wrappers intact. Outside a wrapper, use `###` for body headings and balance fences: an unfenced `##` starts another block. A broken fence can block further submissions until repaired. Empty or whitespace-only new notes cannot be submitted.
 
-Long file selections use `; Snippet: elided` in the heading and a bare `...` between the first 10 and last 5 snippet lines. Without that label, an ellipsis is literal code. File notes without snippets use line hints rather than a reliable match.
+Long file selections use `; Snippet: elided` in the heading and a bare `...` between the first 10 and last 5 snippet lines. Without that label, an ellipsis is literal code. Line-specific notes without snippets use line hints rather than a reliable match. Whole-file notes use `:file` instead of a range and cannot have a comparison or anchor. They do not create native line threads or participate in line-number rewriting.
 
 Unknown sections, malformed blocks, duplicate notes, and original formatting are preserved rather than guessed or discarded. Old compact file-context formats are not parsed or automatically migrated, but remain copyable. Edits target the selected body; they do not regenerate the whole review file.
 

@@ -33,11 +33,16 @@ type RefreshProjection = {
   visiblePaths: Set<string>;
 };
 
+type DashboardEditorTarget =
+  | { type: 'general' }
+  | { type: 'edit'; entry: SavedEntry }
+  | { type: 'file'; path: string };
+
 interface DashboardEditor {
   id: string;
   repo: Repository;
   store: ReviewStore;
-  entry?: SavedEntry;
+  target: DashboardEditorTarget;
   snapshot: string;
   body: string;
   error?: string;
@@ -89,6 +94,31 @@ function range(anchor: ResolvedAnchor | ReviewComment): vscode.Range {
   return new vscode.Range(anchor.startLine - 1, 0, anchor.endLine - 1, 0);
 }
 
+/** Labels and statistics both describe the index-to-worktree changes. */
+function fileChangeKinds(repo: Repository): Map<string, NonNullable<DashboardState['files'][number]['changeKind']>> {
+  const kinds = new Map<string, NonNullable<DashboardState['files'][number]['changeKind']>>();
+  // Index changes describe HEAD-to-index history, not the remaining changes.
+  for (const change of repo.state.workingTreeChanges ?? []) {
+    const key = change.uri.toString();
+    switch (change.status) {
+      case 7: // UNTRACKED
+      case 9: // INTENT_TO_ADD
+        kinds.set(key, 'added');
+        break;
+      case 6: // DELETED (working tree)
+        kinds.set(key, 'removed');
+        break;
+      case 10: // INTENT_TO_RENAME
+        kinds.set(key, 'renamed');
+        break;
+    }
+  }
+  for (const change of repo.state.untrackedChanges ?? []) {
+    kinds.set(change.uri.toString(), 'added');
+  }
+  return kinds;
+}
+
 class ReviewExtension implements vscode.Disposable {
   readonly git = new GitResources();
   private controller = vscode.comments.createCommentController('dejareview', 'DejaReview Notes');
@@ -101,13 +131,16 @@ class ReviewExtension implements vscode.Disposable {
     overviewRulerLane: vscode.OverviewRulerLane.Right,
     rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
   });
-  private readonly dashboard = new ReviewDashboard(action => this.dispatchDashboard(action));
+  private readonly dashboard = new ReviewDashboard(action => this.dispatchDashboard(action), () => {
+    this.advanceAfterStage = undefined;
+  });
 
   private async dispatchDashboard(action: DashboardAction): Promise<void> {
     try {
-      if (action.repoKey !== this.repo?.rootUri.toString() || this.fileActionBusy || this.copyInProgress || this.store?.busy) {
+      if (action.repoKey !== this.repo?.rootUri.toString() || this.advancingFile || this.fileActionBusy || this.copyInProgress || this.store?.busy) {
         return;
       }
+      this.advanceAfterStage = undefined;
       switch (action.type) {
         case 'input':
         case 'saveEdit':
@@ -128,6 +161,13 @@ class ReviewExtension implements vscode.Disposable {
         case 'openFile':
           await this.openFile(action.fileId);
           return;
+        case 'addFileNote': {
+          const file = this.files.find(file => file.id === action.fileId);
+          if (file) {
+            await this.openDashboardEditor({ type: 'file', path: file.path });
+          }
+          return;
+        }
         case 'stageFile':
         case 'revertFile':
           await this.changeFile(action.fileId, action.type === 'revertFile');
@@ -157,10 +197,13 @@ class ReviewExtension implements vscode.Disposable {
     }
     switch (action.type) {
       case 'delete': {
+        let prompt = 'Delete General Review Note?';
+        if (!isGeneralNote(entry.comment)) {
+          const location = entry.comment.wholeFile ? entry.comment.path : `${entry.comment.path}:${entry.comment.startLine}`;
+          prompt = `Delete Review Note on ${location}?`;
+        }
         const choice = await vscode.window.showWarningMessage(
-          isGeneralNote(entry.comment) ? 'Delete General Review Note?'
-            : `Delete Review Note on ${entry.comment.path}:${entry.comment.startLine}?`,
-          { modal: true }, 'Delete Review Note');
+          prompt, { modal: true }, 'Delete Review Note');
         const current = this.cardEntries.get(action.noteId);
         if (choice !== 'Delete Review Note' || !current || !this.savedEntries.includes(current)) {
           return;
@@ -176,11 +219,11 @@ class ReviewExtension implements vscode.Disposable {
         return;
       }
       case 'edit':
-        await this.openDashboardEditor(entry);
+        await this.openDashboardEditor({ type: 'edit', entry });
         return;
       case 'open':
         if (isGeneralNote(entry.comment)) {
-          await this.openDashboardEditor(entry);
+          await this.openDashboardEditor({ type: 'edit', entry });
         } else {
           await this.goto({ ...entry, comment: entry.comment });
         }
@@ -209,6 +252,8 @@ class ReviewExtension implements vscode.Disposable {
   private forceStatistics = false;
   private statisticsSnapshot?: { revision: number; repo: Repository; candidates: RefreshProjection['files']; force: boolean };
   private pendingFileAction?: { repo: Repository; file: DashboardState['files'][number]; action: 'stage' | 'revert' };
+  private advanceAfterStage?: { repo: Repository; path: string };
+  private advancingFile = false;
   private get fileActionBusy(): boolean {
     return this.pendingFileAction !== undefined;
   }
@@ -362,18 +407,25 @@ class ReviewExtension implements vscode.Disposable {
         startLine: entry.resolved?.startLine ?? entry.comment.startLine,
         endLine: entry.resolved?.endLine ?? entry.comment.endLine,
         preview,
-        stale: !entry.resolved,
+        stale: !entry.comment.wholeFile && !entry.resolved,
         comparison: !!entry.comment.comparison,
+        wholeFile: entry.comment.wholeFile,
       });
     }
 
     let editor: DashboardState['editor'];
     const session = this.dashboardEditor;
     if (session) {
+      let title = 'Add General Review Note';
+      if (session.target.type === 'edit') {
+        title = 'Edit Review Note';
+      } else if (session.target.type === 'file') {
+        title = `Add File Review Note: ${session.target.path}`;
+      }
       editor = {
         id: session.id,
         repoKey: session.repo.rootUri.toString(),
-        title: session.entry ? 'Edit Review Note' : 'Add General Review Note',
+        title,
         body: session.body,
         error: session.error,
       };
@@ -431,7 +483,7 @@ class ReviewExtension implements vscode.Disposable {
     }
   }
 
-  private async openDashboardEditor(entry?: SavedEntry): Promise<void> {
+  private async openDashboardEditor(target: DashboardEditorTarget = { type: 'general' }): Promise<void> {
     if (this.dashboardEditor || this.editorBusy || this.copyInProgress || this.fileActionBusy || this.store?.busy) {
       return;
     }
@@ -448,19 +500,38 @@ class ReviewExtension implements vscode.Disposable {
         throw new Error('The opened project folder changed. Refresh and retry.');
       }
       const snapshot = await store.read() ?? '';
+      if (target.type === 'file') {
+        await this.validateFileNoteTarget(repo, target);
+      }
       if (this.disposed || this.store !== store || this.repo !== repo || this.copyInProgress || this.fileActionBusy
         || store.busy || vscode.workspace.workspaceFolders?.[0]?.uri.toString() !== repo.rootUri.toString()) {
         throw new Error('The opened project folder changed or is busy. Refresh and retry.');
       }
-      const current = entry ? this.current(snapshot, entry) : undefined;
+      let body = '';
+      if (target.type === 'edit') {
+        const current = this.current(snapshot, target.entry);
+        target = { type: 'edit', entry: { comment: current, repo, snapshot } };
+        body = current.body;
+      }
       this.dashboardEditor = {
         id: String(++this.editorSequence), repo, store, snapshot,
-        entry: current ? { comment: current, repo, snapshot } : undefined,
-        body: current?.body ?? '',
+        target, body,
       };
     } finally {
       this.editorBusy = false;
       this.updateDashboard();
+    }
+  }
+
+  private async validateFileNoteTarget(repo: Repository, target: Extract<DashboardEditorTarget, { type: 'file' }>): Promise<void> {
+    const generation = this.filesGeneration;
+    const current = (): boolean => !this.disposed && this.repo === repo
+      && generation === this.filesGeneration
+      && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString();
+    const candidates = await this.git.filesToReview(repo, new Set(this.entries.map(entry => entry.comment.path)),
+      [this.context.globalStorageUri], current);
+    if (!current() || !candidates.some(file => file.path === target.path)) {
+      throw new Error('Files to Review changed. Cancel and reopen the file Review Note to retry.');
     }
   }
 
@@ -502,6 +573,15 @@ class ReviewExtension implements vscode.Disposable {
         || vscode.workspace.workspaceFolders?.[0]?.uri.toString() !== session.repo.rootUri.toString()) {
         throw new Error('The project folder changed. Cancel this Review Note and return to its original folder.');
       }
+      const target = session.target;
+      if (target.type === 'file') {
+        const uri = vscode.Uri.joinPath(session.repo.rootUri, target.path).toString();
+        const changes = [...session.repo.state.workingTreeChanges ?? [], ...session.repo.state.untrackedChanges ?? []];
+        if (!this.files.some(file => file.path === target.path) || !changes.some(change => change.uri.toString() === uri)
+          || this.entries.some(entry => entry.comment.path === target.path)) {
+          throw new Error('Files to Review changed. Cancel and reopen the file Review Note to retry.');
+        }
+      }
     };
     this.editorBusy = true;
     this.updateDashboard();
@@ -513,23 +593,45 @@ class ReviewExtension implements vscode.Disposable {
       if (await this.git.workspaceRepository() !== session.repo) {
         throw new Error('No Git repository is available for this project folder.');
       }
+      if (session.target.type === 'file') {
+        await this.validateFileNoteTarget(session.repo, session.target);
+      }
       validate();
       let unchanged = false;
       const saved = await session.store.mutate(text => {
         validate();
-        if (!session.entry && text !== session.snapshot) {
-          throw new Error('Saved Review Notes changed. Cancel and reopen the general Review Note to retry.');
+        if (session.target.type !== 'edit' && text !== session.snapshot) {
+          throw new Error('Saved Review Notes changed. Cancel and reopen the Review Note to retry.');
         }
-        const next = session.entry
-          ? editComment(text, this.current(text, session.entry), body)
-          : appendGeneralNote(text, body, session.repo.state.HEAD?.commit?.slice(0, 12));
+        let next: string;
+        const base = session.repo.state.HEAD?.commit?.slice(0, 12);
+        switch (session.target.type) {
+          case 'edit':
+            next = editComment(text, this.current(text, session.target.entry), body);
+            break;
+          case 'general':
+            next = appendGeneralNote(text, body, base);
+            break;
+          case 'file':
+            next = appendComment(text, {
+              path: session.target.path, wholeFile: true, startLine: 1, endLine: 1,
+              origin: 'changed', side: 'document', body,
+            }, base);
+            break;
+        }
         unchanged = next === text;
         return next;
-      }, async () => { validate(); }, validate);
+      }, async () => {
+        validate();
+        if (session.target.type === 'file') {
+          await this.validateFileNoteTarget(session.repo, session.target);
+        }
+        validate();
+      }, validate);
       if (saved || unchanged) {
         this.dashboardEditor = undefined;
         await this.refresh();
-        if (!session.entry) {
+        if (session.target.type !== 'edit') {
           void this.offerGitignore(session.repo, session.store).catch(error => this.error(error));
         }
       }
@@ -628,9 +730,43 @@ class ReviewExtension implements vscode.Disposable {
       do {
         generation = this.generation;
         await this.refreshProjection();
+        if (generation === this.generation) {
+          await this.openNextStagedFile();
+        }
       } while (!this.disposed && generation !== this.generation);
     } finally {
       this.refreshing = undefined;
+    }
+  }
+
+  private async openNextStagedFile(): Promise<void> {
+    const pending = this.advanceAfterStage;
+    if (!pending) {
+      return;
+    }
+    if (this.disposed || this.repo !== pending.repo || this.dashboardEditor || this.editorBusy || this.copyInProgress
+      || this.store?.busy || vscode.workspace.workspaceFolders?.[0]?.uri.toString() !== pending.repo.rootUri.toString()) {
+      this.advanceAfterStage = undefined;
+      return;
+    }
+    if (this.filesError || this.files.some(file => file.path === pending.path)) {
+      return;
+    }
+    this.advanceAfterStage = undefined;
+    const target = vscode.Uri.joinPath(pending.repo.rootUri, pending.path).toString();
+    const changes = [...pending.repo.state.workingTreeChanges ?? [], ...pending.repo.state.untrackedChanges ?? []];
+    if (changes.some(change => change.uri.toString() === target)) {
+      return;
+    }
+    const next = this.files[0];
+    if (!next) {
+      return;
+    }
+    this.advancingFile = true;
+    try {
+      await this.openFile(next.id);
+    } finally {
+      this.advancingFile = false;
     }
   }
 
@@ -746,6 +882,9 @@ class ReviewExtension implements vscode.Disposable {
     const staleBase = !!parsed.base && !!repo.state.HEAD?.commit && !repo.state.HEAD.commit.startsWith(parsed.base);
     const contents = new Map<string, Promise<string>>();
     const entries = await Promise.all(parsed.comments.map(async comment => {
+      if (comment.wholeFile) {
+        return { comment, resolved: undefined, repo, snapshot: text ?? '' };
+      }
       const key = `${comment.origin}:${comment.path}`;
       let pendingContent = contents.get(key);
       if (!pendingContent) {
@@ -829,7 +968,18 @@ class ReviewExtension implements vscode.Disposable {
       });
       this.statisticsSnapshot = { revision: this.statisticsRevision, repo, candidates: files, force: this.forceStatistics };
     }
-    for (const file of this.files) { file.visible = visiblePaths.has(file.path); }
+    const changeKinds = filesError ? undefined : fileChangeKinds(repo);
+    for (const file of this.files) {
+      file.visible = visiblePaths.has(file.path);
+      if (changeKinds) {
+        const kind = changeKinds.get(vscode.Uri.joinPath(repo.rootUri, file.path).toString());
+        if (kind) {
+          file.changeKind = kind;
+        } else {
+          delete file.changeKind;
+        }
+      }
+    }
     this.filesError = filesError;
     this.archives = archives;
     this.hasFeedback = !!text?.trim();
@@ -1248,7 +1398,10 @@ class ReviewExtension implements vscode.Disposable {
         await vscode.window.showTextDocument(document, { preview: true });
       }
     } else {
-      await vscode.commands.executeCommand('vscode.diff', index, uri, `${file.path} (Unstaged changes)`, { preview: true });
+      // VS Code's native Stage Hunk/Selection menus require the working-tree
+      // comparison ref (~). It follows the index for partially staged files.
+      const original = index.with({ query: JSON.stringify({ path: uri.fsPath, ref: '~' }) });
+      await vscode.commands.executeCommand('vscode.diff', original, uri, `${file.path} (Unstaged changes)`, { preview: true });
     }
   }
 
@@ -1260,6 +1413,7 @@ class ReviewExtension implements vscode.Disposable {
     const file = this.files.find(file => file.id === id);
     if (!repo || !file) { return; }
     this.pendingFileAction = { repo, file, action: revert ? 'revert' : 'stage' };
+    const advance = !revert && this.files[0] === file;
     const generation = this.filesGeneration;
     let failure: { error: unknown } | undefined;
     try {
@@ -1281,6 +1435,9 @@ class ReviewExtension implements vscode.Disposable {
         });
       } else {
         await this.git.stageFile(repo, file.path, notedPaths, [this.context.globalStorageUri], validate);
+        if (advance) {
+          this.advanceAfterStage = { repo, path: file.path };
+        }
       }
     } catch (error) {
       failure = { error };
@@ -1331,6 +1488,17 @@ class ReviewExtension implements vscode.Disposable {
       }
     };
     await validate();
+    if (entry.comment.wholeFile) {
+      let uri = await this.git.validatedUri(entry.comment, entry.repo);
+      const deleted = entry.repo.state.workingTreeChanges?.some(change => change.status === 6
+        && change.uri.toString() === uri.toString());
+      if (deleted) {
+        uri = await this.git.validatedUri({ path: entry.comment.path, origin: 'staged' }, entry.repo);
+      }
+      await validate();
+      await vscode.commands.executeCommand('vscode.open', uri, { preview: true });
+      return;
+    }
     if (!entry.resolved && !comparisonOnly) {
       await this.reveal(entry);
       return;

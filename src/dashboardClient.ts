@@ -26,8 +26,9 @@ export function isDashboardHostMessage(value: unknown): value is DashboardHostMe
     return typeof data === 'number' && Number.isSafeInteger(data) && data >= 0;
   }
   function file(data: unknown): boolean {
-    return record(data) && keys(data, ['id', 'path'], ['insertions', 'deletions', 'visible', 'pending', 'statisticsPending'])
+    return record(data) && keys(data, ['id', 'path'], ['insertions', 'deletions', 'visible', 'pending', 'statisticsPending', 'changeKind'])
       && text(data.id) && typeof data.path === 'string'
+      && (data.changeKind === undefined || data.changeKind === 'added' || data.changeKind === 'removed' || data.changeKind === 'renamed')
       && (data.insertions === undefined || count(data.insertions))
       && (data.deletions === undefined || count(data.deletions))
       && (data.visible === undefined || typeof data.visible === 'boolean')
@@ -41,7 +42,8 @@ export function isDashboardHostMessage(value: unknown): value is DashboardHostMe
     if (data.general === true) {
       return keys(data, ['id', 'general', 'preview']);
     }
-    return keys(data, ['id', 'path', 'startLine', 'endLine', 'preview', 'stale', 'comparison'], ['general'])
+    return keys(data, ['id', 'path', 'startLine', 'endLine', 'preview', 'stale', 'comparison'], ['general', 'wholeFile'])
+      && (data.wholeFile === undefined || typeof data.wholeFile === 'boolean')
       && (data.general === undefined || data.general === false) && typeof data.path === 'string'
       && count(data.startLine) && data.startLine > 0 && count(data.endLine) && data.endLine >= data.startLine
       && typeof data.stale === 'boolean' && typeof data.comparison === 'boolean';
@@ -98,12 +100,13 @@ export function dashboardClient(
     item: HTMLLIElement;
     open: HTMLButtonElement;
     revert: HTMLButtonElement;
+    addNote: HTMLButtonElement;
     stage: HTMLButtonElement;
     name: HTMLSpanElement;
     insertions: HTMLSpanElement;
     deletions: HTMLSpanElement;
     unknown: HTMLSpanElement;
-    eye: HTMLSpanElement;
+    changeKind: HTMLSpanElement;
     status: HTMLSpanElement;
     current: File;
     repoKey: string | undefined;
@@ -371,7 +374,7 @@ export function dashboardClient(
     });
   }
 
-  function sendFile(type: 'openFile' | 'revertFile' | 'stageFile', row: FileRow): void {
+  function sendFile(type: 'openFile' | 'revertFile' | 'addFileNote' | 'stageFile', row: FileRow): void {
     if (!state?.repoKey || state.busy || state.editor || row.current.pending || row.repoKey !== state.repoKey) {
       return;
     }
@@ -399,18 +402,15 @@ export function dashboardClient(
     const unknown = document.createElement('span');
     unknown.className = 'muted';
     unknown.textContent = 'Stats unavailable';
-    const eye = document.createElement('span');
-    eye.className = 'file-visible';
-    eye.title = 'Visible in editor';
-    eye.setAttribute('aria-hidden', 'true');
-    eye.append(icon('eye-icon'));
     const status = document.createElement('span');
     status.className = 'file-progress';
     status.setAttribute('role', 'status');
     const label = document.createElement('span');
     label.className = 'file-label';
-    label.append(eye, name);
-    open.append(label, insertions, deletions, unknown);
+    label.append(name);
+    const changeKind = document.createElement('span');
+    changeKind.className = 'file-change-kind';
+    open.append(label, insertions, deletions, unknown, changeKind);
 
     const revert = document.createElement('button');
     revert.type = 'button';
@@ -418,19 +418,26 @@ export function dashboardClient(
     revert.title = 'Revert File';
     revert.setAttribute('aria-label', 'Revert File');
     revert.append(icon('revert-icon'));
+    const addNote = document.createElement('button');
+    addNote.type = 'button';
+    addNote.className = 'file-action file-note';
+    addNote.title = 'Add File Review Note';
+    addNote.setAttribute('aria-label', 'Add File Review Note');
+    addNote.append(icon('note-icon'));
     const stage = document.createElement('button');
     stage.type = 'button';
     stage.className = 'file-action file-stage';
     stage.title = 'Stage File';
     stage.setAttribute('aria-label', 'Stage File');
     stage.append(icon('stage-icon'));
-    item.append(open, revert, stage, status);
+    item.append(open, revert, addNote, stage, status);
 
     const row: FileRow = {
-      item, open, revert, stage, name, insertions, deletions, unknown, eye, status, current: file, repoKey,
+      item, open, revert, addNote, stage, name, insertions, deletions, unknown, changeKind, status, current: file, repoKey,
     };
     open.addEventListener('click', () => sendFile('openFile', row));
     revert.addEventListener('click', () => sendFile('revertFile', row));
+    addNote.addEventListener('click', () => sendFile('addFileNote', row));
     stage.addEventListener('click', () => sendFile('stageFile', row));
     return row;
   }
@@ -439,7 +446,6 @@ export function dashboardClient(
     row.current = file;
     row.name.textContent = file.path.slice(file.path.lastIndexOf('/') + 1);
     row.open.title = file.path;
-    row.eye.hidden = file.visible !== true;
     row.status.hidden = !file.pending;
     row.status.textContent = file.pending === 'stage' ? 'Staging file' : '';
     if (file.pending === 'revert') {
@@ -456,11 +462,32 @@ export function dashboardClient(
     blocked = blocked || !!file.pending;
 
     const labels: string[] = [];
+    let kindLabel = '';
+    switch (file.changeKind) {
+      case 'added':
+        kindLabel = 'Added';
+        break;
+      case 'removed':
+        kindLabel = 'Removed';
+        break;
+      case 'renamed':
+        kindLabel = 'Renamed';
+        break;
+    }
+    row.changeKind.textContent = kindLabel;
+    row.changeKind.hidden = !kindLabel;
+    if (kindLabel) {
+      labels.push(kindLabel);
+    }
+    let knownCounts = 0;
     for (const key of ['insertions', 'deletions'] as const) {
       const count = file[key];
       const known = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
-      row[key].hidden = !known;
+      // Omit redundant zeroes for status-labelled rows, but keep nonzero counts
+      // on both sides when a labelled change also modifies content.
+      row[key].hidden = !known || (!!kindLabel && count === 0);
       if (known) {
+        knownCounts++;
         const sign = key === 'insertions' ? '+' : '-';
         row[key].textContent = sign + count;
         labels.push(count + ' ' + (count === 1 ? key.slice(0, -1) : key));
@@ -469,7 +496,7 @@ export function dashboardClient(
       }
     }
     row.unknown.textContent = file.statisticsPending ? 'Loading stats' : 'Stats unavailable';
-    row.unknown.hidden = labels.length === 2;
+    row.unknown.hidden = knownCounts === 2;
     if (!row.unknown.hidden) {
       labels.push(row.unknown.textContent);
     }
@@ -479,6 +506,7 @@ export function dashboardClient(
     row.open.setAttribute('aria-label', 'Open file: ' + file.path + ', ' + labels.join(', '));
     row.open.disabled = blocked;
     row.revert.disabled = blocked;
+    row.addNote.disabled = blocked;
     row.stage.disabled = blocked;
   }
 
@@ -488,6 +516,7 @@ export function dashboardClient(
     row.item.setAttribute('aria-hidden', 'true');
     row.open.disabled = true;
     row.revert.disabled = true;
+    row.addNote.disabled = true;
     row.stage.disabled = true;
     if (reducedMotion.matches) {
       row.item.remove();
@@ -601,11 +630,15 @@ export function dashboardClient(
       const range = note.startLine === note.endLine ? String(note.startLine) : note.startLine + '-' + note.endLine;
       label = note.path.slice(note.path.lastIndexOf('/') + 1) + ':' + range;
       target = note.path + ':' + range;
+      if (note.wholeFile) {
+        label = note.path.slice(note.path.lastIndexOf('/') + 1);
+        target = note.path;
+      }
       destination = 'Go to code';
       if (note.comparison) {
         destination = 'Open code comparison';
       }
-      if (note.stale) {
+      if (note.stale && !note.wholeFile) {
         destination = 'Open saved Review Note';
       }
     }

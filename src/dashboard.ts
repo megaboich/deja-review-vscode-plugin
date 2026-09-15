@@ -11,6 +11,7 @@ export type DashboardNote = {
   stale: boolean;
   comparison: boolean;
   general?: false;
+  wholeFile?: boolean;
 } | { id: string; general: true; preview: string };
 
 export interface DashboardState {
@@ -20,6 +21,7 @@ export interface DashboardState {
   busy: boolean;
   files: Array<{
     id: string; path: string; insertions?: number; deletions?: number;
+    changeKind?: 'added' | 'removed' | 'renamed';
     visible?: boolean; pending?: 'stage' | 'revert'; statisticsPending?: boolean;
   }>;
   filesError?: string;
@@ -36,7 +38,7 @@ export type DashboardAction =
   | { type: "addGeneral"; repoKey: string }
   | { type: "restore"; repoKey: string; archiveId: string }
   | { type: "open" | "edit" | "delete"; repoKey: string; noteId: string }
-  | { type: "openFile" | "revertFile" | "stageFile"; repoKey: string; fileId: string }
+  | { type: "openFile" | "revertFile" | "addFileNote" | "stageFile"; repoKey: string; fileId: string }
   | { type: "input" | "saveEdit"; repoKey: string; editorId: string; body: string }
   | { type: "cancelEdit"; repoKey: string; editorId: string };
 
@@ -100,6 +102,7 @@ export function decodeDashboardMessage(message: unknown): DashboardMessage | und
       }
       return;
     case "openFile":
+    case "addFileNote":
     case "revertFile":
     case "stageFile":
       if (exactKeys("type", "repoKey", "fileId") && typeof data.fileId === "string" && data.fileId) {
@@ -147,7 +150,10 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
   private historyVisible = false;
   private readonly instanceKey = randomBytes(32).toString("hex");
 
-  constructor(private readonly onAction: (action: DashboardAction) => void | Promise<void>) {}
+  constructor(
+    private readonly onAction: (action: DashboardAction) => void | Promise<void>,
+    private readonly onActivity: () => void = () => {},
+  ) {}
 
   update(state: DashboardState): void {
     if (this.disposed) {
@@ -167,8 +173,11 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
   }
 
   private projectState(state: DashboardState): DashboardState {
-    const files = state.files.map(({ id, path, insertions, deletions, visible, pending, statisticsPending }) => {
+    const files = state.files.map(({ id, path, insertions, deletions, visible, pending, statisticsPending, changeKind }) => {
       const file: DashboardState['files'][number] = { id, path };
+      if (changeKind === 'added' || changeKind === 'removed' || changeKind === 'renamed') {
+        file.changeKind = changeKind;
+      }
       if (typeof insertions === "number" && Number.isSafeInteger(insertions) && insertions >= 0) {
         file.insertions = insertions;
       }
@@ -192,7 +201,11 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
         return { id: note.id, general: true, preview };
       }
       const { id, path, startLine, endLine, stale, comparison } = note;
-      return { id, path, startLine, endLine, preview, stale, comparison };
+      const projected: DashboardNote = { id, path, startLine, endLine, preview, stale, comparison };
+      if (note.wholeFile) {
+        projected.wholeFile = true;
+      }
+      return projected;
     });
     const archives = state.archives
       .map(({ id, createdAt, commentCount }) => ({ id, createdAt, commentCount }))
@@ -324,6 +337,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
         if (this.state.editor || this.state.hasFeedback) {
           return;
         }
+        this.onActivity();
         this.historyVisible = decoded.type === "openHistory";
         this.pushState();
         return;
@@ -333,6 +347,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
     if (!action) {
       return;
     }
+    this.onActivity();
 
     // Input is delivered synchronously so the owner can preserve each keystroke without busy flicker.
     const input = action.type === "input";
@@ -426,6 +441,7 @@ export class ReviewDashboard implements vscode.WebviewViewProvider, vscode.Dispo
 
     switch (action.type) {
       case "openFile":
+      case "addFileNote":
       case "revertFile":
       case "stageFile":
         return this.state.files.some(file => file.id === action.fileId && !file.pending) ? action : undefined;

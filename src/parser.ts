@@ -1,7 +1,7 @@
 import { normalizeComment, normalizeResource } from './model';
 import type { Comparison, Origin, ParseResult, ReviewComment, Side } from './model';
 
-const HEADER = /^##\s+`(?<path>[^`]+)`\s*:\s*(?<range>(?<start>\d+)(?:\s*-\s*(?<end>\d+))?)(?:\s*;\s*Snippet\s*:\s*(?<elided>elided))?\s*$/di;
+const HEADER = /^##\s+`(?<path>[^`]+)`\s*:\s*(?<range>(?<wholeFile>file)|(?<start>\d+)(?:\s*-\s*(?<end>\d+))?)(?:\s*;\s*Snippet\s*:\s*(?<elided>elided))?\s*$/di;
 const ORIGIN_LABEL = '(?:Working\\s+tree|Staging\\s+area|HEAD|Commit\\s+(?:[0-9a-f]{40}|[0-9a-f]{64}))';
 const DOCUMENT_SELECTION = new RegExp(`^\\s*Selected\\s*:\\s*(?<origin>${ORIGIN_LABEL})\\s*$`, 'i');
 const COMPARISON_SELECTION = new RegExp(
@@ -165,7 +165,7 @@ export function parse(text: string): ParseResult {
       // File grammar consumes context and an optional anchor; general notes start at the body.
       let file: (Omit<ReviewComment, 'body'> & { rangeStartOffset: number; rangeEndOffset: number }) | undefined;
       if (!general && fields && range) {
-        const { path, start, end, elided } = fields;
+        const { path, start, end, elided, wholeFile } = fields;
         diagnosticLine = cursor < limit ? cursor : first;
         let comparison: Comparison | undefined;
         if (cursor < limit && /^\s*Comparison\s*:/i.test(lines[cursor].text)) {
@@ -206,8 +206,9 @@ export function parse(text: string): ParseResult {
         }
         file = {
           path,
-          startLine: Number(start),
-          endLine: Number(end ?? start),
+          ...(wholeFile ? { wholeFile: true } : {}),
+          startLine: wholeFile ? 1 : Number(start),
+          endLine: wholeFile ? 1 : Number(end ?? start),
           origin,
           side,
           comparison,

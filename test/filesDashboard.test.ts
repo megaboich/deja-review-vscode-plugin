@@ -2315,6 +2315,154 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     assert.equal(state().busy, false);
   });
 
+  for (const kind of ['tracked', 'binary', 'deleted', 'untracked'] as const) {
+    await t.test(`whole-file ${kind} creation retains input across refresh and saves only file-wide feedback`, async () => {
+      await reset(kind === 'deleted' ? GitStatus.Deleted : GitStatus.Modified,
+        kind === 'untracked' ? 'untrackedChanges' : 'workingTreeChanges');
+      if (kind === 'binary') {
+        sources.set('/synthetic/repo/src/a.ts', '\0binary');
+      }
+      await incoming({ ...action(), type: 'addFileNote' });
+      const editor = currentEditor();
+      assert.equal(editor.title, 'Add File Review Note: src/a.ts');
+      const body = '## File-wide feedback\n```\nunbalanced';
+      await incoming({ type: 'input', repoKey: repoKey(), editorId: editor.id, body });
+      await registeredCommand('dejareview.refresh')();
+      await mountView();
+      assert.equal(currentEditor().id, editor.id);
+      assert.equal(currentEditor().body, body);
+      assert.deepEqual(paths(), ['src/a.ts'], 'Drafts do not suppress candidates');
+      await incoming({ type: 'saveEdit', repoKey: repoKey(), editorId: editor.id, body });
+      assert.equal(state().editor, undefined);
+      const note = parse(store().savedText).comments[0];
+      assert.equal(note.wholeFile, true);
+      assert.equal(note.path, 'src/a.ts');
+      assert.equal(note.body, body);
+      assert.equal(note.anchorText, undefined);
+      assert.deepEqual(paths(), []);
+      assert.equal(state().commentCount, 1);
+      assert.deepEqual(adds, []);
+      assert.deepEqual(cleans, []);
+      assert.deepEqual(opened, []);
+      assert.deepEqual(navigation(), []);
+    });
+  }
+
+  for (const when of ['before save', 'publication'] as const) {
+    await t.test(`whole-file creation retains input when membership changes ${when}`, async () => {
+      await reset();
+      await incoming({ ...action(), type: 'addFileNote' });
+      const editor = currentEditor();
+      const remove = (): void => { repository.state.workingTreeChanges = []; };
+      if (when === 'publication') {
+        onFinalGuard = async () => remove();
+      } else {
+        remove();
+      }
+      await incoming({ type: 'saveEdit', repoKey: repoKey(), editorId: editor.id, body: 'Keep my input' });
+      assert.equal(store().text, undefined);
+      assert.equal(currentEditor().body, 'Keep my input');
+      assert.match(currentEditor().error ?? '', /Files to Review changed/);
+      await incoming({ type: 'cancelEdit', repoKey: repoKey(), editorId: editor.id });
+      assert.equal(state().editor, undefined);
+    });
+  }
+
+  await t.test('whole-file cards open deleted files from the index and never rewrite their scope', async () => {
+    await reset(GitStatus.Deleted);
+    await incoming({ ...action(), type: 'addFileNote' });
+    await incoming({ type: 'saveEdit', repoKey: repoKey(), editorId: currentEditor().id, body: 'Restore this file' });
+    const snapshot = store().savedText;
+    const note = state().notes[0];
+    assert.ok(!note.general && note.wholeFile);
+    assert.equal(note.stale, false);
+    const client = scriptFixture();
+    client.update(state());
+    assert.equal(client.element('notes').children[0].children[0].children[0].textContent, 'a.ts');
+    await incoming({ type: 'open', repoKey: repoKey(), noteId: note.id });
+    assert.equal(navigation()[0].command, 'vscode.open');
+    const target = navigation()[0].args[0];
+    assert.ok(target instanceof Uri);
+    assert.equal(target.scheme, 'git');
+    await registeredCommand('dejareview.reanchorAll')();
+    assert.equal(store().savedText, snapshot);
+  });
+
+  for (const cancellation of ['saved note filtering', 'history action'] as const) {
+    await t.test(`${cancellation} cannot cause a delayed staging advance`, async () => {
+      await reset();
+      repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+      await registeredCommand('dejareview.refresh')();
+      await incoming(stageAction());
+      if (cancellation === 'saved note filtering') {
+        store().text = appendComment('', {
+          path: 'src/a.ts', wholeFile: true, startLine: 1, endLine: 1, origin: 'changed', side: 'document', body: 'Still needs changes',
+        });
+        store().changed.fire();
+      } else {
+        receive.fire({ type: 'openHistory', repoKey: repoKey() });
+        repository.state.workingTreeChanges = [change('/synthetic/repo/src/other.ts')];
+        gitChanged.fire();
+      }
+      await automaticRefresh();
+      assert.deepEqual(paths(), ['src/other.ts']);
+      assert.deepEqual(navigation(), []);
+    });
+  }
+
+  for (const timing of ['immediate', 'later Git event'] as const) {
+    await t.test(`staging the first row opens the next only after ${timing} confirms removal`, async () => {
+      await reset();
+      repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+      await registeredCommand('dejareview.refresh')();
+      const remove = (): void => {
+        repository.state.workingTreeChanges = [change('/synthetic/repo/src/other.ts')];
+      };
+      if (timing === 'immediate') {
+        onAdd = async () => remove();
+      }
+      await incoming(stageAction());
+      if (timing === 'later Git event') {
+        assert.deepEqual(navigation(), []);
+        remove();
+        gitChanged.fire();
+        await automaticRefresh();
+      }
+      assert.deepEqual(paths(), ['src/other.ts']);
+      assert.equal(navigation().length, 1);
+      assert.equal(navigation()[0].command, 'vscode.diff');
+      assert.equal(navigation()[0].args[2], 'src/other.ts (Unstaged changes)');
+      await registeredCommand('dejareview.refresh')();
+      assert.equal(navigation().length, 1, 'Advance is consumed exactly once');
+    });
+  }
+
+  for (const operation of ['lower row', 'revert', 'failure', 'manual navigation'] as const) {
+    await t.test(`${operation} does not trigger automatic staging navigation`, async () => {
+      await reset();
+      repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+      await registeredCommand('dejareview.refresh')();
+      if (operation === 'failure') {
+        onAdd = async () => { throw new Error('Synthetic staging failure'); };
+        await incoming(stageAction());
+      } else if (operation === 'revert') {
+        await incoming(revertAction());
+      } else if (operation === 'lower row') {
+        await incoming({ ...action('src/other.ts'), type: 'stageFile' });
+      } else {
+        await incoming(stageAction());
+        await incoming(action('src/other.ts'));
+      }
+      executed.length = 0;
+      errors.length = 0;
+      repository.state.workingTreeChanges = operation === 'lower row'
+        ? [change('/synthetic/repo/src/a.ts')] : [change('/synthetic/repo/src/other.ts')];
+      gitChanged.fire();
+      await automaticRefresh();
+      assert.deepEqual(navigation(), []);
+    });
+  }
+
   for (const kind of ['tracked', 'binary', 'unknown stats', 'new', 'new binary', 'partial', 'deleted'] as const) {
     await t.test(`stageFile sends one absolute ${kind} path and waits for refreshed Git state`, async () => {
       await reset(kind === 'deleted' ? GitStatus.Deleted : GitStatus.Modified,
@@ -2495,6 +2643,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         title: button.title, label: button.attributes.get('aria-label'), disabled: button.disabled,
       })), [
         { title: 'Revert File', label: 'Revert File', disabled: false },
+        { title: 'Add File Review Note', label: 'Add File Review Note', disabled: false },
         { title: 'Stage File', label: 'Stage File', disabled: false },
       ]);
       const started = deferred(), release = deferred();
@@ -2509,7 +2658,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       assert.ok(buttons.every(button => button.disabled), 'Published busy state disables actual client controls');
       const cleanCount = cleans.length, addCount = adds.length, warningCount = warnings.length;
       for (const target of ['src/a.ts', 'src/other.ts']) {
-        for (const type of ['stageFile', 'revertFile'] as const) {
+        for (const type of ['stageFile', 'revertFile', 'addFileNote'] as const) {
           const request = { ...action(target), type };
           receive.fire(request);
           await incoming(request);
@@ -2945,8 +3094,61 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     assert.equal(mutations, 0);
   });
 
+  await t.test('file change labels describe only changes relative to the staged snapshot', async () => {
+    await reset();
+    for (const [workingStatus, indexStatus, expected] of [
+      [GitStatus.Untracked, undefined, 'added'],
+      [GitStatus.IntentToAdd, undefined, 'added'],
+      [GitStatus.Deleted, undefined, 'removed'],
+      [GitStatus.IntentToRename, undefined, 'renamed'],
+      [GitStatus.Modified, 3, undefined],
+      [GitStatus.Modified, 1, undefined],
+      [GitStatus.Deleted, 1, 'removed'],
+      [GitStatus.Deleted, 3, 'removed'],
+      [GitStatus.Modified, undefined, undefined],
+    ] as const) {
+      repository.state.workingTreeChanges = [change('/synthetic/repo/src/a.ts', workingStatus)];
+      repository.state.indexChanges = indexStatus === undefined ? [] : [change('/synthetic/repo/src/a.ts', indexStatus)];
+      gitChanged.fire();
+      await automaticRefresh();
+      assert.equal(state().files[0].changeKind, expected);
+      await statisticsPublished();
+      const client = scriptFixture();
+      client.update(state());
+      const open = client.element('files').children[0].children[0];
+      if (workingStatus === GitStatus.Modified) {
+        assert.equal(open.children[4].hidden, true, 'Staged history must not label residual edits Added or Renamed');
+        assert.equal(open.children[1].textContent, '+2');
+        assert.equal(open.children[2].textContent, '-1');
+      }
+    }
+    repository.state.workingTreeChanges = [];
+    repository.state.untrackedChanges = [change('/synthetic/repo/src/a.ts', GitStatus.Untracked)];
+    const started = deferred();
+    const release = deferred();
+    onStatistics = async () => {
+      started.resolve();
+      await release.promise;
+      return new Map();
+    };
+    await registeredCommand('dejareview.refresh')();
+    await started.promise;
+    assert.equal(state().files[0].changeKind, 'added', 'Label is published before counts settle');
+    release.resolve();
+    await statisticsPublished();
+    assert.equal(state().files[0].changeKind, 'added');
+    assert.equal(state().files[0].insertions, undefined, 'Unavailable statistics do not remove the label');
+    repository.state.untrackedChanges = [];
+    repository.state.workingTreeChanges = [];
+    repository.state.indexChanges = [change('/synthetic/repo/src/a.ts', 3)];
+    gitChanged.fire();
+    await automaticRefresh();
+    assert.deepEqual(paths(), [], 'Status metadata must not introduce index-only candidates');
+  });
+
   const navigationCases = [
     { kind: 'tracked', status: GitStatus.Modified, group: 'workingTreeChanges' },
+    { kind: 'partially staged', status: GitStatus.Modified, group: 'workingTreeChanges' },
     { kind: 'untracked', status: GitStatus.Modified, group: 'untrackedChanges' },
     { kind: 'status7', status: GitStatus.Untracked, group: 'workingTreeChanges' },
     { kind: 'deleted', status: GitStatus.Deleted, group: 'workingTreeChanges' },
@@ -2954,7 +3156,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   for (const { kind, status, group } of navigationCases) {
     await t.test(`openFile navigates ${kind} using the correct resource`, async () => {
       await reset(status, group);
-      if (kind === 'tracked') { repository.state.indexChanges = [change('/synthetic/repo/src/a.ts')]; }
+      if (kind === 'partially staged') { repository.state.indexChanges = [change('/synthetic/repo/src/a.ts')]; }
       receive.fire(action());
       await settle();
       assert.equal(state().busy, false);
@@ -2963,17 +3165,21 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         assert.equal(uri.scheme, 'git');
         assert.deepEqual(JSON.parse(uri.query), { path: '/synthetic/repo/src/a.ts', ref: '' });
       };
-      if (kind === 'tracked') {
+      if (kind === 'tracked' || kind === 'partially staged') {
         assert.equal(navigation().length, 1);
         const call = navigation()[0];
         assert.equal(call.command, 'vscode.diff');
         assert.ok(call.args[0] instanceof Uri);
         assert.ok(call.args[1] instanceof Uri);
-        index(call.args[0]);
+        assert.equal(call.args[0].scheme, 'git');
+        assert.equal(call.args[0].query, JSON.stringify({ path: '/synthetic/repo/src/a.ts', ref: '~' }),
+          'Native Git hunk staging menus require the working-tree ref, with ref last in the query');
         assert.equal(call.args[1].toString(), file('/synthetic/repo/src/a.ts').toString());
         assert.equal(call.args[2], 'src/a.ts (Unstaged changes)');
         assert.deepEqual(call.args[3], { preview: true });
         assert.deepEqual(opened, []); assert.deepEqual(shown, []);
+        assert.deepEqual(adds, [], 'Opening a staging-enabled diff does not stage anything');
+        assert.deepEqual(cleans, []);
       } else {
         assert.deepEqual(navigation(), []);
         assert.equal(opened.length, 1); assert.equal(shown.length, 1);
@@ -2982,7 +3188,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         if (kind === 'deleted') { index(opened[0]); }
         else { assert.equal(opened[0].toString(), file('/synthetic/repo/src/a.ts').toString()); }
       }
-      assert.deepEqual(validations, kind === 'tracked' || kind === 'deleted' ? ['changed', 'staged'] : ['changed']);
+      const usesIndex = kind === 'tracked' || kind === 'partially staged' || kind === 'deleted';
+      assert.deepEqual(validations, usesIndex ? ['changed', 'staged'] : ['changed']);
     });
   }
 

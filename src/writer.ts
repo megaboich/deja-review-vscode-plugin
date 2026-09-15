@@ -64,7 +64,10 @@ export function appendComment(text: string, input: ReviewComment, base?: string)
   const comment = normalizeComment(input);
   const eol = newline(text);
   const convert = (value: string): string => value.replace(/\r\n|\r|\n/g, eol);
-  const range = comment.startLine === comment.endLine ? `${comment.startLine}` : `${comment.startLine}-${comment.endLine}`;
+  let range = comment.startLine === comment.endLine ? `${comment.startLine}` : `${comment.startLine}-${comment.endLine}`;
+  if (comment.wholeFile) {
+    range = 'file';
+  }
 
   const context: string[] = [];
   let selected = originLabel(comment.origin);
@@ -175,6 +178,9 @@ export function deleteComment(text: string, comment: ParsedNote): string {
 /** The target and its range offsets must come from a fresh parse of text. */
 export function rewriteLines(text: string, comment: ParsedComment, start: number, end: number): string {
   checkSnapshot(text, comment);
+  if (comment.wholeFile) {
+    throw new Error('Whole-file Review Notes have no line numbers to rewrite');
+  }
   validateRange(start, end);
   const range = start === end ? `${start}` : `${start}-${end}`;
   return text.slice(0, comment.rangeStartOffset) + range + text.slice(comment.rangeEndOffset);

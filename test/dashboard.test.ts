@@ -46,7 +46,7 @@ test("decoder constructs exact action variants independently of live authorizati
     ...["copy", "addGeneral", "openHistory", "closeHistory"].map(type => ({ type, repoKey: "/repo" })),
     { type: "restore", repoKey: "/repo", archiveId: "batch" },
     ...["open", "edit", "delete"].map(type => ({ type, repoKey: "/repo", noteId: "note" })),
-    ...["openFile", "revertFile", "stageFile"].map(type => ({ type, repoKey: "/repo", fileId: "file" })),
+    ...["openFile", "revertFile", "addFileNote", "stageFile"].map(type => ({ type, repoKey: "/repo", fileId: "file" })),
     ...["input", "saveEdit"].map(type => ({ type, repoKey: "/repo", editorId: "editor", body: "", requestId: "request" })),
     { type: "cancelEdit", repoKey: "/repo", editorId: "editor", requestId: "request" },
     { type: "editorRequestStatus", repoKey: "/repo", editorId: "editor", requestId: "request" },
@@ -391,14 +391,16 @@ test("static shell has nonce-only CSP, accessible full-text copy button and resp
   assert.match(labelStyles, /display: flex/);
   assert.doesNotMatch(labelStyles, /flex-wrap: wrap/);
   assert.doesNotMatch(html, /\.file-exiting \.file-progress/);
-  assert.match(html, /\.file-visible\s*\{ color: var\(--vscode-icon-foreground\);/);
-  assert.match(html, /\.file-open\s*\{[^}]*padding-right: 70px;/);
+  assert.doesNotMatch(html, /file-visible|eye-icon/);
+  assert.doesNotMatch(matchedText(html, /\.file-open\s*\{([^}]+)\}/, 1), /padding-right/);
   const actionStyle = matchedText(html, /\.file-action\s*\{([^}]+)\}/, 1);
   assert.match(actionStyle, /position: absolute;\s*right: 4px;[\s\S]*width: 28px;\s*height: 28px;\s*padding: 6px;/);
   assert.match(actionStyle, /opacity: 0;/);
-  assert.doesNotMatch(actionStyle, /display: none|visibility: hidden|pointer-events: none/);
-  assert.match(html, /\.file-revert\s*\{ right: 36px; \}/);
-  assert.match(html, /\.file-row:hover \.file-action,\s*\.file-row:focus-within \.file-action\s*\{ opacity: 1; \}/);
+  assert.doesNotMatch(actionStyle, /display: none|visibility: hidden/);
+  assert.match(actionStyle, /top: 4px;/);
+  assert.match(html, /\.file-revert\s*\{ right: 68px; \}/);
+  assert.match(html, /\.file-note\s*\{ right: 36px; \}/);
+  assert.match(html, /\.file-row:hover \.file-action,\s*\.file-row:focus-within \.file-action\s*\{ opacity: 1; pointer-events: auto; \}/);
   const disabledStyle = matchedText(html, /\bbutton:disabled\s*\{([^}]+)\}/, 1);
   assert.match(disabledStyle, /cursor: default;/);
   assert.doesNotMatch(disabledStyle, /opacity\s*:/, "disabled buttons must neither dim the panel nor override hidden file-action opacity");
@@ -737,7 +739,7 @@ test("provider whitelists file metadata, snapshots it and leaves unknown counts 
   dashboard.dispose();
 });
 
-for (const type of ["openFile", "revertFile", "stageFile"]) test(`provider validates exact ${type} keys, scope and live membership independent of feedback and stats`, async () => {
+for (const type of ["openFile", "revertFile", "addFileNote", "stageFile"]) test(`provider validates exact ${type} keys, scope and live membership independent of feedback and stats`, async () => {
   const actions: unknown[] = [];
   let finish: (() => void) | undefined;
   const dashboard = new ReviewDashboard(action => {
@@ -776,7 +778,7 @@ for (const type of ["openFile", "revertFile", "stageFile"]) test(`provider valid
     fixture.send({ ...action, fileId: "image.png" });
     assert.equal(actions.length, count, "in-flight file actions are serialized");
     assert.equal(fixture.latestState.busy, type !== "openFile");
-    assert.deepEqual(fixture.latestState.files, current.files.map(file => type === 'openFile' ? file
+    assert.deepEqual(fixture.latestState.files, current.files.map(file => type === 'openFile' || type === 'addFileNote' ? file
       : { ...file, pending: type === 'stageFile' ? 'stage' : 'revert' }), "no optimistic candidate removal");
     assert.ok(finish, "Expected a pending file action");
     finish();
@@ -2192,6 +2194,36 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   assert.deepEqual(messages.map((message) => message.type), ["ready", "copy", "openHistory", "restore"]);
 });
 
+test('file status labels accompany counts and omit redundant zeroes without guessing from statistics', () => {
+  const client = scriptFixture();
+  const cases: Array<{ file: DashboardState['files'][number]; expected: string[] }> = [
+    { file: { id: 'a', path: 'a.ts', changeKind: 'added', insertions: 60, deletions: 0 }, expected: ['Added', '+60'] },
+    { file: { id: 'a', path: 'a.ts', changeKind: 'removed', insertions: 0, deletions: 60 }, expected: ['Removed', '-60'] },
+    { file: { id: 'a', path: 'a.ts', changeKind: 'renamed', insertions: 0, deletions: 0 }, expected: ['Renamed'] },
+    { file: { id: 'a', path: 'a.ts', changeKind: 'renamed', insertions: 2, deletions: 1 }, expected: ['Renamed', '+2', '-1'] },
+    { file: { id: 'a', path: 'a.ts', changeKind: 'added', insertions: 2, deletions: 1 }, expected: ['Added', '+2', '-1'] },
+    { file: { id: 'a', path: 'a.ts', insertions: 60, deletions: 0 }, expected: ['+60', '-0'] },
+    { file: { id: 'a', path: 'a.ts', changeKind: 'added', statisticsPending: true }, expected: ['Added', 'Loading stats'] },
+    { file: { id: 'a', path: 'a.ts', changeKind: 'removed' }, expected: ['Removed', 'Stats unavailable'] },
+    { file: { id: 'a', path: 'a.ts', changeKind: 'renamed', statisticsPending: true }, expected: ['Renamed', 'Loading stats'] },
+  ];
+  for (const { file, expected } of cases) {
+    client.update(state({ files: [file] }));
+    const open = client.element('files').children[0].children[0];
+    const [, additions, deletions, unavailable, kind] = open.children;
+    assert.deepEqual([kind, additions, deletions, unavailable].filter(node => !node.hidden).map(node => node.textContent), expected);
+    if (file.changeKind) {
+      assert.ok(open.attributes.get('aria-label')?.includes(expected[0]));
+    }
+  }
+  assert.equal(isDashboardHostMessage({ type: 'state', state: state({ files: [{ id: 'a', path: 'a', changeKind: 'renamed' }] }) }), true);
+  const invalid = { ...state(), files: [{ id: 'a', path: 'a', changeKind: '<script>' }] };
+  assert.equal(isDashboardHostMessage({ type: 'state', state: invalid }), false);
+  const html = renderDashboard('0123456789abcdef');
+  assert.match(html, /\.file-change-kind\s*\{ order: 1;/);
+  assert.match(html, /\.file-insertions, \.file-deletions, \.file-open > \.muted\s*\{ order: 2;/);
+});
+
 test("busy transitions reuse keyed rows and all descendants while disabling controls and rejecting clicks", () => {
   const { element, messages, update } = scriptFixture();
   const current = state();
@@ -2224,7 +2256,7 @@ test("busy transitions reuse keyed rows and all descendants while disabling cont
     assert.equal(element("archive-unavailable").hidden, true);
     assert.equal(element("history").hidden, true);
   }
-  element("files").children[0].children[2].click();
+  element("files").children[0].children[3].click();
   assert.deepEqual({ ...lastMessage(messages) }, { type: "stageFile", repoKey: "/repo", fileId: "files:0" });
 });
 
@@ -2235,29 +2267,23 @@ test("file heading counts confirmed candidates and visible/pending metadata upda
   assert.equal(client.element('files-title').textContent, 'Files to Review (2)');
   const [first, second] = client.element('files').children;
   const fileLabel = first.children[0].children[0];
-  const eye = fileLabel.children[0];
   assert.equal(fileLabel.className, 'file-label');
-  assert.equal(fileLabel.children[1].className, 'file-name', 'eye precedes the filename inside a shared nonwrapping label');
+  assert.equal(fileLabel.children.length, 1);
+  assert.equal(fileLabel.children[0].className, 'file-name');
   assert.equal(first.className, 'file-row file-in-editor');
-  assert.equal(eye.tagName, 'span');
-  assert.equal(eye.title, 'Visible in editor');
-  assert.equal(eye.attributes.get('aria-hidden'), 'true');
-  assert.equal(eye.hidden, false);
-  assert.equal(eye.listeners.size, 0);
   assert.match(first.children[0].attributes.get('aria-label') || '', /Visible in editor/);
-  assert.equal(second.children[0].children[0].children[0].hidden, true);
   for (const pending of ['stage', 'revert'] as const) {
     client.update(state({ files: [{ ...files[0], pending }, files[1]], busy: true }));
     assert.equal(client.element('files').children[0], first);
     assert.equal(first.className, 'file-row file-in-editor file-pending');
     assert.equal(first.attributes.get('aria-busy'), 'true');
-    assert.equal(first.children[3].attributes.get('role'), 'status');
-    assert.equal(first.children[3].hidden, false);
-    assert.equal(first.children[3].textContent, pending === 'stage' ? 'Staging file' : 'Reverting file');
+    assert.equal(first.children[4].attributes.get('role'), 'status');
+    assert.equal(first.children[4].hidden, false);
+    assert.equal(first.children[4].textContent, pending === 'stage' ? 'Staging file' : 'Reverting file');
     assert.equal(second.className, 'file-row');
-    assert.equal(second.children[3].hidden, true);
+    assert.equal(second.children[4].hidden, true);
     for (const row of [first, second]) {
-      for (const button of row.children.slice(0, 3)) {
+      for (const button of row.children.slice(0, 4)) {
         assert.equal(button.disabled, true);
         button.invokeListener('click');
       }
@@ -2270,8 +2296,7 @@ test("file heading counts confirmed candidates and visible/pending metadata upda
   }
   client.update(state({ files: [{ ...files[0], visible: false }, files[1]] }));
   assert.equal(first.className, 'file-row');
-  assert.equal(first.children[3].hidden, true);
-  assert.equal(eye.hidden, true);
+  assert.equal(first.children[4].hidden, true);
   assert.doesNotMatch(first.children[0].attributes.get('aria-label') || '', /Visible in editor/);
   assert.equal(first.children[0].disabled, false);
   client.update(state({ files: [] }));
@@ -2284,7 +2309,7 @@ test("confirmed removals collapse actual row boxes, stay inert and clean up on a
   client.update(state());
   const row = client.element('files').children[0];
   row.height = 93;
-  row.children[2].click();
+  row.children[3].click();
   assert.equal(row.animations.length, 0, 'a click is not confirmed removal');
   client.update(state({ busy: true, files: [{ ...state().files[0], pending: 'stage' }] }));
   assert.equal(row.animations.length, 0, 'pending is not confirmed removal');
@@ -2407,12 +2432,17 @@ test("files without feedback render text-only stats and sibling accessible rever
     assert.equal(row.className, "file-row");
     assert.deepEqual(row.children.map(node => [node.tagName, node.className, node.type]), [
       ["button", "file-open", "button"], ["button", "file-action file-revert", "button"],
+      ["button", "file-action file-note", "button"],
       ["button", "file-action file-stage", "button"],
       ["span", "file-progress", ""],
     ]);
-    const [open, revert, stage] = row.children;
+    const [open, revert, addNote, stage] = row.children;
+    assert.equal(addNote.title, 'Add File Review Note');
+    assert.equal(addNote.attributes.get('aria-label'), 'Add File Review Note');
+    addNote.click();
+    assert.deepEqual({ ...lastMessage(messages) }, { type: 'addFileNote', repoKey: '/repo', fileId: files[index].id });
     assert.equal(open.title, files[index].path);
-    const filename = open.children[0].children[1];
+    const filename = open.children[0].children[0];
     for (const child of [filename, ...open.children.slice(1)]) {
       assert.equal(child.children.length, 0, "metadata stays text-only");
     }
@@ -2437,7 +2467,7 @@ test("files without feedback render text-only stats and sibling accessible rever
       assert.equal(svg.children[0].tagName, "path");
       assert.notEqual(svg.children[0], templateSvg.children[0]);
       assert.deepEqual(svg.children[0].attributes, templateSvg.children[0].attributes);
-      if (index > 0) assert.notEqual(svg, rows[0].children[action === "revert" ? 1 : 2].children[0]);
+      if (index > 0) assert.notEqual(svg, rows[0].children[action === "revert" ? 1 : 3].children[0]);
       button.focus();
       assert.equal(document.activeElement, button);
       for (const target of [button, svg.children[0]]) {
@@ -2453,7 +2483,7 @@ test("files without feedback render text-only stats and sibling accessible rever
     assert.deepEqual({ ...lastMessage(messages) }, { type: "openFile", repoKey: "/repo", fileId: files[index].id });
   }
   const known = rows[0].children[0];
-  assert.equal(known.children[0].children[1].textContent, `${unsafe}.ts`);
+  assert.equal(known.children[0].children[0].textContent, `${unsafe}.ts`);
   assert.equal(known.children[1].textContent, "+2");
   assert.equal(known.children[1].className, "file-insertions");
   assert.equal(known.children[2].textContent, "-1");
@@ -2487,7 +2517,7 @@ test("files without feedback render text-only stats and sibling accessible rever
       button.invokeListener("click");
     }
   }
-  assert.equal(messages.length, 16);
+  assert.equal(messages.length, 19);
   update({ ...current, filesError: "File action failed" });
   assert.equal(element("files-error").textContent, "File action failed");
   assert.equal(element("files").children.length, 3);
@@ -2503,7 +2533,7 @@ test("files without feedback render text-only stats and sibling accessible rever
   assert.equal(element("files").children.length, 0);
 });
 
-for (const [buttonIndex, type] of ["openFile", "revertFile", "stageFile"].entries()) test(`keyed file rows preserve ${type} focus and reject detached or cross-folder clicks`, () => {
+for (const [buttonIndex, type] of ["openFile", "revertFile", "addFileNote", "stageFile"].entries()) test(`keyed file rows preserve ${type} focus and reject detached or cross-folder clicks`, () => {
   const { element, document, messages, update } = scriptFixture();
   const first = { id: "first", path: "src/first.ts", insertions: 1, deletions: 0 };
   const second = { id: "second", path: "src/second.ts" };
@@ -2522,7 +2552,7 @@ for (const [buttonIndex, type] of ["openFile", "revertFile", "stageFile"].entrie
   assert.deepEqual(element("files").children, [secondRow, firstRow]);
   assert.equal(document.activeElement, button);
   assert.equal(open.title, "renamed.ts");
-  assert.equal(open.children[0].children[1].textContent, "renamed.ts");
+  assert.equal(open.children[0].children[0].textContent, "renamed.ts");
   assert.equal(open.children[1].textContent, "");
   assert.equal(open.children[1].hidden, true);
   assert.equal(open.children[3].hidden, false);

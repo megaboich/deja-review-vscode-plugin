@@ -12,6 +12,8 @@ export interface Comparison {
 }
 
 export interface ReviewComment extends Resource {
+  /** File-wide feedback has no anchor; the internal line hints remain 1 and are never displayed or rewritten. */
+  wholeFile?: boolean;
   startLine: number;
   endLine: number;
   side: Side;
@@ -110,6 +112,10 @@ export function validateRange(start: number, end: number): void {
 
 export function normalizeComment(comment: ReviewComment): ReviewComment {
   validateRange(comment.startLine, comment.endLine);
+  if (comment.wholeFile && (comment.startLine !== 1 || comment.endLine !== 1
+    || comment.anchorText !== undefined || comment.elided || comment.side !== 'document' || comment.comparison)) {
+    throw new Error('Whole-file Review Notes cannot have a range, anchor or comparison');
+  }
   if (comment.elided) {
     const anchor = comment.anchorText?.split(/\r\n|\r|\n/);
     if (anchor?.length !== 16 || anchor[10] !== '...') {
