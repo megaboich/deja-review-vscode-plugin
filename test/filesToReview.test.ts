@@ -64,6 +64,8 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
   let stats: string[] = [];
   let addCalls: string[][] = [];
   let cleanCalls: string[][] = [];
+  let pathspecCalls: string[][] = [];
+  let onPathspec: () => Promise<void> = async () => {};
   let onAdd: () => Promise<void> = async () => {};
   let onClean: () => Promise<void> = async () => {};
   let documents: SourceDocument[] | undefined;
@@ -107,7 +109,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
       },
     },
   };
-  const api = { get repositories() { return repositories; }, state: 'initialized' };
+  const api = { get repositories() { return repositories; }, state: 'initialized', git: { path: '/mock/git' } };
   const mock = { Uri, EventEmitter, FileType: { File: 1, Directory: 2, SymbolicLink: 64 }, workspace,
     extensions: { getExtension: () => ({ activate: async () => ({ getAPI: () => api }) }) } };
   const moduleLoader = require('node:module') as { _load(request: string, ...args: unknown[]): unknown };
@@ -138,6 +140,14 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
   };
   t.mock.method(moduleLoader, '_load', function (this: unknown, request: string, ...args: unknown[]) {
     if (request === 'node:fs/promises') { return boundedFs; }
+    if (request === './gitPath') {
+      return {
+        async validateSingleFilePathspec(...paths: string[]): Promise<void> {
+          pathspecCalls.push(paths);
+          await onPathspec();
+        },
+      } satisfies typeof import('../src/gitPath');
+    }
     return request === 'vscode' ? mock : load.call(this, request, ...args);
   });
   const { GitResources } = require('../src/git') as typeof import('../src/git');
@@ -152,6 +162,8 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     addCalls = [];
     onAdd = async () => {};
     cleanCalls = [];
+    pathspecCalls = [];
+    onPathspec = async () => {};
     onClean = async () => {};
     documents = undefined;
     onStat = async () => {};
@@ -682,6 +694,31 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     assert.equal(enumerations, 4, 'each Git group is enumerated for capture and final membership only');
     assert.deepEqual(diffCalls, []);
     assert.deepEqual(reads, []);
+  });
+
+  await t.test('large sibling scans share in-flight directory checks but recheck later boundaries and mutations', async () => {
+    reset();
+    const changes = Array.from({ length: 400 }, (_, index) => change(`/repo/src/file-${index}.ts`, GitStatus.Modified));
+    for (const entry of changes) {
+      put(entry.uri.fsPath, 'source\n');
+    }
+    repository.state.workingTreeChanges = changes;
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+
+    assert.equal((await git.filesToReview(repo, new Set())).length, 400);
+    const parentChecks = stats.filter(target => target === '/repo/src').length;
+    const markerChecks = stats.filter(target => target === '/repo/src/.git').length;
+    assert.ok(parentChecks <= 100, `Expected at most one parent check per batch/pass, received ${parentChecks}`);
+    assert.ok(markerChecks <= 100, `Expected at most one marker check per batch/pass, received ${markerChecks}`);
+
+    markers.set('/repo/src/.git', 1);
+    await assert.rejects(git.stageFile(repo, 'src/file-0.ts', new Set(), [], () => {}), /boundary|outside/i);
+    assert.deepEqual(addCalls, []);
+    assert.deepEqual(await git.filesToReview(repo, new Set()), []);
+    markers.delete('/repo/src/.git');
+    markers.set('/repo/src', 66);
+    assert.deepEqual(await git.filesToReview(repo, new Set()), []);
   });
 
   await t.test('candidate discovery rejects unsupported leaves but keeps all Git-listed missing paths', async () => {
@@ -1755,9 +1792,78 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
   });
 
   for (const action of ['stageFile', 'revertFile'] as const) {
+    for (const root of ['/repo', '/repo/packages/app']) {
+      for (const status of [GitStatus.Modified, GitStatus.Deleted, GitStatus.Untracked]) {
+        await t.test(`${action} accepts a validated bracket route with status ${status} in ${root}`, async () => {
+          reset();
+          documents = [];
+          workspace.workspaceFolders = [{ uri: Uri.file(root) }];
+          const name = 'pages/projects/[versionId]/opportunities/page.ts';
+          const target = `${root}/${name}`;
+          if (status !== GitStatus.Deleted) {
+            put(target, 'synthetic route');
+          }
+          repository.state.workingTreeChanges = [change(target, status), change(`${root}/other.ts`, GitStatus.Modified)];
+          const repo = await git.workspaceRepository();
+          assert.ok(repo);
+
+          await git[action](repo, name, new Set(), [], () => {});
+
+          assert.deepEqual(pathspecCalls, [['/mock/git', '/repo', target]]);
+          assert.deepEqual(addCalls, action === 'stageFile' ? [[target]] : []);
+          assert.deepEqual(cleanCalls, action === 'revertFile' ? [[target]] : []);
+          assert.deepEqual(reads, []);
+        });
+      }
+    }
+
+    for (const failure of ['ambiguous', 'membership', 'folder', 'dirty', 'symlink', 'hostGuard']) {
+      if (failure === 'dirty' && action === 'stageFile') {
+        continue;
+      }
+      await t.test(`${action} rejects ${failure} during bracket path verification`, async () => {
+        reset();
+        documents = [];
+        const name = 'src/[id].ts';
+        const target = `/repo/${name}`;
+        put(target, 'synthetic route');
+        repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+        const repo = await git.workspaceRepository();
+        assert.ok(repo);
+        onPathspec = async () => {
+          switch (failure) {
+            case 'ambiguous':
+              throw new Error('Git could match other files');
+            case 'membership':
+              repository.state.workingTreeChanges = [];
+              break;
+            case 'folder':
+              workspace.workspaceFolders = [{ uri: Uri.file('/other') }];
+              break;
+            case 'dirty':
+              documents = [{ uri: file(target), isDirty: true, isClosed: false }];
+              break;
+            case 'symlink':
+              put(target, '', 64);
+              break;
+          }
+        };
+
+        await assert.rejects(git[action](repo, name, new Set(), [], () => {
+          if (failure === 'hostGuard') {
+            throw new Error('stale host action');
+          }
+        }));
+
+        assert.equal(pathspecCalls.length, 1);
+        assert.deepEqual(addCalls, []);
+        assert.deepEqual(cleanCalls, []);
+      });
+    }
+
     await t.test(`${action} refuses invalid paths, review data, archives, noted and index-only files before source stat`, async () => {
       const rejected = ['', '.', '..', '../outside.ts', '/repo/a.ts', 'C:\\repo\\a.ts', 'src//a.ts', 'a\0.ts',
-        '*', '*.ts', '?', '[ab].ts', ':/*', 'REVIEW-NOTES.md', '.REVIEW-NOTES.md.id.tmp',
+        '*', '*.ts', '?', ':/*', 'REVIEW-NOTES.md', '.REVIEW-NOTES.md.id.tmp',
         'nested/REVIEW-NOTES.md', 'nested/.REVIEW-NOTES.md.id.tmp',
         'storage/reviews/batch.json', 'src/noted.ts', 'index-only.ts', 'unchanged.ts'];
       for (const name of rejected) {

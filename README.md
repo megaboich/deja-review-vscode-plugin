@@ -63,6 +63,8 @@ The validated file list appears before addition/deletion counts finish loading. 
 
 **Stage File** stages that whole file's saved disk state without a confirmation dialog, including remaining unstaged changes or a deletion. It does not save or stage unsaved editor text. Use VS Code Source Control to stage selected hunks instead.
 
+Square-bracket paths such as `pages/projects/[versionId]/opportunities/page.ts` are supported. Before staging or reverting them, DejaReview checks that Git's filename matching selects only that file; if the brackets also match another path, the action is refused.
+
 When you stage the **first row**, DejaReview automatically opens the next remaining file after refreshed Git state confirms the staged file has disappeared. It uses the same editor/diff behavior as clicking that next row. Staging any other row or reverting does not advance. Failed staging, residual unstaged changes, and an empty remaining list do not open another file. Another dashboard action cancels a pending advance.
 
 **Revert File** asks before discarding that file's unstaged disk changes. Tracked files are restored from the staging area, **not HEAD**, leaving staged changes intact. This restores an unstaged deletion, not a staged deletion. For untracked files, confirmation warns that the file will be removed and **Git cannot recover it**. A file with unsaved editor changes cannot be reverted; the extension never saves or discards those buffers for you. Conflicts, intent-to-add, and other unsupported states are refused rather than risking staged work.

@@ -29,8 +29,6 @@ type RefreshProjection = {
   archives: ReviewArchive[];
   historyError: string | undefined;
   staleBase: boolean;
-  resources: Map<string, vscode.Uri[]>;
-  visiblePaths: Set<string>;
 };
 
 type DashboardEditorTarget =
@@ -250,7 +248,8 @@ class ReviewExtension implements vscode.Disposable {
   private statisticsWork: Promise<void> = Promise.resolve();
   private statisticsRevision = 0;
   private forceStatistics = false;
-  private statisticsSnapshot?: { revision: number; repo: Repository; candidates: RefreshProjection['files']; force: boolean };
+  private statisticsSnapshot?: { revision: number; repo: Repository; text: string | undefined; candidates: RefreshProjection['files']; force: boolean };
+  private editorsRevision = 0;
   private pendingFileAction?: { repo: Repository; file: DashboardState['files'][number]; action: 'stage' | 'revert' };
   private advanceAfterStage?: { repo: Repository; path: string };
   private advancingFile = false;
@@ -314,9 +313,13 @@ class ReviewExtension implements vscode.Disposable {
         this.lastTab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
       }),
       vscode.window.onDidChangeVisibleTextEditors(() => {
-        void this.refresh(false).catch(error => this.error(error));
+        void this.refreshEditors().catch(error => this.error(error));
       }),
-      vscode.workspace.onDidOpenTextDocument(() => this.schedule()),
+      vscode.workspace.onDidOpenTextDocument(() => {
+        if (this.entries.some(entry => !entry.comment.wholeFile)) {
+          this.schedule();
+        }
+      }),
       vscode.workspace.onDidChangeWorkspaceFolders(() => this.schedule(true)),
       vscode.workspace.onDidChangeTextDocument(event => {
         if (event.document.uri.toString() !== this.store?.uri.toString()) {
@@ -722,6 +725,9 @@ class ReviewExtension implements vscode.Disposable {
       this.refreshing = this.drainRefresh();
     }
     await this.refreshing;
+    // Opening a diff raises editor events. Those updates must not extend the
+    // completed file action by joining another whole-projection drain.
+    await this.openNextStagedFile();
   }
 
   private async drainRefresh(): Promise<void> {
@@ -730,9 +736,6 @@ class ReviewExtension implements vscode.Disposable {
       do {
         generation = this.generation;
         await this.refreshProjection();
-        if (generation === this.generation) {
-          await this.openNextStagedFile();
-        }
       } while (!this.disposed && generation !== this.generation);
     } finally {
       this.refreshing = undefined;
@@ -813,6 +816,10 @@ class ReviewExtension implements vscode.Disposable {
       return;
     }
     this.publishProjection(projection, store, repo, generation);
+    await this.refreshEditors();
+    if (!currentRequest() || store !== this.store || repo !== this.repo) {
+      return;
+    }
     await vscode.commands.executeCommand('setContext', 'dejareview.hasFeedback', !!projection.text?.trim());
     if (!currentRequest() || store !== this.store || repo !== this.repo) {
       return;
@@ -867,8 +874,6 @@ class ReviewExtension implements vscode.Disposable {
     { text, parsed }: Awaited<ReturnType<ReviewStore['load']>>,
     currentRequest: () => boolean,
   ): Promise<RefreshProjection> {
-    const visibleDocuments = vscode.window.visibleTextEditors.map(editor => editor.document);
-    const visibleUris = new Set(visibleDocuments.map(document => document.uri.toString()));
     let archives: ReviewArchive[] = [];
     let historyError: string | undefined;
     if (!text?.trim()) {
@@ -906,16 +911,45 @@ class ReviewExtension implements vscode.Disposable {
     let files: Awaited<ReturnType<GitResources['filesToReview']>> = [];
     let filesError: string | undefined;
     try {
-      files = await this.git.filesToReview(repo, new Set(parsed.comments.map(comment => comment.path)),
-        [this.context.globalStorageUri], currentRequest);
+      const snapshot = this.statisticsSnapshot;
+      if (!this.fileActionBusy && !this.filesError && snapshot?.repo === repo && snapshot.revision === this.statisticsRevision
+        && snapshot.text === text) {
+        files = snapshot.candidates;
+      } else {
+        files = await this.git.filesToReview(repo, new Set(parsed.comments.map(comment => comment.path)),
+          [this.context.globalStorageUri], currentRequest);
+      }
     } catch {
       filesError = 'Files to Review could not be refreshed. Refresh and retry.';
     }
 
+    return { text, parsed, entries, files, filesError, archives, historyError, staleBase };
+  }
+
+  private async refreshEditors(): Promise<void> {
+    const revision = ++this.editorsRevision;
+    const repo = this.repo;
+    if (!repo || this.disposed) {
+      return;
+    }
+    const entries = this.entries;
+    const files = this.files;
+    const filesGeneration = this.filesGeneration;
+    const current = (): boolean => !this.disposed && this.repo === repo && this.entries === entries
+      && this.files === files && this.filesGeneration === filesGeneration && this.editorsRevision === revision
+      && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString();
+    const visibleDocuments = vscode.window.visibleTextEditors.map(editor => editor.document);
+    const visibleUris = new Set(visibleDocuments.map(document => document.uri.toString()));
     const resources = new Map<string, vscode.Uri[]>();
     const visiblePaths = new Set<string>();
-    const documents = new Map([...vscode.workspace.textDocuments, ...visibleDocuments].map(doc => [doc.uri.toString(), doc]));
+    // Hidden documents matter only for native file-note projections, not row highlights.
+    const documents = new Map((entries.some(entry => !entry.comment.wholeFile)
+      ? [...vscode.workspace.textDocuments, ...visibleDocuments] : visibleDocuments)
+      .map(doc => [doc.uri.toString(), doc]));
     for (const doc of documents.values()) {
+      if (!current()) {
+        return;
+      }
       if (doc.isClosed || !['file', 'git'].includes(doc.uri.scheme)) {
         continue;
       }
@@ -932,11 +966,18 @@ class ReviewExtension implements vscode.Disposable {
         // Unrelated or unsupported virtual documents are not review targets.
       }
     }
-    return { text, parsed, entries, files, filesError, archives, historyError, staleBase, resources, visiblePaths };
+    if (!current()) {
+      return;
+    }
+    for (const file of files) {
+      file.visible = visiblePaths.has(file.path);
+    }
+    this.updateDashboard();
+    this.publishEditors(entries, resources, repo);
   }
 
   private publishProjection(projection: RefreshProjection, store: ReviewStore, repo: Repository, generation: number): void {
-    const { text, parsed, entries, files, filesError, archives, historyError, staleBase, resources, visiblePaths } = projection;
+    const { text, parsed, entries, files, filesError, archives, historyError, staleBase } = projection;
     this.entries = entries;
     this.publishedGeneration = generation;
     this.savedEntries = [...entries, ...parsed.generalNotes.map(comment => ({ comment, repo, snapshot: text ?? '' }))]
@@ -964,13 +1005,12 @@ class ReviewExtension implements vscode.Disposable {
           // counts. Only a new row needs a loading placeholder.
           return { ...row };
         }
-        return { path: file.path, id: file.path, statisticsPending: true };
+        return { path: file.path, id: file.path, visible: false, statisticsPending: true };
       });
-      this.statisticsSnapshot = { revision: this.statisticsRevision, repo, candidates: files, force: this.forceStatistics };
+      this.statisticsSnapshot = { revision: this.statisticsRevision, repo, text, candidates: files, force: this.forceStatistics };
     }
     const changeKinds = filesError ? undefined : fileChangeKinds(repo);
     for (const file of this.files) {
-      file.visible = visiblePaths.has(file.path);
       if (changeKinds) {
         const kind = changeKinds.get(vscode.Uri.joinPath(repo.rootUri, file.path).toString());
         if (kind) {
@@ -997,7 +1037,6 @@ class ReviewExtension implements vscode.Disposable {
       this.warnedBase = parsed.base;
       void vscode.window.showWarningMessage('Review base changed. HEAD and index review notes are marked stale; their captured feedback is preserved.');
     }
-    this.publishEditors(entries, resources, repo);
     if (!filesError && !reuseStatistics) { this.loadFileStatistics(); }
   }
 

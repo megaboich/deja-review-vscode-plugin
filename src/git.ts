@@ -3,6 +3,7 @@ import { open } from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { normalizeResource, type Resource } from './model';
+import { validateSingleFilePathspec } from './gitPath';
 
 // Values from the bundled vscode.git API, not porcelain status letters.
 const GitStatus = {
@@ -47,6 +48,7 @@ export interface Repository {
 }
 
 interface GitAPI {
+  readonly git?: { readonly path: string };
   readonly repositories: readonly Repository[];
   readonly state?: string;
   readonly onDidChangeState?: vscode.Event<string>;
@@ -330,7 +332,26 @@ export class GitResources implements vscode.Disposable {
       .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length)[0];
   }
 
-  private async withinRepository(file: vscode.Uri, repo: Repository, directory = false): Promise<boolean> {
+  private readonly pendingDirectoryStats = new Map<string, Thenable<vscode.FileStat>>();
+
+  private async directoryStat(uri: vscode.Uri): Promise<vscode.FileStat> {
+    const key = uri.toString();
+    const pending = this.pendingDirectoryStats.get(key);
+    if (pending) {
+      return pending;
+    }
+    // Share only in-flight parent/marker checks across a bounded candidate batch.
+    // Settled results are never cached: later passes and mutations check afresh.
+    const operation = vscode.workspace.fs.stat(uri);
+    this.pendingDirectoryStats.set(key, operation);
+    try {
+      return await operation;
+    } finally {
+      this.pendingDirectoryStats.delete(key);
+    }
+  }
+
+  private async withinRepository(file: vscode.Uri, repo: Repository, directory = false, shareDirectoryChecks = false): Promise<boolean> {
     const root = repo.rootUri.toString();
     const owned = (): boolean => {
       const owner = this.containingRepository(file);
@@ -347,7 +368,8 @@ export class GitResources implements vscode.Disposable {
     while (current.toString() !== root) {
       if (relative(current, repo) === undefined) { return false; }
       try {
-        const stat = await vscode.workspace.fs.stat(current);
+        const stat = shareDirectoryChecks && (directory || current.toString() !== file.toString())
+          ? await this.directoryStat(current) : await vscode.workspace.fs.stat(current);
         if (stat.type & vscode.FileType.SymbolicLink) { return false; }
         if ((directory || current.toString() !== file.toString()) && stat.type !== vscode.FileType.Directory) {
           return false;
@@ -361,7 +383,12 @@ export class GitResources implements vscode.Disposable {
       // their boundary marker metadata, never marker contents.
       if (directory || current.toString() !== file.toString()) {
         try {
-          await vscode.workspace.fs.stat(vscode.Uri.joinPath(current, '.git'));
+          const marker = vscode.Uri.joinPath(current, '.git');
+          if (shareDirectoryChecks) {
+            await this.directoryStat(marker);
+          } else {
+            await vscode.workspace.fs.stat(marker);
+          }
           return false;
         } catch (error) {
           if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'FileNotFound') {
@@ -418,13 +445,13 @@ export class GitResources implements vscode.Disposable {
     return adapter;
   }
 
-  async repositoryFor(uri?: vscode.Uri): Promise<Repository | undefined> {
+  async repositoryFor(uri?: vscode.Uri, shareDirectoryChecks = false): Promise<Repository | undefined> {
     const file = uri ? source(uri)?.file : undefined;
     const repo = await this.workspaceRepository();
     if (!uri) { return repo; }
     if (!repo || !file || relative(file, repo) === undefined) { return undefined; }
     const actual = this.containingRepository(repo.rootUri);
-    return actual && await this.withinRepository(file, actual)
+    return actual && await this.withinRepository(file, actual, false, shareDirectoryChecks)
       && vscode.workspace.workspaceFolders?.[0]?.uri.toString() === repo.rootUri.toString() ? repo : undefined;
   }
 
@@ -467,7 +494,7 @@ export class GitResources implements vscode.Disposable {
   ): Promise<boolean> {
     const current = (): boolean => isCurrent() && this.currentFileScope(repo);
     if (!current()) { return false; }
-    if (await this.repositoryFor(candidate.uri) !== repo || !current()) { return false; }
+    if (await this.repositoryFor(candidate.uri, true) !== repo || !current()) { return false; }
 
     // Recheck the leaf after walking parents: source directories and unsupported
     // leaves are not candidates, even when Git still reports a change for them.
@@ -742,7 +769,7 @@ export class GitResources implements vscode.Disposable {
       throw new Error(`${label} requires a losslessly represented filesystem path without literal backslashes.`);
     }
     const resource = normalizeResource({ path: filePath, origin: 'changed' });
-    if (/[*?\[\]]/.test(resource.path)) {
+    if (/[*?]/.test(resource.path)) {
       throw new Error(`${label} requires one literal file path, not a wildcard.`);
     }
     const uri = this.uri(resource, repo);
@@ -822,6 +849,18 @@ export class GitResources implements vscode.Disposable {
     }
     await this.validatedUri(resource, repo);
     missing = await checkFile();
+    if (/[\[\]]/.test(resource.path)) {
+      // The bundled Git API accepts filesystem paths, not escaped pathspecs.
+      // Brackets are valid filenames, but Git can also expand them to siblings.
+      const repository = this.containingRepository(uri);
+      const gitPath = this.api?.git?.path;
+      if (!repository || !gitPath) {
+        throw new Error('Cannot verify this filename with the containing Git repository. Refresh and retry.');
+      }
+      await validateSingleFilePathspec(gitPath, repository.rootUri.fsPath, uri.fsPath);
+      await this.validatedUri(resource, repo);
+      missing = await checkFile();
+    }
     // Keep the host guard, live membership checks and Git invocation in one synchronous turn.
     validate();
     const current = candidate();

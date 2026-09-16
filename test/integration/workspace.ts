@@ -72,6 +72,45 @@ export async function testWorkspaceScope(git: GitResources, root: vscode.Uri, ap
     assert.equal(await git.resource(file, repo), undefined);
     assert.throws(() => git.uri(resource, repo), /nested repository/);
   }
+
+  const routePath = 'pages/projects/[versionId]/opportunities/page.ts';
+  const gitExtension = vscode.extensions.getExtension<{
+    getAPI(version: 1): { repositories: readonly { rootUri: vscode.Uri; status(): Promise<void> }[] };
+  }>('vscode.git');
+  assert.ok(gitExtension);
+  const gitApi = (await gitExtension.activate()).getAPI(1);
+  const fixtureRepository = gitApi.repositories.find(candidate => candidate.rootUri.toString() === actual.rootUri.toString());
+  assert.ok(fixtureRepository);
+  const route = vscode.Uri.joinPath(root, routePath);
+  const unrelated = vscode.Uri.joinPath(root, 'pages/projects/unrelated.ts');
+  const indexBefore = await actual.show('', working.fsPath);
+  await fs.mkdir(path.dirname(route.fsPath), { recursive: true });
+  await fs.writeFile(route.fsPath, 'export const route = true;\n');
+  await fs.writeFile(unrelated.fsPath, 'export const unrelated = true;\n');
+  const isCandidate = (uri: vscode.Uri): boolean => [
+    ...(repo.state.workingTreeChanges ?? []),
+    ...(repo.state.untrackedChanges ?? []),
+  ].some(change => change.uri.toString() === uri.toString());
+  await fixtureRepository.status();
+  await waitFor('bracket route discovered by bundled Git', () => isCandidate(route) && isCandidate(unrelated));
+
+  await git.stageFile(repo, routePath, new Set(), [], () => {
+    assert.equal(vscode.workspace.workspaceFolders?.[0]?.uri.toString(), root.toString());
+  });
+
+  assert.equal(await actual.show('', route.fsPath), 'export const route = true;\n');
+  assert.equal(await actual.show('', working.fsPath), indexBefore, 'existing staged content is unchanged');
+  assert.ok(!repo.state.indexChanges?.some(change => change.uri.toString() === unrelated.toString()));
+  assert.equal(isCandidate(unrelated), true, 'another candidate remains unstaged');
+
+  // Remove only the disposable route fixture and stage its deletion for the next host.
+  await fs.unlink(route.fsPath);
+  await fixtureRepository.status();
+  await waitFor('bracket route deletion discovered by bundled Git', () =>
+    repo.state.workingTreeChanges?.some(change => change.uri.toString() === route.toString() && change.status === 6) ?? false);
+  await git.stageFile(repo, routePath, new Set(), [], () => {});
+  assert.ok(!repo.state.indexChanges?.some(change => change.uri.toString() === route.toString()));
+  await fs.unlink(unrelated.fsPath);
 }
 
 export async function run(): Promise<void> {

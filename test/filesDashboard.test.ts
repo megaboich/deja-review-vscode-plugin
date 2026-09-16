@@ -42,6 +42,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   const gitChanged = new EventEmitter();
   const foldersChanged = new EventEmitter();
   const documentsChanged = new EventEmitter<{ document: { uri: vscode.Uri } }>();
+  const documentOpened = new EventEmitter();
   const receive = new EventEmitter<unknown>();
   const viewDisposed = new EventEmitter();
   const visibilityChanged = new EventEmitter();
@@ -234,7 +235,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     textDocuments: [] as Array<Pick<vscode.TextDocument, 'uri' | 'isDirty' | 'isClosed' | 'getText'>>,
     onDidChangeWorkspaceFolders: foldersChanged.event,
     onDidChangeTextDocument: documentsChanged.event,
-    onDidOpenTextDocument: disposable,
+    onDidOpenTextDocument: documentOpened.event,
     onDidChangeConfiguration: disposable,
     getConfiguration: () => ({ get: (key: string, fallback: unknown) => key === 'renderSideBySide' ? sideBySide : fallback }),
     async applyEdit(edit: unknown) { edits.push(edit); return onApplyEdit(); },
@@ -1889,7 +1890,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     }
   });
 
-  await t.test('editor discovery failure clears pending stats, updates retained eyes and rejects late completion', async () => {
+  await t.test('discovery failure clears pending stats while independent visibility updates retain rows', async () => {
     const api = await reset();
     repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
     mock.window.visibleTextEditors = [visibleEditor(file('/synthetic/repo/src/a.ts'))];
@@ -1915,6 +1916,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       onCandidates = async () => {
         throw new Error('Synthetic editor-refresh candidate failure');
       };
+      await api.refresh();
 
       for (const visible of [true, false]) {
         mock.window.visibleTextEditors = visible ? [visibleEditor(file('/synthetic/repo/src/other.ts'))] : [];
@@ -1950,10 +1952,10 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         return undefined;
       };
       const beforeRetry = messages.length;
-      visibleEditorsChanged.fire();
+      await api.refresh();
       await waitForState(() => messages.length > beforeRetry);
       await statisticsPublished();
-      assert.equal(jobs, 2, 'An editor-only retry must create a new snapshot after discovery failure');
+      assert.equal(jobs, 2, 'An explicit retry must create a new snapshot after discovery failure');
       assert.equal(state().filesError, undefined);
       assert.deepEqual(paths(), ['src/a.ts', 'src/other.ts']);
       assert.ok(state().files.every(row => row.insertions === 2 && row.deletions === 1));
@@ -1969,6 +1971,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
     const first = visibleEditor(file('/synthetic/repo/src/a.ts'));
     const second = visibleEditor(file('/synthetic/repo/src/other.ts'));
+    await registeredCommand('dejareview.refresh')();
     workspace.textDocuments = [first.document, second.document];
     for (const [editors, expected] of [
       [[first], ['src/a.ts']],
@@ -1991,6 +1994,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   await t.test('visible Git revisions match validated source paths, including different-file diff panes', async () => {
     await reset();
     repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+    await registeredCommand('dejareview.refresh')();
     for (const ref of ['', 'HEAD', '~', 'b'.repeat(40)]) {
       mock.window.visibleTextEditors = [visibleEditor(Uri.from({
         scheme: 'git', path: '/synthetic/repo/src/a.ts',
@@ -2040,6 +2044,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   for (const mutation of ['move', 'close', 'folder'] as const) {
     await t.test(`visibility validation cannot publish stale eyes after ${mutation}`, async child => {
       await reset();
+      repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
+      await registeredCommand('dejareview.refresh')();
       const started = deferred();
       const release = deferred();
       const resource = GitResources.prototype.resource;
@@ -2064,6 +2070,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         ? [visibleEditor(file('/synthetic/repo/src/other.ts'))] : [];
       if (mutation === 'folder') {
         switchFolder();
+        t.mock.timers.tick(1000);
       } else {
         repository.state.workingTreeChanges = ['a', 'other'].map(name => change(`/synthetic/repo/src/${name}.ts`));
         visibleEditorsChanged.fire();
@@ -2436,6 +2443,104 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       assert.equal(navigation().length, 1, 'Advance is consumed exactly once');
     });
   }
+
+  await t.test('400-file staging unlocks the next visible row without another scan when its diff opens', async () => {
+    const api = await reset();
+    const changes = Array.from({ length: 400 }, (_, index) => {
+      const target = `/synthetic/repo/src/file-${String(index).padStart(3, '0')}.ts`;
+      sources.set(target, 'disk content\n');
+      return change(target);
+    });
+    repository.state.workingTreeChanges = changes;
+    await api.refresh();
+    await statisticsPublished();
+    const release = deferred();
+    let scans = 0;
+    let reads = 0;
+    let diffOpened = false;
+    onCandidates = async () => {
+      scans++;
+      if (diffOpened) {
+        await release.promise;
+      }
+    };
+    onRead = async () => { reads++; };
+    onAdd = async () => {
+      repository.state.workingTreeChanges = repository.state.workingTreeChanges?.slice(1);
+      gitChanged.fire();
+    };
+    onCommand = async (command, args) => {
+      if (command !== 'vscode.diff') {
+        return;
+      }
+      diffOpened = true;
+      const original = args[0];
+      const modified = args[1];
+      assert.ok(original instanceof Uri && modified instanceof Uri);
+      mock.window.visibleTextEditors = [visibleEditor(original), visibleEditor(modified)];
+      workspace.textDocuments = mock.window.visibleTextEditors.map(editor => editor.document);
+      documentOpened.fire();
+      visibleEditorsChanged.fire();
+    };
+    try {
+      receive.fire({ ...action('src/file-000.ts'), type: 'stageFile' });
+      await settle();
+      assert.equal(diffOpened, true);
+      assert.equal(state().busy, false, 'The webview action lock must finish after navigation, without another full scan');
+      assert.deepEqual(visiblePaths(), ['src/file-001.ts']);
+      assert.equal(scans, 1, 'Only the Git-confirming post-stage scan is required');
+      assert.equal(reads, 1, 'Opening the next diff must not reload saved notes');
+      const client = scriptFixture();
+      client.update(state());
+      const row = client.element('files').children[0];
+      const stage = row.children.find(child => child.title === 'Stage File');
+      assert.ok(stage);
+      assert.equal(stage.disabled, false);
+
+      receive.fire({ ...action('src/file-001.ts'), type: 'stageFile' });
+      await settle();
+      assert.deepEqual(adds, [['/synthetic/repo/src/file-000.ts'], ['/synthetic/repo/src/file-001.ts']],
+        'The next activation must reach live host validation and Git immediately');
+    } finally {
+      release.resolve();
+      await settle();
+      await statisticsFinished();
+    }
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('visibility updates bypass blocked full discovery and editor refreshes reuse candidate membership', async () => {
+    const api = await reset();
+    let scans = 0;
+    const started = deferred();
+    const release = deferred();
+    onCandidates = async () => {
+      scans++;
+      started.resolve();
+      await release.promise;
+    };
+    const refresh = api.refresh();
+    try {
+      await started.promise;
+      mock.window.visibleTextEditors = [visibleEditor(file('/synthetic/repo/src/a.ts'))];
+      visibleEditorsChanged.fire();
+      await settle();
+      assert.deepEqual(visiblePaths(), ['src/a.ts'], 'Highlights must not queue behind whole-list discovery');
+      assert.equal(scans, 1);
+    } finally {
+      release.resolve();
+      await refresh;
+    }
+    documentsChanged.fire({ document: mock.window.visibleTextEditors[0].document });
+    await automaticRefresh();
+    assert.equal(scans, 1, 'Source-buffer changes do not invalidate Git candidate membership');
+    gitChanged.fire();
+    await automaticRefresh();
+    assert.equal(scans, 2, 'Git changes must still revalidate candidates');
+    store().changed.fire();
+    await automaticRefresh();
+    assert.equal(scans, 3, 'Saved-note changes must still revalidate candidates');
+  });
 
   for (const operation of ['lower row', 'revert', 'failure', 'manual navigation'] as const) {
     await t.test(`${operation} does not trigger automatic staging navigation`, async () => {
