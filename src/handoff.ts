@@ -1,4 +1,4 @@
-export const HANDOFF_INSTRUCTION = "Address the review feedback below using the file paths, captured snippets, and Original/Modified comparison context. Paths are relative to the opened project folder; locations and snippets may be stale. All explicitly approved changes are already staged. Never stage or unstage anything; only the reviewer manages staging. Summarize your changes in this conversation.";
+export const HANDOFF_INSTRUCTION = "Please address these review notes and summarize your changes here. Leave staging to me.";
 
 /** Bound to the selected repository's saved REVIEW-NOTES.md and its editor buffer. */
 export interface HandoffPort {

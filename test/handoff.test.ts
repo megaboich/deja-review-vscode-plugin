@@ -56,7 +56,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 test("exports the exact self-contained handoff instruction", () => {
-  assert.equal(HANDOFF_INSTRUCTION, "Address the review feedback below using the file paths, captured snippets, and Original/Modified comparison context. Paths are relative to the opened project folder; locations and snippets may be stale. All explicitly approved changes are already staged. Never stage or unstage anything; only the reviewer manages staging. Summarize your changes in this conversation.");
+  assert.equal(HANDOFF_INSTRUCTION, "Please address these review notes and summarize your changes here. Leave staging to me.");
 });
 
 test("awaits clipboard and durable archive success before rereading and deleting the exact snapshot", async () => {

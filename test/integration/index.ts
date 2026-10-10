@@ -394,7 +394,7 @@ export async function run(): Promise<void> {
     });
 
     await test('malformed feedback survives refresh and valid comment mutations', async () => {
-      const malformed = '## `sample.ts`:nope\nSelected: Working tree\n\nKeep this malformed feedback.\n';
+      const malformed = '## `sample.ts`:nope (Working tree)\n\n💬 Keep this malformed feedback.\n';
       await fs.writeFile(feedback, malformed);
       await api.refresh();
       assert.equal(api.getState().comments, 0);
@@ -429,8 +429,7 @@ export async function run(): Promise<void> {
         assert.equal(api.getState().threads, 0);
         assert.equal(api.getState().hasFeedback, false);
         assert.deepEqual(api.getState().archives, [], 'Extension history must not use direct-store fixture storage');
-        const base = repo.state.HEAD!.commit!.slice(0, 12);
-        const valid = appendComment(appendComment('', captured[1].comment, base), captured[2].comment);
+        const valid = appendComment(appendComment('', captured[1].comment), captured[2].comment);
         const raw = `\uFEFFFree-form feedback\r\n\r\n${valid.replace(/\n/g, '\r\n')}\r\n## File: broken\r\n  Preserve every byte.\r\n`;
         const sources = await Promise.all([working, other].map(uri => vscode.workspace.fs.readFile(uri)));
         const indexBefore = await git.content({ path: 'sample.ts', origin: 'staged' }, repo);
@@ -466,7 +465,6 @@ export async function run(): Promise<void> {
         assert.ok(api.getState().threads >= 2);
         for (const context of captured.slice(1, 3)) { savedThread(context.uri, context.comment.body); }
         const restored = parse(await reviewStore.read() ?? '');
-        assert.equal(restored.base, base);
         assert.deepEqual(restored.comments.map(comment => comment.anchorText),
           captured.slice(1, 3).map(context => context.comment.anchorText));
 

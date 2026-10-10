@@ -677,6 +677,30 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     return { thread, note };
   };
 
+  await t.test('HEAD movement does not mark matching saved notes stale or interpret an old base preamble', async () => {
+    const api = await reset();
+    const preamble = '# Review · base aaaaaaaaaaaa\n\n';
+    let text = preamble;
+    for (const origin of ['head', 'staged'] as const) {
+      text = appendComment(text, {
+        path: 'src/a.ts', origin, side: 'document', startLine: 1, endLine: 1,
+        anchorText: 'disk content', body: `Feedback on ${origin}`,
+      });
+    }
+    store().save(text);
+    await api.refresh();
+    assert.deepEqual(state().notes.map(note => !note.general && note.stale), [false, false]);
+
+    repository.state.HEAD = { commit: 'b'.repeat(40) };
+    gitChanged.fire();
+    await automaticRefresh();
+
+    assert.deepEqual(state().notes.map(note => !note.general && note.stale), [false, false]);
+    assert.equal(api.getThreads().length, 2);
+    assert.equal(store().savedText, text);
+    assert.deepEqual(warnings, []);
+  });
+
   for (const operation of ['copy', 'restore'] as const) {
     for (const wait of ['discovery', 'initial context', 'final callback'] as const) {
       await t.test(`${operation} rejects a folder switch during ${wait} without touching either store`, async child => {
@@ -1263,7 +1287,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     assert.deepEqual(parsed.comments, []);
     assert.equal(parsed.generalNotes.length, 1);
     assert.equal(parsed.generalNotes[0].body, body);
-    assert.equal(parsed.base, 'a'.repeat(12));
+    assert.ok(store().savedText.startsWith('## General Review Note\n'));
     assert.equal(state().commentCount, 1);
     assert.equal(state().notes[0].general, true);
     assert.equal(api.getState().comments, 1);
@@ -2743,9 +2767,9 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       const client = scriptFixture();
       client.update(state());
       const row = client.element('files').children[0];
-      const buttons = row.children.filter(child => child.tagName === 'button');
+      const buttons = row.children.filter(child => child.tagName === 'BUTTON');
       assert.deepEqual(buttons.slice(1).map(button => ({
-        title: button.title, label: button.attributes.get('aria-label'), disabled: button.disabled,
+        title: button.title, label: button.getAttribute('aria-label'), disabled: button.disabled,
       })), [
         { title: 'Revert File', label: 'Revert File', disabled: false },
         { title: 'Add File Review Note', label: 'Add File Review Note', disabled: false },

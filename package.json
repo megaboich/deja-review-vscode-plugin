@@ -19,8 +19,9 @@
     "vscode.git"
   ],
   "scripts": {
-    "compile": "tsc -p .",
-    "check": "tsc -p . --noEmit",
+    "build:client": "node scripts/buildClient.mjs",
+    "compile": "npm run build:client && tsc -p .",
+    "check": "npm run build:client && tsc -p . --noEmit",
     "test": "npm run compile && node --test out/test/*.test.js",
     "test:integration": "npm run compile && node out/test/runIntegration.js",
     "vscode:prepublish": "npm run compile",
@@ -31,6 +32,9 @@
     "@types/vscode": "1.96.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.28.2",
+    "happy-dom": "^20.14.5",
+    "preact": "^10.29.8",
     "typescript": "^5.9.2"
   },
   "contributes": {

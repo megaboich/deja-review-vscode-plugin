@@ -102,7 +102,7 @@ Archive history is **hidden by default**, including after a handoff. Open **More
 
 History shows the latest **10** valid batches, newest first, with local dates, total review-note counts including general notes, and **Recover** actions. **Recover Archived Review** also remains available in the Command Palette.
 
-Recovery restores the exact saved text and its original review base into an absent or unchanged whitespace-only `REVIEW-NOTES.md`. It keeps the archive and never merges with or overwrites active feedback. Finish or cancel drafts and edits, including the dashboard editor, and resolve unsaved review-file changes first. Archives never become current notes automatically, even after a reload or when the review file is missing.
+Recovery restores the exact saved text into an absent or unchanged whitespace-only `REVIEW-NOTES.md`. It keeps the archive and never merges with or overwrites active feedback. Finish or cancel drafts and edits, including the dashboard editor, and resolve unsaved review-file changes first. Archives never become current notes automatically, even after a reload or when the review file is missing.
 
 Archives live outside the repository in VS Code's user-local extension storage and survive restarts. Each opened folder has separate history: opening a repository subfolder does not show the parent folder's archives. Existing repository-root history stays available when that root is opened. Older batches are retained even though only the latest 10 are displayed; there is no purge or archive-delete action. Counts describe the archived batch, not a fresh recount. This is local recovery storage, not conversation history or an encrypted backup; account for the retained code and feedback when managing local storage. Previously named scratch files are not scanned or migrated.
 
@@ -112,45 +112,42 @@ Archives live outside the repository in VS Code's user-local extension storage a
 - Paths through symbolic links below the containing Git root are rejected, even when the link points inside the project. On macOS/Linux, filenames containing literal backslashes are also unsupported rather than confused with directory separators. These restrictions apply to file capture, reads, and Files to Review actions.
 - Native gutter drafts cannot reliably record the moment you clicked the gutter or expose every unsubmitted draft. Prefer the shortcut to freeze context before typing. If a revision changes during capture or composition, you may need to recapture; failed validation preserves your input. Native drafts and dashboard input are transient, not reload-persistent storage.
 - Inline diffs do not reliably show Original-side native notes. Use the native **Open Side-by-Side Comparison** action when needed; normal card navigation does not change your diff layout. When both panes show the same resource, VS Code may display a note on both sides even though its saved context identifies the selected side.
-- Snippets capture whole lines: up to 20 verbatim, or the first 10 and last 5 for longer selections, with an explicit omission marker. Locations may become stale. DejaReview adjusts display positions when it can find the snippet, but does not automatically rewrite saved lines, snippets, or remove stale feedback. A changed review base makes HEAD/staging-area notes stale rather than silently rebasing them. **Rewrite Line Numbers from Anchors** is an explicit action for file notes.
+- Snippets capture whole lines: up to 20 verbatim, or the first 10 and last 5 for longer selections, with an explicit omission marker. Locations may become stale. DejaReview adjusts display positions when it can find the snippet, but does not automatically rewrite saved lines, snippets, or remove stale feedback. **Rewrite Line Numbers from Anchors** is an explicit action for file notes.
 - Settings are limited to `dejareview.decorationStyle` (`badge` or `none`, default `badge`) and `dejareview.searchRadius` (0-10000, default `50`). There is no AI integration, PR workflow, reply thread, or review-completion model.
 
 ## Optional Markdown
 
-You can hand-edit and save `REVIEW-NOTES.md`, but the panel and native composer handle this format for you. General notes have the exact heading `## General Review Note` and a body, with no file path, location, or captured snippet. File notes include their captured context:
+You can hand-edit and save `REVIEW-NOTES.md`, but the panel and native composer handle this format for you. Each note starts with a heading; 💬 marks the feedback body. File locations and revision context share one line:
 
 ````md
 ## General Review Note
 
-Add regression tests for the error-handling changes before the next pass.
+💬 Add regression tests for the error-handling changes before the next pass.
 
-## `src/client.ts`:file
-Selected: Working tree
+## `src/client.ts`:file (Working tree)
 
-Split this file into smaller modules.
+💬 Split this file into smaller modules.
 
-## `src/client.ts`:42
-Comparison: HEAD -> Staging area
-Selected: Modified (Staging area)
+## `src/client.ts`:42 (Modified: Staging area vs HEAD)
 
 ```ts
 const response = await fetch(url);
 ```
 
-Handle request failures before using the response.
+💬 Handle request failures before using the response.
 ````
 
 <details>
 <summary>Hand-editing details</summary>
 
-Paths are relative to the opened folder. File-note ranges are 1-based and inclusive in the selected revision. A regular-editor note uses `Selected: Working tree`, `Selected: Staging area`, `Selected: HEAD`, or `Selected: Commit <full-sha>` (40 or 64 hexadecimal characters). A comparison records Original then Modified endpoints and always names the selected side and its revision, as above.
+Paths are relative to the opened folder. Ranges are 1-based and inclusive in the selected revision. A regular-editor header ends with `(Working tree)`, `(Staging area)`, `(HEAD)`, or `(Commit <full-sha>)` (40 or 64 hexadecimal characters). In `(Modified: Working tree vs HEAD)`, the location and snippet belong to the Modified working-tree side; HEAD is the opposite side. `(Original: HEAD vs Working tree)` selects the Original HEAD side instead, even if both revisions happen to contain identical text.
 
-Same-file comparisons omit endpoint paths. Different-file comparisons name both, for example ``Comparison: `old.ts` (HEAD) -> `new.ts` (Working tree)`` with `Selected: Modified (Working tree)` under a `new.ts` heading. The selected endpoint must match the heading's path and selected revision. Keep file metadata directly after the heading and any captured code fence directly after `Selected:`; blank lines are allowed. General notes have none of this metadata, and code fences in their body are feedback, not anchors.
+Different-file comparisons include the opposite path: ``## `new.ts`:42 (Modified: Working tree vs `old.ts` @ HEAD)``. A captured code fence goes between the heading and 💬, allowing blank lines. General notes use the exact heading `## General Review Note` and have only a 💬 body, without file context or an anchor. The 💬 marker is saved-file formatting and does not become part of the editable feedback.
 
-Composers accept arbitrary text, including `##` headings, metadata examples, unfinished fences, and significant surrounding whitespace. When necessary, the saved body uses `Body: fenced` followed by a `markdown` backtick fence longer than any backtick run in the feedback. Editors show the original body without the wrapper; copy and archives preserve the saved representation. When hand-editing, keep wrappers intact. Outside a wrapper, use `###` for body headings and balance fences: an unfenced `##` starts another block. A broken fence can block further submissions until repaired. Empty or whitespace-only new notes cannot be submitted.
+Composers accept arbitrary text, including `##` headings, metadata examples, unfinished fences, and significant surrounding whitespace. When necessary, the saved body uses `💬 Body: fenced` followed by a `markdown` backtick fence longer than any backtick run in the feedback. A body starting with a code fence also uses this wrapper. Editors show the original body without the marker or wrapper; copy and archives preserve the saved representation. When hand-editing, keep wrappers intact. Outside a wrapper, use `###` for body headings and balance fences: an unfenced `##` starts another block. A broken fence can block further submissions until repaired. Empty or whitespace-only new notes cannot be submitted.
 
 Long file selections use `; Snippet: elided` in the heading and a bare `...` between the first 10 and last 5 snippet lines. Without that label, an ellipsis is literal code. Line-specific notes without snippets use line hints rather than a reliable match. Whole-file notes use `:file` instead of a range and cannot have a comparison or anchor. They do not create native line threads or participate in line-number rewriting.
 
-Unknown sections, malformed blocks, duplicate notes, and original formatting are preserved rather than guessed or discarded. Old compact file-context formats are not parsed or automatically migrated, but remain copyable. Edits target the selected body; they do not regenerate the whole review file.
+Unknown sections, malformed blocks, duplicate notes, and original formatting are preserved rather than guessed or discarded. Only the format above is parsed; other text remains copyable. Edits target the selected body; they do not regenerate the whole review file.
 
 </details>

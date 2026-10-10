@@ -4,7 +4,15 @@ import { promisify } from 'node:util';
 
 const execute = promisify(execFile);
 
-/** Check Git's pathspec expansion without reading source or changing the index. */
+/**
+ * Check Git's pathspec expansion without reading source or changing the index.
+ *
+ * Square brackets are valid filename characters but also pathspec wildcards, so
+ * `a[1].ts` can match siblings. The API takes filesystem paths, so escaping is not an
+ * option: instead require Git itself to resolve this path to exactly one tracked or
+ * untracked file before any single-file add/clean. This narrows but cannot eliminate
+ * the race with external filesystem changes. Literal `*`/`?` names stay unsupported.
+ */
 export async function validateSingleFilePathspec(gitPath: string, repositoryRoot: string, filePath: string): Promise<void> {
   let output: string;
   try {

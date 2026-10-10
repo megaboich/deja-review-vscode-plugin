@@ -18,16 +18,14 @@ export async function testArchives(
 ): Promise<void> {
   const archives = new ReviewArchives(storageUri, repo.rootUri);
   const store = new ReviewStore(repo, archives);
-  const base = '0123456789ab';
-  const valid = appendComment(appendComment('', { ...comment, body: 'First archived comment' }, base),
+  const valid = appendComment(appendComment('', { ...comment, body: 'First archived comment' }),
     { ...comment, body: 'Second archived comment' });
-  const snapshot = `\uFEFF${valid.replace(/\n/g, '\r\n')}\r\n## \`broken\`:nope\r\n  Keep malformed feedback verbatim.\r\n`;
+  const snapshot = `\uFEFF${valid.replace(/\n/g, '\r\n')}\r\n## \`broken\`:nope (HEAD)\r\n💬 Keep malformed feedback verbatim.\r\n`;
   const records: ReviewArchive[] = [];
   try {
     await test('durable archive metadata, exact BOM and malformed text, newest ten of twelve with older IDs retained', async () => {
       assert.deepEqual(await archives.list(), []);
-      assert.ok(snapshot.startsWith('\uFEFF# Review'));
-      assert.equal(parse(snapshot).base, base);
+      assert.ok(snapshot.startsWith('\uFEFF## `'));
       assert.equal(parse(snapshot).comments.length, 2);
       assert.ok(parse(snapshot).diagnostics.length > 0);
       for (let index = 0; index < 12; index++) {
@@ -48,7 +46,6 @@ export async function testArchives(
       for (const [index, record] of records.entries()) {
         const text = await fresh.read(record.id);
         assert.deepEqual(new TextEncoder().encode(text), new TextEncoder().encode(`${snapshot}${index}\r\n`));
-        assert.equal(parse(text).base, base);
         assert.deepEqual(parse(text).comments.map(item => item.anchorText), [comment.anchorText, comment.anchorText]);
       }
     });
@@ -74,7 +71,7 @@ export async function testArchives(
       assert.equal(await store.read(), undefined);
       assert.equal(await store.restore(id), true, 'Older IDs outside the displayed ten remain recoverable');
       assert.equal(await store.read(), expected);
-      assert.equal((await store.load()).parsed.base, base);
+      assert.equal((await store.load()).parsed.comments.length, 2);
       await vscode.workspace.fs.writeFile(store.uri, new TextEncoder().encode('Saved active feedback\r\n'));
       assert.equal(await store.restore(id), false);
       assert.equal(await store.read(), 'Saved active feedback\r\n');

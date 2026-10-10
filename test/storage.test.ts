@@ -744,8 +744,8 @@ test('failed shared listing is retryable and failed archive publication leaves e
 for (const commentCount of [0, 7]) {
   test(`stored archive count ${commentCount} remains independent of the current parsed count`, async t => {
     const f = fixture(t);
-    const text = '\uFEFF# Synthetic review\r\r## `a.ts`:1\rSelected: Working tree\r\rSynthetic feedback\r'
-      + '\r## General Review Note\r\rSynthetic general feedback\r';
+    const text = '\uFEFF# Synthetic review\r\r## `a.ts`:1 (Working tree)\r\r💬 Synthetic feedback\r'
+      + '\r## General Review Note\r\r💬 Synthetic general feedback\r';
     assert.equal(parse(text).comments.length, 1);
     assert.equal(parse(text).generalNotes.length, 1);
     const saved = await f.archives.save(text);

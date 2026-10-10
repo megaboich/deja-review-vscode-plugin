@@ -72,7 +72,6 @@ export interface ParseResult {
   comments: ParsedComment[];
   generalNotes: ParsedGeneralNote[];
   diagnostics: { line: number; message: string }[];
-  base?: string;
 }
 
 export function parsedNotes(result: ParseResult): ParsedNote[] {

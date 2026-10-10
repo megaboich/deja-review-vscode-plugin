@@ -1,4 +1,4 @@
-import { dashboardClient, isDashboardHostMessage } from "./dashboardClient";
+import { DASHBOARD_CLIENT_BUNDLE } from "./generated/dashboardClientBundle";
 
 /** Static shell only: metadata and explicit editor text arrive over postMessage, never inside script source. */
 export function renderDashboard(nonce: string, instanceKey = nonce): string {
@@ -259,7 +259,8 @@ export function renderDashboard(nonce: string, instanceKey = nonce): string {
   <template id="stage-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></svg></template>
   <template id="note-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 2h12v9H6l-4 3V2zm1 1v9l2.7-2H13V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7z"/></svg></template>
   <script nonce="${nonce}">
-    (${dashboardClient.toString()})(acquireVsCodeApi, "${instanceKey}", ${isDashboardHostMessage.toString()});
+${DASHBOARD_CLIENT_BUNDLE}
+    __dejareviewDashboard(acquireVsCodeApi, "${instanceKey}");
   </script>
 </body>
 </html>`;

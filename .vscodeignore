@@ -12,3 +12,4 @@ REVIEW-NOTES.md
 .gitignore
 package-lock.json
 *.vsix
+scripts/**
