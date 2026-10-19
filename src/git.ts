@@ -3,7 +3,7 @@ import { open } from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { normalizeResource, type Resource } from './model';
-import { validateSingleFilePathspec } from './gitPath';
+import { indexEntry, validateSingleFilePathspec } from './gitPath';
 
 // Values from the bundled vscode.git API, not porcelain status letters.
 const GitStatus = {
@@ -30,6 +30,8 @@ type StatisticsCache = {
 
 export interface Repository {
   rootUri: vscode.Uri;
+  /** Local checkout/worktree root; adapters keep rootUri scoped to the opened folder. */
+  checkoutUri?: vscode.Uri;
   state: {
     HEAD?: { commit?: string };
     indexChanges?: readonly { readonly uri: vscode.Uri; readonly status?: number }[];
@@ -149,8 +151,11 @@ async function trackedStatistics(repo: Repository, uri: vscode.Uri): Promise<Fil
   return binary ? {} : { insertions, deletions };
 }
 
+type IndexLookup = (uri: vscode.Uri) => Promise<{ mode: string; object: string } | undefined>;
+
 async function statisticsSignature(
   repo: Repository, candidate: FileReviewCandidate, stat: vscode.FileStat | undefined, isCurrent: () => boolean,
+  resolveLookup: () => IndexLookup | undefined,
 ): Promise<string | undefined> {
   // Missing metadata (including deleted files) cannot prove unchanged disk input.
   if (!stat || stat.type !== vscode.FileType.File || !Number.isFinite(stat.mtime)
@@ -160,18 +165,16 @@ async function statisticsSignature(
   const disk = [stat.type, stat.mtime, stat.size];
   if (candidate.untracked) { return JSON.stringify(['untracked', ...disk]); }
 
-  // Resolve the live adapter outside the lookup catch: repository access errors
-  // are ownership failures, not an optional statistics capability failure.
-  const getObjectDetails = repo.getObjectDetails;
-  if (!getObjectDetails || !repo.diffWithHEAD) { return undefined; }
-  let details: Awaited<ReturnType<NonNullable<Repository['getObjectDetails']>>>;
+  const lookup = resolveLookup();
+  if (!lookup || !repo.diffWithHEAD) { return undefined; }
+  let details: Awaited<ReturnType<IndexLookup>>;
   try {
-    // VS Code 1.96 getObjectDetails('') uses ls-files --stage, not HEAD.
-    details = await getObjectDetails.call(repo, '', candidate.uri.fsPath);
+    details = await lookup(candidate.uri);
   } catch {
     // An unavailable index identity only disables reuse; still request a fresh diff.
     return undefined;
   }
+  if (!details) { return undefined; }
   const { object, mode } = details;
   if (!isCurrent() || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(object)
     || !/^100(?:644|755)$/.test(mode)) {
@@ -420,6 +423,7 @@ export class GitResources implements vscode.Disposable {
       };
       adapter = {
         rootUri: folder,
+        checkoutUri: repository.rootUri,
         get state() { return actual().state; },
         show: (ref, filePath) => actual().show(ref, filePath),
         getCommit: ref => actual().getCommit(ref),
@@ -555,8 +559,6 @@ export class GitResources implements vscode.Disposable {
         if (excludedFolders.some(rootUri => relative(uri, { ...repo, rootUri }) !== undefined)) { continue; }
         try {
           if (uri.scheme !== 'file') { continue; }
-          const name = path.basename(uri.fsPath);
-          if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)) { continue; }
           const value = source(uri);
           const filePath = value && relative(value.file, repo);
           if (!filePath) { continue; }
@@ -630,7 +632,15 @@ export class GitResources implements vscode.Disposable {
         // getObjectDetails does not expose the merge stage. Nonstandard working
         // states cannot prove the index object is the diff's complete baseline.
         if (!candidate.untracked && membership.read().get(key)?.status !== GitStatus.Modified) { stat = undefined; }
-        const signature = await statisticsSignature(repo, candidate, stat, valid);
+        if (!candidate.untracked && !await this.assertSingleFilePathspec(candidate.uri).then(() => true, () => false)) {
+          // Index identity and diff would both include sibling files that the pathspec matches.
+          if (!valid()) { return; }
+          cache.entries.delete(key);
+          signatures.delete(key);
+          reused.delete(key);
+          return {};
+        }
+        const signature = await statisticsSignature(repo, candidate, stat, valid, () => this.indexLookup(repo));
         if (!valid()) { return; }
         if (!candidate.untracked && stat && Number.isFinite(stat.mtime)
           && !await this.validateFileCandidate(repo, candidate, valid)) { return; }
@@ -698,7 +708,7 @@ export class GitResources implements vscode.Disposable {
           if (!candidate.untracked && membership.read().get(key)?.status !== GitStatus.Modified) { stat = undefined; }
           const before = signatures.get(key);
           if (before) {
-            const after = await statisticsSignature(repo, candidate, stat, valid);
+            const after = await statisticsSignature(repo, candidate, stat, valid, () => this.indexLookup(repo));
             const observed = stat;
             let finalStat: vscode.FileStat | undefined;
             if (!await this.validateFileCandidate(repo, candidate, valid, value => { finalStat = value; })) { return; }
@@ -777,10 +787,8 @@ export class GitResources implements vscode.Disposable {
       if (this.disposed || vscode.workspace.workspaceFolders?.[0]?.uri.toString() !== repo.rootUri.toString()) {
         throw new Error('The opened folder has changed. Refresh Files to Review and retry.');
       }
-      const name = path.posix.basename(resource.path);
-      if (name === 'REVIEW-NOTES.md' || /^\.REVIEW-NOTES\.md\..*\.tmp$/.test(name)
-        || excludedFolders.some(rootUri => relative(uri, { ...repo, rootUri }) !== undefined)) {
-        throw new Error(`Review Notes, temporary review files and archive storage cannot be ${action === 'stage' ? 'staged' : 'reverted'}.`);
+      if (excludedFolders.some(rootUri => relative(uri, { ...repo, rootUri }) !== undefined)) {
+        throw new Error(`Extension storage cannot be ${action === 'stage' ? 'staged' : 'reverted'}.`);
       }
       if ([...notedPaths].some(value => value.replace(/\\/g, '/') === resource.path)) {
         throw new Error('This file has saved Review Notes and is no longer a Files to Review candidate.');
@@ -842,6 +850,8 @@ export class GitResources implements vscode.Disposable {
       if (current.kind !== initial.kind || (missing && !current.deleted)) {
         throw new Error('The Git candidate changed. Refresh Files to Review and retry.');
       }
+      // Refuse an ambiguous filename before asking, not only after the reviewer confirmed.
+      await this.assertSingleFilePathspec(uri);
       if (!await confirm(initial.untracked)) { return; }
       validate();
       candidate();
@@ -849,15 +859,7 @@ export class GitResources implements vscode.Disposable {
     }
     await this.validatedUri(resource, repo);
     missing = await checkFile();
-    if (/[\[\]]/.test(resource.path)) {
-      // The bundled Git API accepts filesystem paths, not escaped pathspecs.
-      // Brackets are valid filenames, but Git can also expand them to siblings.
-      const repository = this.containingRepository(uri);
-      const gitPath = this.api?.git?.path;
-      if (!repository || !gitPath) {
-        throw new Error('Cannot verify this filename with the containing Git repository. Refresh and retry.');
-      }
-      await validateSingleFilePathspec(gitPath, repository.rootUri.fsPath, uri.fsPath);
+    if (await this.assertSingleFilePathspec(uri)) {
       await this.validatedUri(resource, repo);
       missing = await checkFile();
     }
@@ -875,6 +877,40 @@ export class GitResources implements vscode.Disposable {
     const mutate = action === 'stage' ? repo.add : repo.clean;
     if (!mutate) { throw new Error(`The containing Git repository does not support ${label}. Refresh and retry.`); }
     await mutate.call(repo, [current.uri.fsPath]);
+  }
+
+  /**
+   * Resolved per use and outside any catch: a closed repository is an ownership failure,
+   * not a missing optional capability. Prefer one literal Git process per lookup.
+   */
+  private indexLookup(repo: Repository): IndexLookup | undefined {
+    const gitPath = this.api?.git?.path;
+    if (gitPath) {
+      return async uri => {
+        const owner = this.containingRepository(uri);
+        return owner ? indexEntry(gitPath, owner.rootUri.fsPath, uri.fsPath) : undefined;
+      };
+    }
+    // VS Code 1.96 getObjectDetails('') uses ls-files --stage, not HEAD.
+    const getObjectDetails = repo.getObjectDetails;
+    return getObjectDetails ? uri => getObjectDetails.call(repo, '', uri.fsPath) : undefined;
+  }
+
+  /**
+   * The bundled Git API accepts filesystem paths, not escaped pathspecs. Brackets are valid
+   * filenames, but Git can also expand them to siblings. Returns whether Git was consulted.
+   */
+  private async assertSingleFilePathspec(uri: vscode.Uri): Promise<boolean> {
+    if (!/[\[\]]/.test(uri.fsPath)) { return false; }
+    const repository = this.containingRepository(uri);
+    const gitPath = this.api?.git?.path;
+    if (!repository || !gitPath) {
+      throw new Error('Cannot verify this filename with the containing Git repository. Refresh and retry.');
+    }
+    // Git strips its own root literally; only the remainder is matched as a pathspec.
+    if (!/[\[\]]/.test(path.relative(repository.rootUri.fsPath, uri.fsPath))) { return false; }
+    await validateSingleFilePathspec(gitPath, repository.rootUri.fsPath, uri.fsPath);
+    return true;
   }
 
   uri(resource: Resource, repo: Repository): vscode.Uri {

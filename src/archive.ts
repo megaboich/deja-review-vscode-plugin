@@ -1,189 +1,70 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { parse } from './parser';
-import { assertUtf8Text } from './writer';
+import { ReviewStorage, recordsFromText, renderNotes, validateNotes, type NotesDocument, type StoredNote } from './reviewStorage';
 
 export interface ReviewArchive {
   id: string;
   createdAt: string;
-  // Historical metadata: parser evolution may change how many notes the text yields today.
   commentCount: number;
 }
 
-interface ArchiveRecord extends ReviewArchive {
-  version: 1;
-  repoUri: string;
-  text: string;
-}
+interface LastCopy extends NotesDocument, ReviewArchive {}
 
-function validateRecord(record: unknown, id: string, repoUri: string): ArchiveRecord {
-  if (!record || typeof record !== 'object' || Array.isArray(record)) {
-    throw new Error('Invalid review archive record.');
-  }
-  const value = record as Record<string, unknown>;
-  const { version, id: recordId, repoUri: recordUri, text, createdAt, commentCount } = value;
-  if (version !== 1 || recordUri !== repoUri || recordId !== id) {
-    throw new Error('Invalid review archive metadata or content.');
-  }
-  if (typeof text !== 'string' || !text.trim()) {
-    throw new Error('Invalid review archive metadata or content.');
-  }
-  if (typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))
-    || new Date(createdAt).toISOString() !== createdAt) {
-    throw new Error('Invalid review archive metadata or content.');
-  }
-  if (typeof commentCount !== 'number' || !Number.isSafeInteger(commentCount) || commentCount < 0) {
-    throw new Error('Invalid review archive metadata or content.');
-  }
-  assertUtf8Text(text);
-
-  return { version, id: recordId, repoUri: recordUri, text, createdAt, commentCount };
-}
-
+/** One recovery snapshot per local checkout, replaced only after the next copy succeeds. */
 export class ReviewArchives {
-  private readonly directory: vscode.Uri;
-  private readonly repoUri: string;
-  private metadata = new Map<string, { mtime: number; size: number; archive: ReviewArchive }>();
-  private listing: Promise<ReviewArchive[]> | undefined;
-  private generation = 0;
+  readonly storage: ReviewStorage;
+  readonly prefix: string;
 
-  constructor(storageUri: vscode.Uri, repoUri: vscode.Uri) {
-    this.repoUri = repoUri.toString();
-    const hash = createHash('sha256').update(this.repoUri).digest('hex');
-    this.directory = vscode.Uri.joinPath(storageUri, 'reviews', hash);
+  constructor(storageUri: vscode.Uri, checkoutUri: vscode.Uri, folderUri = checkoutUri) {
+    this.storage = new ReviewStorage(storageUri.fsPath, checkoutUri.fsPath);
+    const relative = path.relative(checkoutUri.fsPath, folderUri.fsPath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new Error('The review folder is outside its checkout.');
+    }
+    this.prefix = relative ? relative.split(path.sep).join('/') + '/' : '';
   }
 
-  private uri(id: string): vscode.Uri {
-    // Only canonical randomUUID IDs are accepted, never paths or encoded paths.
-    if (typeof id !== 'string' || id.length !== 36
-      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
-      throw new Error('Invalid review archive ID.');
+  private async snapshot(): Promise<LastCopy | undefined> {
+    const value = await this.storage.read('last-copy.json');
+    if (value === undefined) { return undefined; }
+    const document = validateNotes(value, this.storage.checkoutPath);
+    if (!value || typeof value !== 'object' || !('id' in value) || typeof value.id !== 'string'
+      || !/^[0-9a-f-]{36}$/.test(value.id) || !('createdAt' in value) || typeof value.createdAt !== 'string'
+      || !Number.isFinite(Date.parse(value.createdAt)) || new Date(value.createdAt).toISOString() !== value.createdAt
+      || !('commentCount' in value) || value.commentCount !== document.notes.length || !document.notes.length) {
+      throw new Error('Invalid last copied Review Notes metadata.');
     }
-    return vscode.Uri.joinPath(this.directory, `${id}.json`);
-  }
-
-  private async record(id: string, knownStat?: vscode.FileStat): Promise<ArchiveRecord> {
-    const uri = this.uri(id);
-    const stat = knownStat ?? await vscode.workspace.fs.stat(uri);
-    if (!(stat.type & vscode.FileType.File) || (stat.type & vscode.FileType.SymbolicLink)) {
-      throw new Error('Review archive is not a regular file.');
-    }
-    const bytes = await vscode.workspace.fs.readFile(uri);
-    let record: unknown;
-    try {
-      record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-    } catch {
-      throw new Error('Invalid review archive JSON or encoding.');
-    }
-    return validateRecord(record, id, this.repoUri);
+    return { ...document, id: value.id, createdAt: value.createdAt, commentCount: document.notes.length };
   }
 
   async list(): Promise<ReviewArchive[]> {
-    if (!this.listing) {
-      this.listing = (async () => {
-        let generation: number;
-        let archives: ReviewArchive[];
-        do {
-          generation = this.generation;
-          archives = await this.scan(generation);
-        } while (generation !== this.generation);
-        return archives;
-      })().finally(() => {
-        this.listing = undefined;
-      });
-    }
-    return (await this.listing).map(archive => ({ ...archive }));
+    const snapshot = await this.snapshot();
+    return snapshot ? [{ id: snapshot.id, createdAt: snapshot.createdAt, commentCount: snapshot.commentCount }] : [];
   }
 
-  private async scan(generation: number): Promise<ReviewArchive[]> {
-    let entries: [string, vscode.FileType][];
-    try {
-      entries = await vscode.workspace.fs.readDirectory(this.directory);
-    } catch (error) {
-      if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
-        if (generation === this.generation) {
-          this.metadata.clear();
-        }
-        return [];
-      }
-      throw error;
-    }
-
-    const archives: ReviewArchive[] = [];
-    const metadata: typeof this.metadata = new Map();
-    for (const [name] of entries) {
-      if (!name.endsWith('.json')) {
-        continue;
-      }
-      try {
-        const id = name.slice(0, -5);
-        const uri = this.uri(id);
-        const stat = await vscode.workspace.fs.stat(uri);
-        if (!(stat.type & vscode.FileType.File) || (stat.type & vscode.FileType.SymbolicLink)) {
-          throw new Error('Review archive is not a regular file.');
-        }
-
-        const cached = this.metadata.get(id);
-        if (cached && cached.mtime === stat.mtime && cached.size === stat.size) {
-          metadata.set(id, cached);
-          archives.push(cached.archive);
-        } else {
-          const { createdAt, commentCount } = await this.record(id, stat);
-          const archive = { id, createdAt, commentCount };
-          const after = await vscode.workspace.fs.stat(uri);
-          if (after.type === stat.type && after.mtime === stat.mtime && after.size === stat.size) {
-            metadata.set(id, { mtime: stat.mtime, size: stat.size, archive });
-          }
-          archives.push(archive);
-        }
-      } catch (error) {
-        console.warn(`Skipping invalid review archive ${name}:`, error);
-      }
-    }
-
-    if (generation === this.generation) {
-      this.metadata = metadata;
-    }
-    // Limit only the display, not retention; older IDs remain recoverable.
-    return archives.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
-      || b.id.localeCompare(a.id)).slice(0, 10);
+  /** Caller holds the checkout write lock, covering recovery publication and clearing. */
+  async saveRecords(notes: StoredNote[]): Promise<ReviewArchive> {
+    if (!notes.length) { throw new Error('Cannot save an empty recovery snapshot.'); }
+    const snapshot: LastCopy = {
+      version: 1, checkoutPath: this.storage.checkoutPath, notes,
+      id: randomUUID(), createdAt: new Date().toISOString(), commentCount: notes.length,
+    };
+    await this.storage.write('last-copy.json', snapshot);
+    return { id: snapshot.id, createdAt: snapshot.createdAt, commentCount: snapshot.commentCount };
   }
 
   async save(text: string): Promise<ReviewArchive> {
-    if (!text.trim()) {
-      throw new Error('Cannot archive empty review feedback.');
-    }
-    assertUtf8Text(text);
+    return this.storage.locked(() => this.saveRecords(recordsFromText(text, this.prefix)));
+  }
 
-    const parsed = parse(text);
-    const archive: ReviewArchive = {
-      id: randomUUID(),
-      createdAt: new Date().toISOString(),
-      commentCount: parsed.comments.length + parsed.generalNotes.length,
-    };
-    const record: ArchiveRecord = { version: 1, repoUri: this.repoUri, ...archive, text };
-    const destination = this.uri(archive.id);
-    const temporary = vscode.Uri.joinPath(this.directory, `${archive.id}.${randomUUID()}.tmp`);
-
-    await vscode.workspace.fs.createDirectory(this.directory);
-    try {
-      await vscode.workspace.fs.writeFile(temporary, new TextEncoder().encode(JSON.stringify(record)));
-      await vscode.workspace.fs.rename(temporary, destination, { overwrite: false });
-      this.generation++;
-    } catch (error) {
-      try {
-        await vscode.workspace.fs.delete(temporary, { recursive: false, useTrash: false });
-      } catch (cleanupError) {
-        if (!(cleanupError instanceof vscode.FileSystemError && cleanupError.code === 'FileNotFound')) {
-          console.warn('Could not remove temporary review archive:', cleanupError);
-        }
-      }
-      throw error;
-    }
-    return archive;
+  async records(id: string): Promise<StoredNote[]> {
+    const snapshot = await this.snapshot();
+    if (!snapshot || snapshot.id !== id) { throw new Error('The last copied Review Notes changed. Refresh and retry.'); }
+    return snapshot.notes;
   }
 
   async read(id: string): Promise<string> {
-    return (await this.record(id)).text;
+    return renderNotes(await this.records(id), this.prefix);
   }
 }

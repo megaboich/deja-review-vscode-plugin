@@ -141,7 +141,11 @@ export function dashboardClient(
   let renderedFiles: readonly File[] = [];
   const fileNodes = new Map<string, HTMLLIElement>();
   const fileNodeRefs = new Map<string, (node: HTMLLIElement | null) => void>();
-  /** Records each row's element for exit measurement; identities are stable across renders. */
+  /**
+   * Records each row's element for exit measurement; identities are stable across renders.
+   * Keyed by id, not folder: when a folder switch replaces a same-id row, Preact detaches the
+   * old row's ref before attaching the new one, so the map ends at the new node.
+   */
   function fileNodeRef(id: string): (node: HTMLLIElement | null) => void {
     let ref = fileNodeRefs.get(id);
     if (!ref) {
@@ -217,7 +221,7 @@ export function dashboardClient(
   }
 
   function countLabel(count: number): string {
-    return count + (count === 1 ? ' review note' : ' review notes');
+    return count + (count === 1 ? ' Review Note' : ' Review Notes');
   }
 
   /**
@@ -304,7 +308,7 @@ export function dashboardClient(
       closeMenu();
       more.focus();
       if (state.hasFeedback) {
-        byId('archive-unavailable').textContent = 'Recent Archives are available when there are no current saved Review Notes. Finish your review, then use Copy Review Notes & Clear to view or recover an earlier batch.';
+        byId('archive-unavailable').textContent = 'Restore Last Copied Review Notes is available when there are no current Review Notes in this checkout. Finish your review, then use Copy Review Notes & Clear.';
         byId('archive-unavailable').hidden = false;
         return;
       }
@@ -702,9 +706,9 @@ export function dashboardClient(
         <button
           type="button"
           disabled={blocked || !current.historyVisible || current.hasFeedback || !current.repoKey}
-          aria-label={'Recover ' + count + ' from ' + label}
+          aria-label={'Restore ' + count + ' from ' + label}
           onClick={(event) => restoreArchive(archive, repoKey, event.currentTarget)}
-        >Recover</button>
+        >Restore</button>
       </li>
     );
   }
@@ -849,7 +853,7 @@ export function dashboardClient(
   function renderFeedbackStatus(current: DashboardState): void {
     byId('empty').hidden = current.hasFeedback;
     byId('empty').textContent = current.repoKey
-      ? 'No current review notes. Add a general review note or a review note in the editor.'
+      ? 'No current Review Notes. Add a general Review Note or a Review Note in the editor.'
       : 'Open a local project folder in VS Code to start reviewing.';
     byId('error').textContent = current.error || '';
     byId('error').hidden = !current.error;

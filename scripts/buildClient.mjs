@@ -23,9 +23,9 @@ const result = await build({
 const [output] = result.outputFiles;
 const code = output.text.trimEnd();
 
-// The bundle is inlined between <script> tags; a literal closing tag would end the element.
-if (/<\/script/i.test(code)) {
-  throw new Error('Bundled dashboard client contains a literal </script sequence');
+// The bundle is inlined between <script> tags; these sequences could end or re-mode the element.
+if (/<\/script|<!--|<script/i.test(code)) {
+  throw new Error('Bundled dashboard client contains a literal </script, <!-- or <script sequence');
 }
 
 const contents = [

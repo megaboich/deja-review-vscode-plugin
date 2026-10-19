@@ -146,6 +146,12 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
           pathspecCalls.push(paths);
           await onPathspec();
         },
+        // Delegates to the synthetic index so lookups keep the per-candidate fixtures and race hooks.
+        async indexEntry(_gitPath: string, _root: string, filePath: string) {
+          const getObjectDetails = repository.getObjectDetails;
+          if (!getObjectDetails) { throw new Error('synthetic index unavailable'); }
+          return getObjectDetails.call(repository, '', filePath);
+        },
       } satisfies typeof import('../src/gitPath');
     }
     return request === 'vscode' ? mock : load.call(this, request, ...args);
@@ -1306,18 +1312,16 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     });
   }
 
-  await t.test('excludes review filenames and temporary siblings anywhere, not metadata-like source names', async () => {
+  await t.test('includes ordinary project files with former review-storage names', async () => {
     reset();
-    const excluded = ['REVIEW-NOTES.md', '.REVIEW-NOTES.md.id.tmp',
-      'nested/REVIEW-NOTES.md', 'nested/.REVIEW-NOTES.md.any.part.tmp'];
-    const allowed = ['REVIEW-NOTES.md.ts', 'other.md', 'nested/other.md', '.REVIEW-NOTES.md.id.tmp.ts',
+    const allowed = ['REVIEW-NOTES.md', '.REVIEW-NOTES.md.id.tmp',
+      'nested/REVIEW-NOTES.md', 'nested/.REVIEW-NOTES.md.any.part.tmp',
+      'REVIEW-NOTES.md.ts', 'other.md', 'nested/other.md', '.REVIEW-NOTES.md.id.tmp.ts',
       'Comparison: Original -> Modified.ts', 'Selected: HEAD.ts', '+++.ts', '---.ts', 'space name.ts'];
-    repository.state.workingTreeChanges = [...excluded, ...allowed].map(name => change(`/repo/${name}`));
-    repository.state.untrackedChanges = excluded.map(name => change(`/repo/${name}`, GitStatus.Untracked));
+    repository.state.workingTreeChanges = allowed.map(name => change(`/repo/${name}`));
     assert.deepEqual((await list()).map(row => row.path), [...allowed].sort());
     assert.deepEqual([...diffCalls].sort(), allowed.map(name => `/repo/${name}`).sort());
     assert.deepEqual(reads, []);
-    assert.ok(stats.every(target => !excluded.some(name => target === `/repo/${name}`)), 'no review data is statted or read');
   });
 
   await t.test('subfolder adapters exclude outside, nested, undiscovered, and submodule resources before statistics', async () => {
@@ -1791,7 +1795,60 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
     }
   });
 
+  for (const ambiguous of [false, true]) {
+    await t.test(`statistics ${ambiguous ? 'omit counts for' : 'count'} a bracket route Git ${ambiguous ? 'could expand' : 'resolves to one file'}`, async () => {
+      reset();
+      const target = '/repo/src/[id].ts';
+      repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+      if (ambiguous) {
+        onPathspec = async () => { throw new Error('Git could match other files'); };
+      }
+
+      assert.deepEqual(await list(), [ambiguous
+        ? { path: 'src/[id].ts' }
+        : { path: 'src/[id].ts', insertions: 2, deletions: 1 }]);
+      assert.deepEqual(diffCalls, ambiguous ? [] : [target]);
+      assert.ok(pathspecCalls.length > 0);
+      assert.ok(pathspecCalls.every(call => call.join('\0') === ['/mock/git', '/repo', target].join('\0')));
+    });
+  }
+
+  await t.test('revertFile refuses an ambiguous bracket route before asking for confirmation', async () => {
+    reset();
+    documents = [];
+    const target = '/repo/src/[id].ts';
+    put(target, 'synthetic route');
+    repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+    const repo = await git.workspaceRepository();
+    assert.ok(repo);
+    onPathspec = async () => { throw new Error('Git could match other files'); };
+    let asked = false;
+
+    await assert.rejects(git.revertFile(repo, 'src/[id].ts', new Set(), [], () => {}, async () => {
+      asked = true;
+      return true;
+    }), /Git could match other files/);
+
+    assert.equal(asked, false);
+    assert.deepEqual(cleanCalls, []);
+  });
+
   for (const action of ['stageFile', 'revertFile'] as const) {
+    await t.test(`${action} accepts ordinary project files with former review-storage names`, async () => {
+      for (const name of ['REVIEW-NOTES.md', '.REVIEW-NOTES.md.id.tmp',
+        'nested/REVIEW-NOTES.md', 'nested/.REVIEW-NOTES.md.id.tmp']) {
+        reset();
+        documents = [];
+        const target = `/repo/${name}`;
+        put(target, 'Synthetic project file');
+        repository.state.workingTreeChanges = [change(target, GitStatus.Modified)];
+        const repo = await git.workspaceRepository();
+        assert.ok(repo);
+        await git[action](repo, name, new Set(), [], () => {}, async () => true);
+        assert.deepEqual(addCalls, action === 'stageFile' ? [[target]] : []);
+        assert.deepEqual(cleanCalls, action === 'revertFile' ? [[target]] : []);
+      }
+    });
     for (const root of ['/repo', '/repo/packages/app']) {
       for (const status of [GitStatus.Modified, GitStatus.Deleted, GitStatus.Untracked]) {
         await t.test(`${action} accepts a validated bracket route with status ${status} in ${root}`, async () => {
@@ -1861,10 +1918,9 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
       });
     }
 
-    await t.test(`${action} refuses invalid paths, review data, archives, noted and index-only files before source stat`, async () => {
+    await t.test(`${action} refuses invalid paths, extension storage, noted and index-only files before source stat`, async () => {
       const rejected = ['', '.', '..', '../outside.ts', '/repo/a.ts', 'C:\\repo\\a.ts', 'src//a.ts', 'a\0.ts',
-        '*', '*.ts', '?', ':/*', 'REVIEW-NOTES.md', '.REVIEW-NOTES.md.id.tmp',
-        'nested/REVIEW-NOTES.md', 'nested/.REVIEW-NOTES.md.id.tmp',
+        '*', '*.ts', '?', ':/*',
         'storage/reviews/batch.json', 'src/noted.ts', 'index-only.ts', 'unchanged.ts'];
       for (const name of rejected) {
         reset();
@@ -1877,7 +1933,7 @@ test('files to review with a synthetic in-memory VS Code host', async t => {
         assert.ok(adapter);
         stats = [];
         await assert.rejects(git[action](adapter, name, new Set(['src\\noted.ts']), [file('/repo/storage')],
-          () => assert.fail('excluded candidates must not reach the host guard')), /path|wildcard|Review Notes|archive|unstaged/i);
+          () => assert.fail('excluded candidates must not reach the host guard')), /path|wildcard|Review Notes|storage|unstaged/i);
         assert.deepEqual(addCalls, [], name);
         assert.deepEqual(cleanCalls, [], name);
         assert.deepEqual(stats, [], name);

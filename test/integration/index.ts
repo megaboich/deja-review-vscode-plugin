@@ -19,7 +19,7 @@ import { testWorkspaceScope } from './workspace';
 // Activation must expose live snapshots; CommentController has no public threads property.
 export interface ReviewTestAPI {
   refresh(): Promise<void>;
-  getState(): { repo?: string; comments: number; threads: number; hasFeedback: boolean; archives: ReviewArchive[] };
+  getState(): { repo?: string; storagePath?: string; comments: number; threads: number; hasFeedback: boolean; archives: ReviewArchive[] };
   getDrafts(): readonly vscode.CommentThread[];
   getThreads(): readonly vscode.CommentThread[];
 }
@@ -104,10 +104,18 @@ export async function run(): Promise<void> {
     const repo = await git.repositoryFor(vscode.Uri.file(path.join(root, 'sample.ts')));
     assert.ok(repo);
     assert.equal(repo.rootUri.fsPath, root);
-    const storageUri = vscode.Uri.joinPath(repo.rootUri, '.test-archive-storage');
-    store = new ReviewStore(repo, new ReviewArchives(storageUri, repo.rootUri));
+    await api.refresh();
+    const storagePath = api.getState().storagePath;
+    assert.ok(storagePath);
+    const storageUri = vscode.Uri.file(path.dirname(path.dirname(path.dirname(storagePath))));
+    store = new ReviewStore(repo, new ReviewArchives(storageUri, repo.checkoutUri ?? repo.rootUri, repo.rootUri));
     const reviewStore = store;
     const feedback = reviewStore.uri.fsPath;
+    assert.equal(feedback, storagePath);
+    // Test helpers operate on the projection, while the actual file is validated JSON.
+    const readFeedback = async (): Promise<string> => await reviewStore.read() ?? '';
+    const writeFeedback = async (text: string): Promise<void> => { await reviewStore.mutate(() => text); };
+    const clearFeedback = async (): Promise<void> => { await writeFeedback(''); };
     const range = new vscode.Range(0, 0, 1, 0);
     const head = git.uri({ path: 'sample.ts', origin: 'head' }, repo);
     const staged = git.uri({ path: 'sample.ts', origin: 'staged' }, repo);
@@ -216,10 +224,16 @@ export async function run(): Promise<void> {
         assert.ok(draft, 'addComment(uri, range) must expose its new draft via getDrafts()');
         assert.equal(draft.uri.toString(), context.uri.toString());
         context.comment.body = `Integration feedback ${index}`;
-        await vscode.commands.executeCommand('dejareview.submitComment', { thread: draft, text: context.comment.body });
+        // The bundled Git extension can publish a status event during mutable-revision
+        // validation. A refused save intentionally retains the draft; retry that same
+        // draft, never create another one or relax production capture validation.
+        for (let attempt = 0; attempt < 3 && api.getDrafts().includes(draft); attempt++) {
+          await vscode.commands.executeCommand('dejareview.submitComment', { thread: draft, text: context.comment.body });
+          if (api.getDrafts().includes(draft)) { await new Promise(resolve => setTimeout(resolve, 150)); }
+        }
         await api.refresh();
         assert.equal(api.getDrafts().length, 0);
-        const parsed = parse(await fs.readFile(feedback, 'utf8'));
+        const parsed = parse(await readFeedback());
         assert.deepEqual(parsed.diagnostics, []);
         assert.equal(parsed.comments.length, index + 1);
         const saved = parsed.comments[index];
@@ -233,7 +247,7 @@ export async function run(): Promise<void> {
     });
 
     await test('restore persisted threads after closing and reopening editors', async () => {
-      const before = await fs.readFile(feedback, 'utf8');
+      const before = await readFeedback();
       await vscode.commands.executeCommand('workbench.action.closeAllEditors');
       await api.refresh();
       for (const context of captured) {
@@ -246,13 +260,28 @@ export async function run(): Promise<void> {
         savedThread(context.uri, context.comment.body);
       }
       assert.equal(api.getState().comments, captured.length);
-      assert.equal(await fs.readFile(feedback, 'utf8'), before, 'Display restoration must not rewrite feedback');
+      assert.equal(await readFeedback(), before, 'Display restoration must not rewrite feedback');
+    });
+
+    await test('go to code selects every captured line so a recapture keeps the range', async () => {
+      await openDocument(working);
+      await api.refresh();
+      const note = savedThread(working, captured[0].comment.body).comments[0];
+      assert.ok('entry' in note);
+      await vscode.commands.executeCommand('dejareview.gotoCode', note.entry);
+      const editor = vscode.window.activeTextEditor;
+      assert.ok(editor);
+      assert.equal(editor.document.uri.toString(), working.toString());
+      const { startLine, endLine } = captured[0].comment;
+      assert.equal(editor.selection.start.line, startLine - 1);
+      assert.equal(editor.selection.start.character, 0);
+      assert.ok(editor.selection.end.isEqual(editor.document.lineAt(endLine - 1).rangeIncludingLineBreak.end));
     });
 
     await test('open saved comparisons side by side through live thread commands', async () => {
       const configuration = vscode.workspace.getConfiguration('diffEditor');
       const previous = configuration.inspect<boolean>('renderSideBySide')?.workspaceValue;
-      const before = await fs.readFile(feedback, 'utf8');
+      const before = await readFeedback();
       const comparisons = parse(before).comments.filter(comment => comment.side === 'right' && comment.comparison);
       assert.equal(comparisons.length, 2, 'Exercise the saved Git and file/file comparisons');
       assert.ok((await vscode.commands.getCommands()).includes('toggle.diff.renderSideBySide'));
@@ -277,7 +306,7 @@ export async function run(): Promise<void> {
           assert.equal(input.modified.toString(), modified.toString());
           assert.equal(vscode.workspace.getConfiguration('diffEditor').get('renderSideBySide'), true);
         }
-        assert.equal(await fs.readFile(feedback, 'utf8'), before, 'Opening comparisons must not rewrite feedback');
+        assert.equal(await readFeedback(), before, 'Opening comparisons must not rewrite feedback');
       } finally {
         await configuration.update('renderSideBySide', previous, vscode.ConfigurationTarget.Workspace);
         assert.equal(vscode.workspace.getConfiguration('diffEditor').inspect<boolean>('renderSideBySide')?.workspaceValue, previous);
@@ -287,7 +316,7 @@ export async function run(): Promise<void> {
     await test('saving an unchanged editor comment returns to preview without rewriting feedback', async () => {
       await openDocument(working);
       await api.refresh();
-      const before = await fs.readFile(feedback, 'utf8');
+      const before = await readFeedback();
       const thread = savedThread(working, captured[0].comment.body);
       const comment = thread.comments[0];
       await vscode.commands.executeCommand('dejareview.editComment', comment);
@@ -296,7 +325,7 @@ export async function run(): Promise<void> {
       assert.equal(comment.mode, vscode.CommentMode.Preview);
       assert.equal(comment.contextValue, 'saved');
       assert.equal(savedThread(working, captured[0].comment.body).comments[0].mode, vscode.CommentMode.Preview);
-      assert.equal(await fs.readFile(feedback, 'utf8'), before);
+      assert.equal(await readFeedback(), before);
     });
 
     await test('edit, save, and delete a displayed comment through commands', async () => {
@@ -310,14 +339,14 @@ export async function run(): Promise<void> {
       comment.body = 'Edited integration feedback';
       await vscode.commands.executeCommand('dejareview.saveComment', comment);
       await api.refresh();
-      let parsed = parse(await fs.readFile(feedback, 'utf8'));
+      let parsed = parse(await readFeedback());
       assert.equal(parsed.comments[0].body, 'Edited integration feedback');
       assert.equal(parsed.comments[0].anchorText, captured[0].comment.anchorText);
       const updated = savedThread(working, 'Edited integration feedback').comments.find(item =>
         (typeof item.body === 'string' ? item.body : item.body.value).includes('Edited integration feedback'))!;
       await vscode.commands.executeCommand('dejareview.deleteComment', updated);
       await api.refresh();
-      parsed = parse(await fs.readFile(feedback, 'utf8'));
+      parsed = parse(await readFeedback());
       assert.deepEqual(parsed.diagnostics, []);
       assert.equal(parsed.comments.length, captured.length - 1);
       assert.ok(parsed.comments.every(item => item.body !== 'Edited integration feedback'));
@@ -333,7 +362,7 @@ export async function run(): Promise<void> {
       assert.equal(parsed.comments.length, 2);
       assert.equal(parsed.comments[0].rawBlock, parsed.comments[1].rawBlock,
         'The regression requires byte-identical blocks, not just identical bodies');
-      await fs.writeFile(feedback, text);
+      await writeFeedback(text);
       await api.refresh();
       assert.equal(api.getState().comments, 2);
       const comment = savedThread(working, duplicate.body).comments[0];
@@ -343,15 +372,15 @@ export async function run(): Promise<void> {
         const survivor = deleteComment(text, parsed.comments[0]);
         assert.equal(parse(survivor).comments.length, 1);
         assert.equal(parse(survivor).comments[0].rawBlock, parsed.comments[1].rawBlock);
-        await fs.writeFile(feedback, survivor);
+        await writeFeedback(survivor);
         await api.refresh();
         assert.equal(api.getState().comments, 1);
         assert.ok(api.getThreads().some(thread => thread.comments.includes(comment)), 'Keep the stale editor input alive');
         comment.body = 'Should not apply';
         // The command catches the stale-action error and must not await its nonmodal notification.
         await within('stale save command', () => vscode.commands.executeCommand('dejareview.saveComment', comment), 5_000);
-        assert.equal(await fs.readFile(feedback, 'utf8'), survivor);
-        assert.equal(parse(await fs.readFile(feedback, 'utf8')).comments[0].body, duplicate.body);
+        assert.equal(await readFeedback(), survivor);
+        assert.equal(parse(await readFeedback()).comments[0].body, duplicate.body);
         assert.equal(comment.body, 'Should not apply');
         assert.equal(comment.mode, vscode.CommentMode.Editing);
         assert.ok(api.getThreads().some(thread => thread.comments.includes(comment)));
@@ -368,23 +397,23 @@ export async function run(): Promise<void> {
       const displayed = (body: string): boolean => api.getThreads().some(thread => thread.uri.toString() === working.toString()
         && thread.comments.some(comment => (typeof comment.body === 'string' ? comment.body : comment.body.value) === body));
       try {
-        await fs.unlink(feedback);
+        await clearFeedback();
         await waitFor('initial deletion watcher event and cleared threads', () => changes > 0
           && api.getState().comments === 0 && api.getThreads().length === 0);
         const external = appendComment('', { ...captured[0].comment, body: 'External feedback' });
         let before = changes;
-        await fs.writeFile(feedback, external);
+        await writeFeedback(external);
         await waitFor('creation watcher event and displayed feedback', () => changes > before
           && api.getState().comments === 1 && displayed('External feedback'));
         savedThread(working, 'External feedback');
         const edited = editComment(external, parse(external).comments[0], 'Externally edited feedback');
         before = changes;
-        await fs.writeFile(feedback, edited);
+        await writeFeedback(edited);
         await waitFor('edit watcher event and updated feedback', () => changes > before && displayed('Externally edited feedback'));
         savedThread(working, 'Externally edited feedback');
-        assert.equal(await fs.readFile(feedback, 'utf8'), edited);
+        assert.equal(await readFeedback(), edited);
         before = changes;
-        await fs.unlink(feedback);
+        await clearFeedback();
         await waitFor('deletion watcher event and cleared threads', () => changes > before
           && api.getState().comments === 0 && api.getState().threads === 0 && api.getThreads().length === 0);
         assert.equal(await reviewStore.read(), undefined);
@@ -393,53 +422,47 @@ export async function run(): Promise<void> {
       }
     });
 
-    await test('malformed feedback survives refresh and valid comment mutations', async () => {
-      const malformed = '## `sample.ts`:nope (Working tree)\n\n💬 Keep this malformed feedback.\n';
-      await fs.writeFile(feedback, malformed);
-      await api.refresh();
-      assert.equal(api.getState().comments, 0);
-      assert.equal(api.getState().threads, 0);
-      const loaded = await reviewStore.load();
-      assert.equal(loaded.text, malformed);
-      assert.ok(loaded.parsed.diagnostics.length > 0);
-      assert.equal(await reviewStore.mutate(text => appendComment(text, captured[0].comment)), true);
-      await api.refresh();
-      const text = await fs.readFile(feedback, 'utf8');
-      assert.ok(text.startsWith(malformed));
-      assert.equal(parse(text).comments.length, 1);
-      assert.ok(parse(text).diagnostics.length > 0);
-      savedThread(working, captured[0].comment.body);
+    await test('central storage is structured JSON and never creates project notes files', async () => {
+      await writeFeedback(appendComment('', captured[0].comment));
+      const value: unknown = JSON.parse(await fs.readFile(feedback, 'utf8'));
+      assert.ok(value && typeof value === 'object' && 'notes' in value && Array.isArray(value.notes));
+      await assert.rejects(fs.stat(path.join(root, 'REVIEW-NOTES.md')), { code: 'ENOENT' });
     });
 
     // Handoff's modal save/discard choices remain covered by pure tests, not UI automation.
     await test('real clipboard handoff through ReviewStore and the copy command', async () => {
       const previousClipboard = await vscode.env.clipboard.readText();
       try {
-        const snapshot = await fs.readFile(feedback, 'utf8');
+        const snapshot = await readFeedback();
         const result = await reviewStore.handoff();
         assert.equal(result.status, 'copied');
         assert.equal(result.clipboardCopied, true);
-        assert.equal(await vscode.env.clipboard.readText(), `${HANDOFF_INSTRUCTION}\n\n${snapshot}`);
+        const exported = await reviewStore.archives.storage.notes();
+        assert.equal(exported.notes.length, 0);
+        assert.ok((await vscode.env.clipboard.readText()).startsWith(HANDOFF_INSTRUCTION));
         assert.equal(await reviewStore.read(), undefined);
         const directArchive = (await reviewStore.archives.list())[0];
         assert.ok(directArchive);
         assert.equal(directArchive.commentCount, parse(snapshot).comments.length);
-        assert.equal(await new ReviewArchives(storageUri, repo.rootUri).read(directArchive.id), snapshot);
+        assert.equal(await reviewStore.archives.read(directArchive.id), snapshot);
         await api.refresh();
         assert.equal(api.getState().threads, 0);
         assert.equal(api.getState().hasFeedback, false);
-        assert.deepEqual(api.getState().archives, [], 'Extension history must not use direct-store fixture storage');
+        assert.equal(api.getState().archives[0].id, directArchive.id, 'All windows share the checkout recovery record');
         const valid = appendComment(appendComment('', captured[1].comment), captured[2].comment);
-        const raw = `\uFEFFFree-form feedback\r\n\r\n${valid.replace(/\n/g, '\r\n')}\r\n## File: broken\r\n  Preserve every byte.\r\n`;
+        const raw = valid;
         const sources = await Promise.all([working, other].map(uri => vscode.workspace.fs.readFile(uri)));
         const indexBefore = await git.content({ path: 'sample.ts', origin: 'staged' }, repo);
-        await fs.writeFile(feedback, raw);
+        await writeFeedback(raw);
         await api.refresh();
         assert.equal(api.getState().hasFeedback, true);
         // Success notifications must be fire-and-forget, not awaited by this command.
         await within('copyForAgent command (must not await a notification)', () =>
           vscode.commands.executeCommand('dejareview.copyForAgent'), 10_000);
-        assert.equal(await vscode.env.clipboard.readText(), `${HANDOFF_INSTRUCTION}\n\n${raw}`);
+        const clipboard = await vscode.env.clipboard.readText();
+        assert.ok(clipboard.startsWith(HANDOFF_INSTRUCTION));
+        assert.equal(parse(clipboard).comments.length, 2);
+        if (repo.checkoutUri?.fsPath !== root) { assert.match(clipboard, /project\/sample\.ts/); }
         assert.equal(await reviewStore.read(), undefined);
         await api.refresh();
         assert.equal(api.getState().comments, 0);
@@ -458,7 +481,7 @@ export async function run(): Promise<void> {
         await within('restore archive command', () =>
           vscode.commands.executeCommand('dejareview.restoreArchive', archive.id, repoKey), 5_000);
         assert.equal(await reviewStore.read(), raw);
-        assert.deepEqual(await fs.readFile(feedback), Buffer.from(raw));
+        assert.equal(await readFeedback(), raw);
         await api.refresh();
         assert.equal(api.getState().hasFeedback, true);
         assert.equal(api.getState().comments, 2);
@@ -469,7 +492,7 @@ export async function run(): Promise<void> {
           captured.slice(1, 3).map(context => context.comment.anchorText));
 
         const active = appendComment('', { ...captured[0].comment, body: 'New active feedback must survive recovery' });
-        await fs.writeFile(feedback, active);
+        await writeFeedback(active);
         await api.refresh();
         // Rejections are reported as fire-and-forget notifications, not rejected command promises.
         await within('restore blocked by current feedback (must not await notification)', () =>
@@ -480,7 +503,7 @@ export async function run(): Promise<void> {
         assert.equal(await reviewStore.read(), active);
         savedThread(working, 'New active feedback must survive recovery');
 
-        await fs.unlink(feedback);
+        await clearFeedback();
         await api.refresh();
         assert.deepEqual(api.getState().archives.find(item => item.id === archive.id), archive,
           'Recovery must retain the original archive metadata');
@@ -489,7 +512,7 @@ export async function run(): Promise<void> {
         assert.equal(await reviewStore.read(), raw, 'The archived record must remain readable after recovery');
         assert.deepEqual(await Promise.all([working, other].map(uri => vscode.workspace.fs.readFile(uri))), sources);
         assert.equal(await git.content({ path: 'sample.ts', origin: 'staged' }, repo), indexBefore);
-        await fs.unlink(feedback);
+        await clearFeedback();
         await api.refresh();
       } finally {
         await vscode.env.clipboard.writeText(previousClipboard);
@@ -505,14 +528,14 @@ export async function run(): Promise<void> {
       const previousFeedback = await reviewStore.read();
       const comment = { ...captured[0].comment, body: 'Reanchor moved working buffer' };
       try {
-        await fs.writeFile(feedback, appendComment('', comment));
+        await writeFeedback(appendComment('', comment));
         await api.refresh();
         savedThread(working, comment.body);
         assert.ok(await editor.edit(edit => edit.insert(new vscode.Position(0, 0), '// Inserted in unsaved buffer\n\n')));
         assert.equal(editor.document.isDirty, true);
         assert.equal(await fs.readFile(working.fsPath, 'utf8'), original, 'The anchor must move only in the live buffer');
         await vscode.commands.executeCommand('dejareview.reanchorAll');
-        const parsed = parse(await fs.readFile(feedback, 'utf8'));
+        const parsed = parse(await readFeedback());
         assert.deepEqual(parsed.diagnostics, []);
         assert.equal(parsed.comments.length, 1);
         assert.equal(parsed.comments[0].startLine, 3);
@@ -529,8 +552,7 @@ export async function run(): Promise<void> {
           editor.document.positionAt(0), editor.document.positionAt(editor.document.getText().length)), original)));
         assert.ok(await editor.document.save());
         assert.equal(await fs.readFile(working.fsPath, 'utf8'), original);
-        if (previousFeedback === undefined) { await fs.unlink(feedback); }
-        else { await fs.writeFile(feedback, previousFeedback); }
+        await writeFeedback(previousFeedback ?? '');
         await api.refresh();
       }
     });

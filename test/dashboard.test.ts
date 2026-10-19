@@ -384,7 +384,7 @@ test("static shell has nonce-only CSP, accessible full-text copy button and resp
   const client = readFileSync(resolve(__dirname, "../../src/dashboardClient.tsx"), "utf8");
   assert.doesNotMatch(client, /innerHTML|outerHTML|dangerouslySetInnerHTML|insertAdjacentHTML/);
   assert.match(html, /<button id="copy"[^>]+hidden disabled>Copy Review Notes &amp; Clear<\/button>/);
-  const explanation = "Copies your review notes to the clipboard, archives this batch, and clears the current review notes.";
+  const explanation = "Copies your Review Notes to the clipboard, archives this batch, and clears the current Review Notes.";
   const copy = matchedText(html, /<button id="copy"[^>]*>/);
   assert.ok(copy.includes(`title="${explanation}"`));
   assert.ok(copy.includes(`aria-description="${explanation}"`));
@@ -393,7 +393,7 @@ test("static shell has nonce-only CSP, accessible full-text copy button and resp
     assert.ok(!paragraph[0].includes(explanation));
   }
   assert.doesNotMatch(html, /select-repository|<header\b|<h1\b|id="repository"|repoName/);
-  assert.match(html, /<button id="copy"[^>]*>[^<]*<\/button>\s*<section id="files-section"[^>]*>[\s\S]*?<\/section>\s*<p id="count"[^>]*>0 review notes<\/p>/);
+  assert.match(html, /<button id="copy"[^>]*>[^<]*<\/button>\s*<section id="files-section"[^>]*>[\s\S]*?<\/section>\s*<p id="count"[^>]*>0 Review Notes<\/p>/);
   assert.match(html, /<h2 id="files-title">Files to Review \(0\)<\/h2>/);
   assert.match(html, /<p id="no-files" class="muted">No files to review\.<\/p>/);
   assert.match(html, /\.file-insertions \{ color: var\(--vscode-gitDecoration-addedResourceForeground,/);
@@ -1887,7 +1887,7 @@ for (const activation of ["click", "Enter", " "]) test(`unavailable archives exp
   assert.equal(element("more").getAttribute("aria-expanded"), "false");
   assert.equal(document.activeElement, element("more"));
   assert.equal(unavailable.hidden, false);
-  assert.equal(unavailable.textContent, "Recent Archives are available when there are no current saved Review Notes. Finish your review, then use Copy Review Notes & Clear to view or recover an earlier batch.");
+  assert.equal(unavailable.textContent, "Restore Last Copied Review Notes is available when there are no current Review Notes in this checkout. Finish your review, then use Copy Review Notes & Clear.");
   assert.equal(unavailable.children.length, 0);
   assert.equal(element("history").hidden, true);
   assert.equal(element("copy").hidden, false);
@@ -2142,7 +2142,7 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   assert.equal(element("note-error").hidden, false);
   assert.equal(element("error").children.length, 0);
   assert.equal(element("note-error").children.length, 0);
-  assert.equal(element("count").textContent, "2 review notes");
+  assert.equal(element("count").textContent, "2 Review Notes");
   assert.equal(element("copy").hidden, false);
   assert.equal(elements.has("explanation"), false);
   assert.equal(element("copy").disabled, false);
@@ -2167,8 +2167,8 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   assert.equal(date.tagName, "TIME");
   assert.equal(date.dateTime, new Date(empty.archives[0].createdAt).toISOString());
   assert.equal(date.textContent, new Date(empty.archives[0].createdAt).toLocaleString());
-  assert.equal(row.children[0].children[1].textContent, "3 review notes");
-  assert.equal(recover.textContent, "Recover");
+  assert.equal(row.children[0].children[1].textContent, "3 Review Notes");
+  assert.equal(recover.textContent, "Restore");
   recover.click();
   assert.deepEqual({ ...lastMessage(messages) }, { type: "restore", repoKey: "/repo", archiveId: "batch" });
   update({ ...empty, historyVisible: true, busy: true });
@@ -2179,7 +2179,7 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   assert.equal(messages.length, 4);
   assert.equal(element("dashboard").getAttribute("aria-busy"), "true");
   update(state({ commentCount: 1, busy: true }));
-  assert.equal(element("count").textContent, "1 review note");
+  assert.equal(element("count").textContent, "1 Review Note");
   assert.equal(element("copy").hidden, false);
   assert.equal(element("copy").disabled, true);
   element("copy").click();
@@ -2197,7 +2197,7 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   for (const count of [0, 1]) {
     update({ ...empty, archives: [{ ...empty.archives[0], commentCount: count }] });
     assert.equal(element("archives").children[0].children[0].children[1].textContent,
-      count === 1 ? "1 review note" : "0 review notes");
+      count === 1 ? "1 Review Note" : "0 Review Notes");
   }
   update({ ...empty, archives: [] });
   assert.equal(element("no-archives").hidden, false);

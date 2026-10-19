@@ -50,7 +50,9 @@ test('only the exact unfenced general header is recognized; general bodies have 
   for (const header of ['## general review note', '## General Review Notes', '## General Review Note ',
     '##  General Review Note', '## General Review Note:1', '### General Review Note']) {
     assert.deepEqual(parsedNotes(parse(`${header}\n\nOpaque prose\n`)), [], header);
+    assert.equal(parse(`${header}\n\nOpaque prose\n`).diagnostics.length, header.startsWith('###') ? 0 : 1, header);
   }
+  assert.deepEqual(parse('## General review notes for this sprint\n\nOpaque prose\n').diagnostics, []);
   assert.deepEqual(parsedNotes(parse('```markdown\n## General Review Note\n```')), []);
   for (const body of ['Selected: HEAD', 'Comparison: arbitrary prose\nSelected: arbitrary prose',
     '```ts\nnot an anchor\n```', '~~~ts\nnot an anchor\n~~~']) {
@@ -64,6 +66,10 @@ test('only the exact unfenced general header is recognized; general bodies have 
 
 test('general append starts at the note and preserves existing bytes and destination newlines', () => {
   assert.equal(appendGeneralNote('', 'Feedback'), '## General Review Note\n\n💬 Feedback\n');
+  for (const eol of ['\n', '\r\n', '\r']) {
+    assert.equal(appendGeneralNote(`Preamble${eol} \t`, 'Feedback'),
+      `Preamble${eol} \t${eol}## General Review Note${eol}${eol}💬 Feedback${eol}`);
+  }
   for (const eol of ['\n', '\r\n', '\r']) {
     for (const prefix of ['', '\uFEFF', 'Preamble', `Preamble${eol}`, `Preamble${eol}${eol}`,
       `\uFEFF# Review \u00b7 base ABCDEF1${eol}${eol}## Unknown${eol}Opaque  ${eol}`]) {
@@ -178,11 +184,11 @@ test('malformed general wrappers remain opaque through sibling writes and append
   for (const eol of ['\n', '\r\n', '\r']) {
     for (const bom of ['', '\uFEFF']) {
       for (const [wrapper, open, message] of [
-        ['Body: fenced', false, /expected a fenced review note body/],
-        ['Body: fenced\nnot a fence\nKeep feedback', false, /expected a fenced review note body/],
-        ['Body: fenced\n~~~markdown\nKeep feedback\n~~~', false, /expected a fenced review note body/],
-        ['Body: fenced\n```text\nKeep feedback\n```', false, /expected a fenced review note body/],
-        ['Body: fenced\n\n```markdown\nKeep feedback\n```', false, /expected a fenced review note body/],
+        ['Body: fenced', false, /expected a fenced Review Note body/],
+        ['Body: fenced\nnot a fence\nKeep feedback', false, /expected a fenced Review Note body/],
+        ['Body: fenced\n~~~markdown\nKeep feedback\n~~~', false, /expected a fenced Review Note body/],
+        ['Body: fenced\n```text\nKeep feedback\n```', false, /expected a fenced Review Note body/],
+        ['Body: fenced\n\n```markdown\nKeep feedback\n```', false, /expected a fenced Review Note body/],
         ['Body: fenced\n```markdown\nKeep feedback\n```\nDo not drop this', false, /must end at its closing fence/],
         ['Body: fenced\n```markdown\nKeep feedback', true, /unterminated/],
         ['Body: fenced\n````markdown\nKeep feedback\n```', true, /unterminated/],

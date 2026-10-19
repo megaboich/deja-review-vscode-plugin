@@ -8,7 +8,7 @@ export const WRAPPER_LABEL = 'Body: fenced';
 
 // `path`:range (context) with an optional trailing elision marker. The greedy context
 // capture stops at the last `)` on the line, so paths may contain parentheses.
-const HEADER = /^##\s+`(?<path>[^`]+)`\s*:\s*(?<range>(?<wholeFile>file)|(?<start>\d+)(?:\s*-\s*(?<end>\d+))?)\s+\((?<context>.*)\)(?:\s*;\s*Snippet\s*:\s*(?<elided>elided))?\s*$/di;
+const HEADER = /^##\s+`(?<path>[^`]+)`\s*:\s*(?<range>(?<wholeFile>file)|(?<start>\d+)(?:\s*-\s*(?<end>\d+))?)\s+\((?<context>[^\r\n]*)\)(?:\s*;\s*Snippet\s*:\s*(?<elided>elided))?\s*$/di;
 const ORIGIN_LABEL = '(?:Working\\s+tree|Staging\\s+area|HEAD|Commit\\s+(?:[0-9a-f]{40}|[0-9a-f]{64}))';
 const DOCUMENT_CONTEXT = new RegExp(`^\\s*(?<origin>${ORIGIN_LABEL})\\s*$`, 'i');
 const COMPARISON_CONTEXT = new RegExp(
@@ -87,7 +87,7 @@ export function scanMarkdown(text: string): { lines: MarkdownLine[]; openFence: 
 function decodeBody(text: string, lines: MarkdownLine[], first: number, last: number): string {
   const marker = first <= last ? BODY_MARKER_PREFIX.exec(lines[first].text) : null;
   if (!marker) {
-    throw new Error(`expected ${BODY_MARKER} before the review note body`);
+    throw new Error(`expected ${BODY_MARKER} before the Review Note body`);
   }
   if (lines[first].text.slice(marker[0].length) !== WRAPPER_LABEL) {
     return text.slice(lines[first].start + marker[0].length, lines[last].end);
@@ -95,14 +95,14 @@ function decodeBody(text: string, lines: MarkdownLine[], first: number, last: nu
 
   const opening = first + 1;
   if (opening >= last || !lines[opening].fenceOpen || !/^`{3,}markdown$/.test(lines[opening].text)) {
-    throw new Error('expected a fenced review note body');
+    throw new Error('expected a fenced Review Note body');
   }
   let closing = opening + 1;
   while (closing <= last && !lines[closing].fenceClose) {
     closing++;
   }
   if (closing !== last) {
-    throw new Error('fenced review note body must end at its closing fence');
+    throw new Error('fenced Review Note body must end at its closing fence');
   }
 
   // Decode once, removing only the structural newline before the closing fence.
@@ -119,6 +119,11 @@ export function parse(text: string): ParseResult {
     const limit = headings[block + 1] ?? lines.length;
     const header = lines[first];
     const general = header.text === '## General Review Note';
+    if (!general && /^##\s+general\s+review\s+notes?[\s:\d]*$/i.test(header.text)) {
+      // Near misses stay opaque, but silently ignoring them would hide the feedback from every view.
+      result.diagnostics.push({ line: first + 1, message: 'unparseable review block: a general note heading must be exactly "## General Review Note"' });
+      continue;
+    }
     if (!general && !/^##\s+`/.test(header.text)) {
       continue;
     }
@@ -238,7 +243,7 @@ export function parse(text: string): ParseResult {
     } catch (error) {
       result.diagnostics.push({
         line: diagnosticLine + 1,
-        message: `unparseable review block: ${error instanceof Error ? error.message : 'invalid review note'}`,
+        message: `unparseable review block: ${error instanceof Error ? error.message : 'invalid Review Note'}`,
       });
     }
   }

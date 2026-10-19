@@ -128,7 +128,7 @@ function freezeEditor(uri: vscode.Uri, range: vscode.Range, options: CaptureOpti
 }
 
 function staleCapture(): Error {
-  return new Error('The Git revision or review base changed since capture. Reopen the comparison and select the source lines again.');
+  return new Error('The Git revision changed since capture. Reopen the comparison and select the source lines again.');
 }
 
 async function resolveEndpoint(
@@ -212,7 +212,7 @@ async function chooseContext(
     }
   }
   return vscode.window.showQuickPick(choices, {
-    title: 'Where did you add this review note?',
+    title: 'Where did you add this Review Note?',
     placeHolder: 'Choose the editor or comparison you used; the original context cannot be determined uniquely.',
     ignoreFocusOut: true,
     matchOnDescription: true,
@@ -232,7 +232,7 @@ export async function captureContext(
   let captureListener: vscode.Disposable | undefined;
   try {
     if (uri.scheme !== 'file' && uri.scheme !== 'git') {
-      throw new Error('Review notes support only file and Git text documents inside a repository.');
+      throw new Error('Review Notes support only file and Git text documents inside a repository.');
     }
     if (input !== undefined && !(input instanceof vscode.TabInputText) && !(input instanceof vscode.TabInputTextDiff)
       && !forcePrompt) {
@@ -287,7 +287,7 @@ export async function captureContext(
       const { original, modified } = choice.input;
       comparison = comparisons.get(choice.input);
       if (original.toString() === modified.toString()) {
-        void vscode.window.showInformationMessage('Both comparison sides use the same URI. The chosen capture side is preserved, but VS Code may display the review note on both sides.');
+        void vscode.window.showInformationMessage('Both comparison sides use the same URI. The chosen capture side is preserved, but VS Code may display the Review Note on both sides.');
       }
     }
     const selectedUris = choice.input ? [choice.input.original, choice.input.modified] : [uri];
@@ -343,7 +343,8 @@ export async function captureContext(
       }),
     };
   } catch (error) {
-    await vscode.window.showWarningMessage(`Cannot capture review note: ${error instanceof Error ? error.message : String(error)}`);
+    // Never await: a notification left unopened would keep the native submission in flight.
+    void vscode.window.showWarningMessage(`Cannot capture Review Note: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
   } finally {
     captureListener?.dispose();

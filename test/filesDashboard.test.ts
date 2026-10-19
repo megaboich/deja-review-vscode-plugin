@@ -41,8 +41,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
   // Only module code is loaded from disk. Persistence and all VS Code I/O are in memory.
   const gitChanged = new EventEmitter();
   const foldersChanged = new EventEmitter();
-  const documentsChanged = new EventEmitter<{ document: { uri: vscode.Uri } }>();
-  const documentOpened = new EventEmitter();
+  const documentsChanged = new EventEmitter<{ document: { uri: vscode.Uri }; contentChanges: readonly unknown[] }>();
+  const documentOpened = new EventEmitter<{ uri: vscode.Uri }>();
   const receive = new EventEmitter<unknown>();
   const viewDisposed = new EventEmitter();
   const visibilityChanged = new EventEmitter();
@@ -236,6 +236,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     onDidChangeWorkspaceFolders: foldersChanged.event,
     onDidChangeTextDocument: documentsChanged.event,
     onDidOpenTextDocument: documentOpened.event,
+    onDidCloseTextDocument: disposable,
     onDidChangeConfiguration: disposable,
     getConfiguration: () => ({ get: (key: string, fallback: unknown) => key === 'renderSideBySide' ? sideBySide : fallback }),
     async applyEdit(edit: unknown) { edits.push(edit); return onApplyEdit(); },
@@ -761,7 +762,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     });
   }
 
-  for (const wait of ['archive listing', 'archive picker'] as const) {
+  for (const wait of ['archive listing'] as const) {
     await t.test(`recovery binds its folder across ${wait}`, async child => {
       child.mock.method(console, 'error', () => {});
       await reset();
@@ -769,7 +770,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       const started = deferred();
       const release = deferred();
       const pause = async () => { started.resolve(); await release.promise; };
-      if (wait === 'archive listing') { onList = pause; } else { onPick = pause; }
+      onList = pause;
       const pending = registeredCommand('dejareview.restoreArchive')();
       await started.promise;
       switchFolder();
@@ -943,8 +944,10 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     });
   }
 
-  for (const mutation of ['cancel', 'folder', 'Git event', 'late body'] as const) {
+  for (const mutation of ['cancel', 'folder', 'Git event', 'working-tree Git event', 'late body'] as const) {
     await t.test(`native submit handles ${mutation} at the final synchronous guard`, async child => {
+      // A Git event only invalidates notes whose captured text came from HEAD or the index.
+      const accepted = mutation === 'late body' || mutation === 'working-tree Git event';
       child.mock.method(console, 'error', () => {});
       await reset();
       const original = store();
@@ -952,8 +955,8 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
         assert.ok(scopedRepository);
         return {
           repo: scopedRepository, uri: file('/synthetic/repo/src/a.ts'), baseCommit: repository.state.HEAD?.commit,
-          comment: { path: 'src/a.ts', origin: 'changed', side: 'document', startLine: 1, endLine: 1,
-            anchorText: 'disk content', body: '' },
+          comment: { path: 'src/a.ts', origin: mutation === 'Git event' ? 'head' : 'changed', side: 'document',
+            startLine: 1, endLine: 1, anchorText: 'disk content', body: '' },
           async validate() {},
         };
       };
@@ -970,13 +973,14 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       switch (mutation) {
         case 'cancel': await registeredCommand('dejareview.cancelDraft')(thread); break;
         case 'folder': switchFolder(); break;
-        case 'Git event': gitChanged.fire(); break;
+        case 'Git event':
+        case 'working-tree Git event': gitChanged.fire(); break;
         case 'late body': reply.text = 'Late body must not replace submitted text'; break;
       }
       release.resolve();
       await pending;
-      assert.equal(publications, mutation === 'late body' ? 1 : 0);
-      if (mutation === 'late body') {
+      assert.equal(publications, accepted ? 1 : 0);
+      if (accepted) {
         assert.equal(parse(original.savedText).comments[0].body, 'Frozen submitted body');
         assert.deepEqual(errors, []);
       } else {
@@ -1212,60 +1216,17 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     assert.match(errors[0], /changed on disk/);
   });
 
-  for (const wait of ['document open', 'edit application'] as const) {
-    await t.test(`gitignore refuses a folder switch during ${wait}`, async child => {
-      child.mock.method(console, 'error', () => {});
-      await reset();
-      sources.set('/synthetic/repo/.gitignore', 'out/\n');
-      const started = deferred();
-      const release = deferred();
-      if (wait === 'document open') {
-        onOpen = async () => { started.resolve(); await release.promise; };
-      } else {
-        onApplyEdit = async () => { started.resolve(); await release.promise; return true; };
-      }
-      const pending = registeredCommand('dejareview.suggestGitignore')();
-      await started.promise;
-      switchFolder();
-      release.resolve();
-      await pending;
-      assert.equal(edits.length, wait === 'document open' ? 0 : 1);
-      assert.equal(documentSaves, 0);
-      assert.match(errors[0], /project folder changed/);
-    });
-  }
-
-  for (const failure of ['edit', 'save'] as const) {
-    await t.test(`gitignore reports failed ${failure} instead of claiming success`, async child => {
-      child.mock.method(console, 'error', () => {});
-      await reset();
-      sources.set('/synthetic/repo/.gitignore', 'out/\n');
-      if (failure === 'edit') { onApplyEdit = async () => false; }
-      else { onSaveDocument = async () => false; }
-      await registeredCommand('dejareview.suggestGitignore')();
-      assert.equal(errors.length, 1);
-      assert.match(errors[0], failure === 'edit' ? /Could not update .gitignore/ : /Could not save .gitignore/);
-      assert.equal(documentSaves, failure === 'edit' ? 0 : 1);
-    });
-  }
-
-  await t.test('gitignore approval remains bound to the folder that saved the note', async child => {
-    child.mock.method(console, 'error', () => {});
+  await t.test('saving notes never prompts for or writes project gitignore files', async () => {
     await reset();
     ignoreSuggested = false;
+    let prompts = 0;
+    onInformation = async () => { prompts++; return undefined; };
     await send(generalAction());
-    const started = deferred();
-    const release = deferred();
-    onInformation = async () => { started.resolve(); await release.promise; return 'Add'; };
-    receive.fire(editorAction('saveEdit', 'Saved general body'));
-    await started.promise;
-    switchFolder();
-    release.resolve();
-    await settle();
+    await send(editorAction('saveEdit', 'Saved general body'));
     assert.deepEqual(edits, []);
     assert.deepEqual(opened, []);
     assert.equal(documentSaves, 0);
-    assert.match(errors[0], /project folder changed/);
+    assert.equal(prompts, 0);
   });
 
   await t.test('general creation without an active editor saves a body-only note and never suppresses files or creates threads', async () => {
@@ -1788,13 +1749,13 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     });
   }
 
-  for (const wait of ['archive listing', 'archive picker'] as const) {
+  for (const wait of ['archive listing'] as const) {
     await t.test(`command recovery rechecks active input after ${wait}`, async child => {
       child.mock.method(console, 'error', () => {});
       await reset(); seedArchive();
       const started = deferred(), release = deferred();
       const pause = async () => { started.resolve(); await release.promise; };
-      if (wait === 'archive listing') { onList = pause; } else { onPick = pause; }
+      onList = pause;
       const pending = registeredCommand('dejareview.restoreArchive')();
       await started.promise;
       await send(generalAction());
@@ -1888,11 +1849,10 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
           assert.deepEqual(state().files, expected.map(row => ({ ...row, visible: editor === first })));
 
           const beforeDocument = messages.length;
-          documentsChanged.fire({ document: editor.document });
+          documentsChanged.fire({ document: editor.document, contentChanges: [{}] });
           t.mock.timers.tick(1000);
-          await waitForState(() => messages.length > beforeDocument);
-          assert.ok(messages.slice(beforeDocument).every(message =>
-            message.files[0].statisticsPending === false));
+          await settle();
+          assert.equal(messages.length, beforeDocument, 'Typing in a file without line notes must not refresh');
           assert.deepEqual(state().files, expected.map(row => ({ ...row, visible: editor === first })));
           assert.equal(jobs, 1, 'Editor refreshes must reuse the original statistics job');
         }
@@ -2503,7 +2463,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       assert.ok(original instanceof Uri && modified instanceof Uri);
       mock.window.visibleTextEditors = [visibleEditor(original), visibleEditor(modified)];
       workspace.textDocuments = mock.window.visibleTextEditors.map(editor => editor.document);
-      documentOpened.fire();
+      documentOpened.fire(mock.window.visibleTextEditors[1].document);
       visibleEditorsChanged.fire();
     };
     try {
@@ -2533,6 +2493,43 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     assert.deepEqual(errors, []);
   });
 
+  await t.test('only content edits to working-tree files holding line notes schedule a refresh', async () => {
+    const api = await reset();
+    store().text = appendComment('', { path: 'src/a.ts', origin: 'changed', side: 'document',
+      startLine: 1, endLine: 1, body: 'Synthetic line note' });
+    await api.refresh();
+    let loads = 0;
+    onRead = async () => { loads++; };
+    const noted = visibleEditor(file('/synthetic/repo/src/a.ts')).document;
+    const cases = [
+      ['another source file', visibleEditor(file('/synthetic/repo/src/other.ts')).document, [{}], 0],
+      ['a dirty-state-only event', noted, [], 0],
+      ['the review notes buffer', { uri: store().uri }, [{}], 0],
+      ['the noted file', noted, [{}], 1],
+    ] as const;
+    for (const [name, document, contentChanges, expected] of cases) {
+      loads = 0;
+      documentsChanged.fire({ document, contentChanges });
+      await automaticRefresh();
+      assert.equal(loads, expected, name);
+    }
+    onRead = async () => {};
+  });
+
+  await t.test('unchanged refreshes keep native note widgets instead of re-rendering them', async () => {
+    const api = await reset();
+    store().text = appendComment('', { path: 'src/a.ts', origin: 'changed', side: 'document',
+      startLine: 1, endLine: 1, body: 'Synthetic line note' });
+    await api.refresh();
+    const [thread] = api.getThreads();
+    assert.ok(thread, 'Expected a native thread for the saved line note');
+    const { comments, range } = thread;
+    await api.refresh();
+    assert.equal(api.getThreads()[0], thread);
+    assert.equal(thread.comments, comments, 'Reassigning comments re-renders the gutter widget');
+    assert.equal(thread.range, range);
+  });
+
   await t.test('visibility updates bypass blocked full discovery and editor refreshes reuse candidate membership', async () => {
     const api = await reset();
     let scans = 0;
@@ -2555,7 +2552,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       release.resolve();
       await refresh;
     }
-    documentsChanged.fire({ document: mock.window.visibleTextEditors[0].document });
+    documentsChanged.fire({ document: mock.window.visibleTextEditors[0].document, contentChanges: [{}] });
     await automaticRefresh();
     assert.equal(scans, 1, 'Source-buffer changes do not invalidate Git candidate membership');
     gitChanged.fire();
@@ -2688,7 +2685,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       await started.promise;
       assert.equal(warnings.length, 1);
       assert.equal(warnings[0].message, untracked
-        ? 'Revert src/a.ts? This untracked file will be removed and cannot be recovered by Git.'
+        ? 'Revert src/a.ts? This untracked file will be deleted (or moved to the Trash, depending on your Git settings). Git cannot recover it.'
         : 'Revert src/a.ts? Its unstaged disk changes will be discarded. Staged changes will be kept.');
       assert.equal(state().busy, true);
       assert.deepEqual(paths(), ['src/a.ts', 'src/other.ts']);
@@ -3041,16 +3038,16 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     }
   }
 
-  await t.test('saved notes and review data are excluded before dashboard or direct helper staging and reverting', async () => {
+  await t.test('noted files and extension storage are excluded before dashboard or direct helper staging and reverting', async () => {
     await reset();
     const request = stageAction();
     const revert = revertAction();
     store().save(appendComment('', { path: 'src/a.ts', origin: 'head', side: 'document',
       startLine: 1, endLine: 1, anchorText: 'missing old anchor', body: 'Synthetic saved note',
     }));
-    const excluded = ['REVIEW-NOTES.md', '.REVIEW-NOTES.md.test.tmp', 'archives/batch.json'];
+    const excluded = ['archives/batch.json'];
     sources.set('/synthetic/repo/guide.md', 'Ordinary project documentation\n');
-    repository.state.workingTreeChanges = ['src/a.ts', 'guide.md', ...excluded.slice(0, 2)]
+    repository.state.workingTreeChanges = ['src/a.ts', 'guide.md']
       .map(name => change(`/synthetic/repo/${name}`));
     await automaticRefresh();
     assert.deepEqual(paths(), ['guide.md']);
@@ -3159,7 +3156,7 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
     };
     workspace.textDocuments = [unsaved];
     const before = diffCalls;
-    documentsChanged.fire({ document: unsaved });
+    documentsChanged.fire({ document: unsaved, contentChanges: [{}] });
     await automaticRefresh();
     assert.equal(diffCalls, before);
     assert.deepEqual(paths(), ['src/a.ts']);

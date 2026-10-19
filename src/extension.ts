@@ -69,18 +69,25 @@ function isNativeNote(note: vscode.Comment | undefined): note is Note {
 
 function label(comment: ReviewComment): string {
   const pair = comment.comparison;
-  return `Captured: ${sideLabel(comment)} - ${comment.path}:${comment.startLine}-${comment.endLine}`
+  let location = `${comment.startLine}-${comment.endLine}`;
+  if (comment.wholeFile) {
+    location = 'file';
+  } else if (comment.startLine === comment.endLine) {
+    location = `${comment.startLine}`;
+  }
+  return `Captured: ${sideLabel(comment)} - ${comment.path}:${location}`
     + (pair ? ` | ${pair.left.path} (${pair.left.origin}) -> ${pair.right.path} (${pair.right.origin})` : '');
 }
 
 function markdown(entry: Entry): vscode.MarkdownString {
-  const value = new vscode.MarkdownString();
+  const value = untrustedMarkdown();
   value.appendText(label(entry.comment));
-  const pair = entry.comment.comparison;
-  if (pair) {
-    value.appendText(`\n\nComparison: ${pair.left.path} (${pair.left.origin}) -> ${pair.right.path} (${pair.right.origin})`);
-  }
   value.appendMarkdown(`\n\n${entry.comment.body}`);
+  return value;
+}
+
+function untrustedMarkdown(text?: string): vscode.MarkdownString {
+  const value = new vscode.MarkdownString(text);
   // Review prose is user-editable. Never trust embedded commands or HTML.
   value.isTrusted = false;
   value.supportHtml = false;
@@ -89,6 +96,18 @@ function markdown(entry: Entry): vscode.MarkdownString {
 
 function range(anchor: ResolvedAnchor | ReviewComment): vscode.Range {
   return new vscode.Range(anchor.startLine - 1, 0, anchor.endLine - 1, 0);
+}
+
+function sameRange(left: vscode.Range | undefined, right: vscode.Range): boolean {
+  return !!left && left.start.line === right.start.line && left.start.character === right.start.character
+    && left.end.line === right.end.line && left.end.character === right.end.character;
+}
+
+/** Matches a full-line selection, so capturing straight after navigation keeps the whole range. */
+function selection(document: vscode.TextDocument, anchor: ResolvedAnchor | ReviewComment): vscode.Selection {
+  const first = Math.min(anchor.startLine, document.lineCount) - 1;
+  const last = Math.min(anchor.endLine, document.lineCount) - 1;
+  return new vscode.Selection(new vscode.Position(first, 0), document.lineAt(last).rangeIncludingLineBreak.end);
 }
 
 /** Labels and statistics both describe the index-to-worktree changes. */
@@ -169,6 +188,13 @@ class ReviewExtension implements vscode.Disposable {
   private readonly saving = new Set<Note>();
   private readonly editSessions = new WeakMap<Note, object>();
   private timer?: ReturnType<typeof setTimeout>;
+  private editorsTimer?: ReturnType<typeof setTimeout>;
+  /** Working-tree file URIs whose unsaved text can move a line note's anchor. */
+  private anchoredDocuments = new Set<string>();
+  /** Revision text per note target; Git events and explicit refreshes clear it. */
+  private revisionContents = new Map<string, Promise<string>>();
+  private diagnosticsKey?: string;
+  private publishedHasFeedback?: boolean;
   private disposed = false;
   private lastEditor = vscode.window.activeTextEditor;
   private lastTab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
@@ -206,7 +232,7 @@ class ReviewExtension implements vscode.Disposable {
   constructor(private readonly context: vscode.ExtensionContext) {
     this.configureController();
     this.status.command = 'dejareview.dashboard.focus';
-    this.status.tooltip = 'Open review notes';
+    this.status.tooltip = 'Open Review Notes';
     this.registerCommand('addComment', (uri?: vscode.Uri, selection?: vscode.Range) => this.add(uri, selection));
     this.registerCommand('submitComment', (reply: vscode.CommentReply) => this.submit(reply));
     this.registerCommand('cancelDraft', (arg: vscode.CommentThread | vscode.CommentReply) => {
@@ -229,7 +255,6 @@ class ReviewExtension implements vscode.Disposable {
     this.registerCommand('restoreArchive', (id?: string, repoKey?: string) => this.restore(id, repoKey));
     this.registerCommand('refresh', () => this.refresh());
     this.registerCommand('reanchorAll', () => this.reanchor());
-    this.registerCommand('suggestGitignore', () => this.gitignore());
     this.subscriptions.push(
       vscode.window.registerWebviewViewProvider('dejareview.dashboard', this.dashboard),
       this.git.onDidChangeRepositories(() => this.schedule(true)),
@@ -246,14 +271,23 @@ class ReviewExtension implements vscode.Disposable {
       vscode.window.onDidChangeVisibleTextEditors(() => {
         void this.refreshEditors().catch(error => this.error(error));
       }),
-      vscode.workspace.onDidOpenTextDocument(() => {
-        if (this.entries.some(entry => !entry.comment.wholeFile)) {
-          this.schedule();
+      vscode.workspace.onDidOpenTextDocument(document => {
+        // Opening a document only adds a place to show existing threads; buffers match disk.
+        if (['file', 'git'].includes(document.uri.scheme) && this.entries.some(entry => !entry.comment.wholeFile)) {
+          this.scheduleEditors();
         }
       }),
       vscode.workspace.onDidChangeWorkspaceFolders(() => this.schedule(true)),
       vscode.workspace.onDidChangeTextDocument(event => {
-        if (event.document.uri.toString() !== this.store?.uri.toString()) {
+        // Only typing in a working-tree file that holds line notes can move their anchors.
+        // Everything else (other files, output channels, dirty-state events) is ignored.
+        if (event.contentChanges.length && this.anchoredDocuments.has(event.document.uri.toString())) {
+          this.schedule();
+        }
+      }),
+      vscode.workspace.onDidCloseTextDocument(document => {
+        // Closing a buffer that had unsaved edits reverts anchors to the saved file.
+        if (this.anchoredDocuments.has(document.uri.toString())) {
           this.schedule();
         }
       }),
@@ -483,7 +517,7 @@ class ReviewExtension implements vscode.Disposable {
   private entry(arg: Entry | Note | undefined): Entry {
     const entry = arg && ('entry' in arg ? arg.entry : arg);
     if (!entry?.comment) {
-      throw new Error('Choose a review note in the editor or review view.');
+      throw new Error('Choose a Review Note in the editor or review view.');
     }
     return entry;
   }
@@ -502,7 +536,7 @@ class ReviewExtension implements vscode.Disposable {
     const matches = parsedNotes(parsed).filter(comment => comment.rawBlock === entry.comment.rawBlock);
     const oldMatches = parsedNotes(parse(entry.snapshot)).filter(comment => comment.rawBlock === entry.comment.rawBlock);
     if (matches.length !== 1 || oldMatches.length !== 1) {
-      throw new Error('This review note changed on disk. Refresh and select it again.');
+      throw new Error('This Review Note changed on disk. Refresh and select it again.');
     }
     return matches[0];
   }
@@ -661,9 +695,11 @@ class ReviewExtension implements vscode.Disposable {
       }, validate);
       if (saved || unchanged) {
         this.dashboardEditor = undefined;
-        await this.refresh();
-        if (session.target.type !== 'edit') {
-          void this.offerGitignore(session.repo, session.store).catch(error => this.error(error));
+        try {
+          await this.refresh();
+        } catch (error) {
+          // The session is already closed, so session.error would never be displayed.
+          void vscode.window.showWarningMessage(`Review Note was saved, but the Review Notes display could not be refreshed: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
     } catch (error) {
@@ -682,6 +718,7 @@ class ReviewExtension implements vscode.Disposable {
     if (invalidateFiles) {
       this.filesGeneration++;
       this.statisticsRevision++;
+      this.revisionContents.clear();
     }
     if (this.timer) {
       clearTimeout(this.timer);
@@ -690,6 +727,17 @@ class ReviewExtension implements vscode.Disposable {
       this.timer = undefined;
       void this.refresh(false).catch(error => this.error(error));
     }, 300);
+  }
+
+  /** Coalesces document-open bursts (Git quick diff opens many) into one thread placement pass. */
+  private scheduleEditors(): void {
+    if (this.disposed || this.editorsTimer) {
+      return;
+    }
+    this.editorsTimer = setTimeout(() => {
+      this.editorsTimer = undefined;
+      void this.refreshEditors().catch(error => this.error(error));
+    }, 100);
   }
 
   private async useRepository(repo: Repository): Promise<void> {
@@ -710,9 +758,11 @@ class ReviewExtension implements vscode.Disposable {
     this.store?.dispose();
     this.repoSubscriptions.forEach(item => item.dispose());
     this.repo = repo;
-    this.store = new ReviewStore(repo, new ReviewArchives(this.context.globalStorageUri, repo.rootUri));
+    this.store = new ReviewStore(repo, new ReviewArchives(this.context.globalStorageUri, repo.checkoutUri ?? repo.rootUri, repo.rootUri));
     this.entries = [];
     this.savedEntries = [];
+    this.anchoredDocuments = new Set();
+    this.revisionContents.clear();
     this.files = [];
     this.filesError = undefined;
     this.archives = [];
@@ -745,6 +795,7 @@ class ReviewExtension implements vscode.Disposable {
     if (invalidateStatistics) {
       this.statisticsRevision++;
       this.forceStatistics = true;
+      this.revisionContents.clear();
     }
     if (!this.refreshing) {
       // All callers await the latest requested projection, not an obsolete pass
@@ -753,8 +804,9 @@ class ReviewExtension implements vscode.Disposable {
     }
     await this.refreshing;
     // Opening a diff raises editor events. Those updates must not extend the
-    // completed file action by joining another whole-projection drain.
-    await this.openNextStagedFile();
+    // completed file action by joining another whole-projection drain. A failure to
+    // open the next file is not a failure of whichever action requested this refresh.
+    await this.openNextStagedFile().catch(error => this.error(error));
   }
 
   private async drainRefresh(): Promise<void> {
@@ -849,9 +901,13 @@ class ReviewExtension implements vscode.Disposable {
     if (!currentRequest() || store !== this.store || repo !== this.repo) {
       return;
     }
-    await vscode.commands.executeCommand('setContext', 'dejareview.hasFeedback', !!projection.text?.trim());
-    if (!currentRequest() || store !== this.store || repo !== this.repo) {
-      return;
+    const hasFeedback = !!projection.text?.trim();
+    if (hasFeedback !== this.publishedHasFeedback) {
+      await vscode.commands.executeCommand('setContext', 'dejareview.hasFeedback', hasFeedback);
+      this.publishedHasFeedback = hasFeedback;
+      if (!currentRequest() || store !== this.store || repo !== this.repo) {
+        return;
+      }
     }
     this.status.text = `$(comment) ${this.savedEntries.length}`;
     if (projection.text !== undefined) {
@@ -886,6 +942,9 @@ class ReviewExtension implements vscode.Disposable {
     this.filesError = undefined;
     this.archives = [];
     this.hasFeedback = false;
+    this.anchoredDocuments = new Set();
+    this.revisionContents.clear();
+    this.diagnosticsKey = undefined;
     this.diagnostics.clear();
     this.status.hide();
     this.noteError = undefined;
@@ -893,6 +952,7 @@ class ReviewExtension implements vscode.Disposable {
       editor.setDecorations(this.decoration, []);
     }
     await vscode.commands.executeCommand('setContext', 'dejareview.hasFeedback', false);
+    this.publishedHasFeedback = false;
     return true;
   }
 
@@ -921,7 +981,7 @@ class ReviewExtension implements vscode.Disposable {
       const key = `${comment.origin}:${comment.path}`;
       let pendingContent = contents.get(key);
       if (!pendingContent) {
-        pendingContent = this.git.content(comment, repo);
+        pendingContent = this.noteContent(comment, repo);
         contents.set(key, pendingContent);
       }
       let resolved: ResolvedAnchor | undefined;
@@ -950,6 +1010,29 @@ class ReviewExtension implements vscode.Disposable {
     }
 
     return { text, parsed, entries, files, filesError, archives, historyError };
+  }
+
+  /**
+   * Working-tree text follows live buffers, so it is always read. Revision text only
+   * changes with a Git status event, which clears this cache, so typing in a noted file
+   * does not spawn `git show` for every HEAD, index or commit note again.
+   */
+  private noteContent(comment: ReviewComment, repo: Repository): Promise<string> {
+    if (comment.origin === 'changed') {
+      return this.git.content(comment, repo);
+    }
+    const key = `${repo.rootUri.toString()}\0${comment.origin}\0${comment.path}`;
+    let content = this.revisionContents.get(key);
+    if (!content) {
+      content = this.git.content(comment, repo);
+      this.revisionContents.set(key, content);
+      content.catch(() => {
+        if (this.revisionContents.get(key) === content) {
+          this.revisionContents.delete(key);
+        }
+      });
+    }
+    return content;
   }
 
   private async refreshEditors(): Promise<void> {
@@ -1051,14 +1134,33 @@ class ReviewExtension implements vscode.Disposable {
     this.hasFeedback = !!text?.trim();
     this.historyError = historyError;
     this.noteError = parsed.diagnostics.length
-      ? `${parsed.diagnostics.length} malformed block(s). Open REVIEW-NOTES.md to fix; all raw feedback can still be copied.` : undefined;
+      ? `${parsed.diagnostics.length} malformed Review Note block(s). Refresh Review Notes and retry.` : undefined;
     this.updateDashboard();
 
-    this.diagnostics.clear();
-    this.diagnostics.set(store.uri, parsed.diagnostics.map(item => {
-      const range = new vscode.Range(item.line - 1, 0, item.line - 1, 1000);
-      return new vscode.Diagnostic(range, item.message, vscode.DiagnosticSeverity.Warning);
-    }));
+    const anchored = new Set<string>();
+    for (const entry of entries) {
+      if (entry.comment.wholeFile || entry.comment.origin !== 'changed') {
+        continue;
+      }
+      try {
+        anchored.add(this.git.uri(entry.comment, repo).toString());
+      } catch {
+        // Nested-repository targets render as stale cards and cannot move.
+      }
+    }
+    anchored.delete(store.uri.toString());
+    this.anchoredDocuments = anchored;
+
+    // Republishing identical diagnostics would make the Problems view flicker on every refresh.
+    const diagnosticsKey = JSON.stringify([store.uri.toString(), parsed.diagnostics]);
+    if (diagnosticsKey !== this.diagnosticsKey) {
+      this.diagnosticsKey = diagnosticsKey;
+      this.diagnostics.clear();
+      this.diagnostics.set(store.uri, parsed.diagnostics.map(item => {
+        const range = new vscode.Range(item.line - 1, 0, item.line - 1, 1000);
+        return new vscode.Diagnostic(range, item.message, vscode.DiagnosticSeverity.Warning);
+      }));
+    }
     if (!filesError && !reuseStatistics) { this.loadFileStatistics(); }
   }
 
@@ -1117,21 +1219,39 @@ class ReviewExtension implements vscode.Disposable {
           thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
         }
         if (!thread.comments.some(note => note.mode === vscode.CommentMode.Editing)) {
-          thread.range = range(entry.resolved);
-          thread.label = label(entry.comment);
-          thread.canReply = false;
-          thread.contextValue = entry.comment.comparison ? 'comparison' : 'saved';
-          const body = new vscode.MarkdownString(entry.comment.body);
-          body.isTrusted = false;
-          const note: Note = {
-            body,
-            mode: vscode.CommentMode.Preview,
-            author: { name: 'Review' },
-            contextValue: 'saved',
-            entry,
-            parent: thread,
-          };
-          thread.comments = [note];
+          // Reassigning unchanged thread properties makes VS Code re-render every
+          // gutter widget, so only touch what changed and rebind the saved entry.
+          const nextRange = range(entry.resolved);
+          if (!sameRange(thread.range, nextRange)) {
+            thread.range = nextRange;
+          }
+          const nextLabel = label(entry.comment);
+          if (thread.label !== nextLabel) {
+            thread.label = nextLabel;
+          }
+          if (thread.canReply !== false) {
+            thread.canReply = false;
+          }
+          const contextValue = entry.comment.comparison ? 'comparison' : 'saved';
+          if (thread.contextValue !== contextValue) {
+            thread.contextValue = contextValue;
+          }
+          const existing = thread.comments.length === 1 ? thread.comments[0] : undefined;
+          if (isNativeNote(existing) && existing.mode === vscode.CommentMode.Preview && existing.contextValue === 'saved'
+            && existing.parent === thread && typeof existing.body !== 'string' && existing.body.value === entry.comment.body
+            && existing.entry.comment.body === entry.comment.body) {
+            existing.entry = entry;
+          } else {
+            const note: Note = {
+              body: untrustedMarkdown(entry.comment.body),
+              mode: vscode.CommentMode.Preview,
+              author: { name: 'Review' },
+              contextValue: 'saved',
+              entry,
+              parent: thread,
+            };
+            thread.comments = [note];
+          }
         }
         next.push(thread);
       }
@@ -1161,13 +1281,19 @@ class ReviewExtension implements vscode.Disposable {
 
   private async add(uri?: vscode.Uri, selection?: vscode.Range): Promise<void> {
     if (this.copyInProgress) {
-      throw new Error('Wait until copying finishes before adding review notes.');
+      throw new Error('Wait until copying finishes before adding Review Notes.');
     }
-    const editor = uri ? vscode.window.visibleTextEditors.find(editor => editor.document.uri.toString() === uri.toString()) : this.lastEditor;
+    // The same document can be visible twice (diff side and plain tab); prefer the active one
+    // so the selection and the active tab input come from the same editor.
+    const active = vscode.window.activeTextEditor;
+    const editor = uri
+      ? (active?.document.uri.toString() === uri.toString() ? active
+        : vscode.window.visibleTextEditors.find(editor => editor.document.uri.toString() === uri.toString()))
+      : this.lastEditor;
     const source = uri ?? editor?.document.uri;
     const selected = selection ?? editor?.selection;
     if (!source || !selected) {
-      throw new Error('Focus a text editor and select a line to add a review note to.');
+      throw new Error('Focus a text editor and select a line to add a Review Note to.');
     }
     const input = uri ? vscode.window.tabGroups.activeTabGroup.activeTab?.input : this.lastTab;
     const captured = await captureContext(this.git, source, selected, {
@@ -1199,7 +1325,7 @@ class ReviewExtension implements vscode.Disposable {
     const thread = reply.thread;
     const body = reply.text;
     if (thread.comments.length) {
-      throw new Error('Replies are not supported. Add a separate review note.');
+      throw new Error('Replies are not supported. Add a separate Review Note.');
     }
 
     this.submitting.add(thread);
@@ -1229,7 +1355,9 @@ class ReviewExtension implements vscode.Disposable {
         if (this.copyInProgress || this.cancelledDrafts.has(thread) || !this.submitting.has(thread)) {
           throw new Error('This Review Note submission was cancelled.');
         }
-        if (revisionChanged || (usesBase && repo.state.HEAD?.commit !== captured.baseCommit)) {
+        // Working-tree and pinned-commit notes are checked by captured.validate(); any
+        // status event would otherwise reject them merely because some file was saved.
+        if (usesBase && (revisionChanged || repo.state.HEAD?.commit !== captured.baseCommit)) {
           throw new Error('The Git revision changed during submission. Retry the Review Note.');
         }
       };
@@ -1282,7 +1410,6 @@ class ReviewExtension implements vscode.Disposable {
       if (latest) {
         latest.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       }
-      void this.offerGitignore(repo, store).catch(error => this.error(error));
     } finally {
       this.submitting.delete(thread);
     }
@@ -1346,22 +1473,34 @@ class ReviewExtension implements vscode.Disposable {
         unchanged = next === text;
         return next;
       }, async () => { validate(); }, validate);
-      validateSession();
-      if (saved || unchanged) {
-        // Rename may already have published while the reviewer typed more. Bind
-        // retries to those exact bytes without replacing the live editor body.
-        if (savedEntry) {
-          note.entry = savedEntry;
-        }
-        if ((typeof note.body === 'string' ? note.body : note.body.value) !== body) {
-          this.schedule();
-          throw new Error('The earlier Review Note body was saved. Your newer input is retained; save again to apply it.');
-        }
-        note.mode = vscode.CommentMode.Preview;
-        note.contextValue = 'saved';
-        note.parent.comments = [note];
-        this.editSessions.delete(note);
+      if (!saved && !unchanged) {
+        validateSession();
+        return;
+      }
+      // The body is published. Rename may have completed while the reviewer typed more,
+      // so bind retries to those exact bytes without replacing the live editor body.
+      if (savedEntry) {
+        note.entry = savedEntry;
+      }
+      try {
+        validateSession();
+      } catch {
+        // Cancelled or replaced after publication: the save still happened, so only refresh.
+        this.schedule();
+        return;
+      }
+      if ((typeof note.body === 'string' ? note.body : note.body.value) !== body) {
+        this.schedule();
+        throw new Error('The earlier Review Note body was saved. Your newer input is retained; save again to apply it.');
+      }
+      note.mode = vscode.CommentMode.Preview;
+      note.contextValue = 'saved';
+      note.parent.comments = [note];
+      this.editSessions.delete(note);
+      try {
         await this.refresh();
+      } catch (error) {
+        void vscode.window.showWarningMessage(`Review Note was saved, but its display could not be refreshed. Refresh to see it. ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
       this.saving.delete(note);
@@ -1370,7 +1509,7 @@ class ReviewExtension implements vscode.Disposable {
 
   private cancelEdit(note: Note): void {
     this.editSessions.delete(note);
-    note.body = new vscode.MarkdownString(note.entry.comment.body);
+    note.body = untrustedMarkdown(note.entry.comment.body);
     note.mode = vscode.CommentMode.Preview;
     note.contextValue = 'saved';
     note.parent.comments = [note];
@@ -1380,7 +1519,7 @@ class ReviewExtension implements vscode.Disposable {
   private storeFor(entry: SavedEntry): ReviewStore {
     const store = this.store;
     if (!store) {
-      throw new Error('The selected project folder changed. Select this review note again.');
+      throw new Error('The selected project folder changed. Select this Review Note again.');
     }
     this.assertScope(entry.repo, store);
     return store;
@@ -1491,7 +1630,7 @@ class ReviewExtension implements vscode.Disposable {
       if (revert) {
         await this.git.revertFile(repo, file.path, notedPaths, [this.context.globalStorageUri], validate, async untracked => {
           const warning = untracked
-            ? `Revert ${file.path}? This untracked file will be removed and cannot be recovered by Git.`
+            ? `Revert ${file.path}? This untracked file will be deleted (or moved to the Trash, depending on your Git settings). Git cannot recover it.`
             : `Revert ${file.path}? Its unstaged disk changes will be discarded. Staged changes will be kept.`;
           return await vscode.window.showWarningMessage(warning, { modal: true }, 'Revert File') === 'Revert File';
         });
@@ -1531,14 +1670,9 @@ class ReviewExtension implements vscode.Disposable {
   private async reveal(entry: Entry): Promise<void> {
     const store = this.storeFor(entry);
     const text = await store.read() ?? '';
-    const comment = this.current(text, entry);
-    const document = await vscode.workspace.openTextDocument(store.uri);
+    this.current(text, entry);
     this.storeFor(entry);
-    if (document.isDirty || document.getText() !== text) {
-      throw new Error('Review notes changed. Save and refresh before navigating.');
-    }
-    const position = document.positionAt(comment.startOffset);
-    await vscode.window.showTextDocument(document, { selection: new vscode.Range(position, position) });
+    await this.openDashboardEditor({ type: 'edit', entry });
   }
 
   private async goto(entry: Entry, comparisonOnly = false): Promise<void> {
@@ -1546,7 +1680,7 @@ class ReviewExtension implements vscode.Disposable {
     const validate = async (): Promise<void> => {
       this.current(await store.read() ?? '', entry);
       if (this.storeFor(entry) !== store || this.copyInProgress || store.busy) {
-        throw new Error('Review notes changed or are busy. Refresh and retry.');
+        throw new Error('Review Notes changed or are busy. Refresh and retry.');
       }
     };
     await validate();
@@ -1582,7 +1716,7 @@ class ReviewExtension implements vscode.Disposable {
       const target = entry.comment.side === 'left' ? left : right;
       const editor = vscode.window.visibleTextEditors.find(editor => editor.document.uri.toString() === target.toString());
       if (editor && entry.resolved) {
-        editor.selection = new vscode.Selection(range(entry.resolved).start, range(entry.resolved).end);
+        editor.selection = selection(editor.document, entry.resolved);
         editor.revealRange(range(entry.resolved), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
       } else if (entry.resolved) {
         const choice = await vscode.window.showInformationMessage('The selected comparison side is not exposed as a text editor. Open its revision separately?', 'Open Revision');
@@ -1590,21 +1724,21 @@ class ReviewExtension implements vscode.Disposable {
           await this.git.validatedUri(entry.comment, entry.repo);
           const document = await vscode.workspace.openTextDocument(target);
           await validate();
-          await vscode.window.showTextDocument(document, { selection: range(entry.resolved), preview: false });
+          await vscode.window.showTextDocument(document, { selection: selection(document, entry.resolved), preview: false });
         }
       }
     } else {
       const document = await vscode.workspace.openTextDocument(await this.git.validatedUri(entry.comment, entry.repo));
       await validate();
       await vscode.window.showTextDocument(document, {
-        selection: range(entry.resolved ?? entry.comment), preview: true,
+        selection: selection(document, entry.resolved ?? entry.comment), preview: true,
       });
     }
   }
 
   private async handoff(expectedRepoKey?: string): Promise<void> {
     this.requireFinishedDashboardEditor();
-    if (this.mutating || this.nativeWriteInFlight) {
+    if (this.mutating || this.blockedByNativeWrite()) {
       return;
     }
     if (!await this.ensureWorkspaceStore()) {
@@ -1616,7 +1750,7 @@ class ReviewExtension implements vscode.Disposable {
       return;
     }
     this.requireFinishedDashboardEditor();
-    if (this.mutating || this.nativeWriteInFlight) {
+    if (this.mutating || this.blockedByNativeWrite()) {
       return;
     }
 
@@ -1639,32 +1773,56 @@ class ReviewExtension implements vscode.Disposable {
       validate();
       if (drafts.size || edits.size) {
         const choice = await vscode.window.showWarningMessage(
-          'Unsubmitted review notes or open edits are not included. Finish them first, or explicitly discard them when copying.',
-          { modal: true }, 'Copy and discard drafts', 'Finish review notes first');
+          'Unsubmitted Review Notes or open edits are not included. Finish them first, or explicitly discard them when copying.',
+          { modal: true }, 'Copy and discard drafts', 'Finish Review Notes first');
         if (choice !== 'Copy and discard drafts') { return; }
       }
       validate();
       const result = await store.handoff(validate);
       if (result.status === 'copied') {
-        validate();
+        // Feedback is already copied, archived and cleared: never report this as a failure.
+        // Input that changed meanwhile is newer than the discard choice, so it is kept.
+        let inputUnchanged = true;
+        try {
+          validate();
+        } catch {
+          inputUnchanged = false;
+        }
         this.generation++;
-        for (const thread of this.drafts.keys()) {
-          thread.dispose();
+        if (inputUnchanged) {
+          for (const thread of this.drafts.keys()) {
+            thread.dispose();
+          }
+          this.drafts.clear();
+          for (const thread of this.threads) {
+            thread.dispose();
+          }
+          this.threads = [];
         }
-        this.drafts.clear();
-        for (const thread of this.threads) {
-          thread.dispose();
-        }
-        this.threads = [];
         // Native gutter templates are not enumerable. Keep the controller alive:
         // unsubmitted native input is not exported, but must never be destroyed.
-        await this.refresh();
-        void vscode.window.showInformationMessage('Review feedback copied and archived; REVIEW-NOTES.md cleared. Recover it from Recent Archives when needed.');
+        let refreshFailure = '';
+        try {
+          await this.refresh();
+        } catch (error) {
+          refreshFailure = ` The Review Notes display could not be refreshed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        const message = 'Review Notes copied and cleared. Restore Last Copied Review Notes is available if you need them again.';
+        if (refreshFailure) {
+          void vscode.window.showWarningMessage(message + refreshFailure);
+        } else {
+          void vscode.window.showInformationMessage(message);
+        }
       } else if (result.status === 'empty') {
-        void vscode.window.showInformationMessage('No review notes to copy.');
+        void vscode.window.showInformationMessage('No Review Notes to copy.');
       } else if (result.status !== 'cancelled') {
-        const prefix = result.clipboardCopied ? 'Feedback copied, but REVIEW-NOTES.md was not cleared.' : 'Feedback was not copied or cleared.';
-        const detail = 'error' in result ? String(result.error) : 'The saved file or editor buffer changed. Save and retry.';
+        let prefix = 'Feedback was not copied or cleared.';
+        if (result.clipboardCopied && result.archived) {
+          prefix = 'Feedback copied and saved for recovery, but Review Notes were not cleared.';
+        } else if (result.clipboardCopied) {
+          prefix = 'Feedback copied, but recovery was not saved and Review Notes were not cleared.';
+        }
+        const detail = 'error' in result ? String(result.error) : 'Review Notes changed. Refresh and retry.';
         void vscode.window.showWarningMessage(`${prefix} ${detail}`);
       }
     } finally {
@@ -1677,7 +1835,7 @@ class ReviewExtension implements vscode.Disposable {
 
   private async restore(id?: string, repoKey?: string): Promise<void> {
     this.requireFinishedDashboardEditor();
-    if (this.mutating || this.nativeWriteInFlight) {
+    if (this.mutating || this.blockedByNativeWrite()) {
       return;
     }
     if (!await this.ensureWorkspaceStore()) {
@@ -1701,12 +1859,8 @@ class ReviewExtension implements vscode.Disposable {
       const archives = await store.archives.list();
       validate();
       if (this.copyInProgress || store.busy) { return; }
-      const choice = await vscode.window.showQuickPick(archives.map(archive => ({
-        label: new Date(archive.createdAt).toLocaleString(),
-        description: `${archive.commentCount} review note${archive.commentCount === 1 ? '' : 's'}`,
-        id: archive.id,
-      })), { placeHolder: archives.length ? 'Recover a recent review batch' : 'No archived reviews for this repository' });
-      id = choice?.id;
+      id = archives[0]?.id;
+      if (!id) { void vscode.window.showInformationMessage('No copied Review Notes to restore for this checkout.'); }
     }
     if (!id) { return; }
     validate();
@@ -1717,11 +1871,16 @@ class ReviewExtension implements vscode.Disposable {
       await vscode.commands.executeCommand('setContext', 'dejareview.copyInProgress', true);
       validate();
       if (!await store.restore(id, validate)) {
-        throw new Error('Current feedback exists or changed. Copy and clear it before recovering a review.');
+        throw new Error('Current Review Notes exist in this checkout. Copy and clear them before restoring the last copy.');
       }
-      validate();
-      await this.refresh();
-      void vscode.window.showInformationMessage('Review recovered to REVIEW-NOTES.md. The archive is still available.');
+      // The archive text is already published; a later failure must not read as a failed recovery.
+      try {
+        await this.refresh();
+      } catch (error) {
+        void vscode.window.showWarningMessage(`Review Notes restored, but the display could not be refreshed: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      void vscode.window.showInformationMessage('Last copied Review Notes restored. The recovery copy is still available.');
     } finally {
       this.copyInProgress = false;
       this.updateDashboard();
@@ -1768,6 +1927,15 @@ class ReviewExtension implements vscode.Disposable {
     await this.refresh();
   }
 
+  /** Explains an otherwise silent refusal; an in-flight copy or file action needs no message. */
+  private blockedByNativeWrite(): boolean {
+    if (!this.nativeWriteInFlight) {
+      return false;
+    }
+    void vscode.window.showInformationMessage('A Review Note is still being saved. Try again when it finishes.');
+    return true;
+  }
+
   private nativeEdits(): vscode.Comment[] {
     return this.threads.flatMap(thread => thread.comments.filter(note => note.mode === vscode.CommentMode.Editing));
   }
@@ -1776,7 +1944,7 @@ class ReviewExtension implements vscode.Disposable {
     const folderKey = vscode.workspace.workspaceFolders?.[0]?.uri.toString();
     const repo = await this.git.workspaceRepository();
     if (!repo) {
-      throw new Error('Open a local Git project folder in VS Code to use review notes.');
+      throw new Error('Open a local Git project folder in VS Code to use Review Notes.');
     }
     if (folderKey !== repo.rootUri.toString() || folderKey !== vscode.workspace.workspaceFolders?.[0]?.uri.toString()) {
       throw new Error('The selected project folder changed. Refresh and retry.');
@@ -1787,69 +1955,9 @@ class ReviewExtension implements vscode.Disposable {
     return true;
   }
 
-  private async offerGitignore(repo: Repository, store: ReviewStore): Promise<void> {
-    this.assertScope(repo, store);
-    const key = `gitignore:${repo.rootUri.toString()}:REVIEW-NOTES.md`;
-    if (this.context.globalState.get(key)) { return; }
-    await this.context.globalState.update(key, true);
-    this.assertScope(repo, store);
-    const choice = await vscode.window.showInformationMessage('REVIEW-NOTES.md is scratch review feedback. Add it to .gitignore?', 'Add', 'Not now');
-    if (choice === 'Add') {
-      this.assertScope(repo, store);
-      await this.gitignore(repo, store);
-    }
-  }
-
-  private async gitignore(repo = this.repo, store = this.store): Promise<void> {
-    if (!repo || !store) { return; }
-    const validate = (): void => this.assertScope(repo, store);
-    validate();
-    const uri = vscode.Uri.joinPath(repo.rootUri, '.gitignore');
-    let document: vscode.TextDocument;
-    try {
-      document = await vscode.workspace.openTextDocument(uri);
-    } catch (error) {
-      validate();
-      let exists = true;
-      try {
-        await vscode.workspace.fs.stat(uri);
-      } catch (statError) {
-        validate();
-        if (!(statError instanceof vscode.FileSystemError) || statError.code !== 'FileNotFound') {
-          throw statError;
-        }
-        exists = false;
-        await vscode.workspace.fs.writeFile(uri, new Uint8Array());
-      }
-      validate();
-      if (exists) {
-        throw error;
-      }
-      document = await vscode.workspace.openTextDocument(uri);
-    }
-    validate();
-    if (document.isDirty) {
-      throw new Error('.gitignore has unsaved changes. Save it and retry.');
-    }
-    if (document.getText().split(/\r?\n/).some(line => ['REVIEW-NOTES.md', '/REVIEW-NOTES.md'].includes(line.trim()))) {
-      return;
-    }
-    const text = document.getText();
-    const edit = new vscode.WorkspaceEdit();
-    edit.insert(uri, document.positionAt(text.length), `${text && !text.endsWith('\n') ? '\n' : ''}/REVIEW-NOTES.md\n`);
-    if (!await vscode.workspace.applyEdit(edit)) {
-      throw new Error('Could not update .gitignore. Retry the edit.');
-    }
-    validate();
-    if (!await document.save()) {
-      throw new Error('Could not save .gitignore. Its edit remains in the editor; save it and retry.');
-    }
-    validate();
-  }
-
-  getState(): { repo?: string; comments: number; threads: number; hasFeedback: boolean; archives: ReviewArchive[] } {
+  getState(): { repo?: string; storagePath?: string; comments: number; threads: number; hasFeedback: boolean; archives: ReviewArchive[] } {
     return { repo: this.repo?.rootUri.fsPath, comments: this.savedEntries.length, threads: this.threads.length,
-      hasFeedback: this.hasFeedback, archives: [...this.archives] };
+      storagePath: this.store?.uri.fsPath, hasFeedback: this.hasFeedback, archives: [...this.archives] };
   }
   getDrafts(): readonly vscode.CommentThread[] { return [...this.drafts.keys()]; }
   getThreads(): readonly vscode.CommentThread[] { return this.threads; }
@@ -1858,6 +1966,7 @@ class ReviewExtension implements vscode.Disposable {
     this.disposed = true;
     this.generation++;
     if (this.timer) { clearTimeout(this.timer); }
+    if (this.editorsTimer) { clearTimeout(this.editorsTimer); }
     this.store?.dispose();
     [...this.subscriptions, ...this.repoSubscriptions, this.controller, this.git,
       this.diagnostics, this.status, this.dashboard, this.decoration, this.output].forEach(item => item.dispose());

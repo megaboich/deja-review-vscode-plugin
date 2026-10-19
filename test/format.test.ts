@@ -64,6 +64,12 @@ test('compact comparisons retain selected-side order for all origins, paths and 
 });
 
 test('compact context tolerates case and whitespace and keeps punctuation inside paths', () => {
+  for (const separator of ['\u2028', '\u2029']) {
+    const comparison = { left: { path: `old${separator}name.ts`, origin: 'head' as const }, right: { path: 'src/file.ts', origin: 'changed' as const } };
+    const result = parse(appendComment('', note({ side: 'right', comparison })));
+    assert.deepEqual(result.diagnostics, []);
+    assert.deepEqual(result.comments[0].comparison, comparison);
+  }
   const sha = 'A'.repeat(64);
   const text = `##   \`src\\file.ts\` : 2 - 3 ( oRiGiNaL : CoMmIt   ${sha} vs \`new (x) vs @.ts\` @ STAGING AREA )  \n\n~~~ts\nfirst\nsecond\n~~~~\n\n💬 Feedback\n`;
   const result = parse(text);

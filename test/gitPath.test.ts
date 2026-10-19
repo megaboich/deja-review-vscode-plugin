@@ -5,7 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
-import { validateSingleFilePathspec } from '../src/gitPath';
+import { indexEntry, validateSingleFilePathspec } from '../src/gitPath';
 
 const execute = promisify(execFile);
 
@@ -79,5 +79,15 @@ test('bracket path verification uses Git matching in a disposable repository', a
   await t.test('unavailable Git fails without publishing raw command output', async () => {
     await assert.rejects(validateSingleFilePathspec(path.join(root, 'missing-git'), root, path.join(root, '[id].ts')),
       { message: 'Cannot verify that Git targets only this file. Refresh Files to Review and retry.' });
+  });
+
+  await t.test('index lookup reads exactly one literal stage-0 entry', async () => {
+    // collision/[ab].ts and collision/a.ts are both staged by the sibling test above.
+    const target = path.join(root, 'collision/[ab].ts');
+    const [mode, object] = (await git('--literal-pathspecs', 'ls-files', '--stage', '--', target)).split(/\s+/);
+    assert.deepEqual(await indexEntry('git', root, target), { mode, object });
+    assert.equal(await indexEntry('git', root, path.join(root, 'collision/[a].ts')), undefined);
+    assert.equal(await indexEntry('git', root, path.join(root, 'collision')), undefined, 'a directory is not one entry');
+    assert.equal(await indexEntry('git', root, path.join(root, 'missing.ts')), undefined);
   });
 });

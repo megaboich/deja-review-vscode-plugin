@@ -33,3 +33,25 @@ export async function validateSingleFilePathspec(gitPath: string, repositoryRoot
     throw new Error('Git could match other files for this filename. The single-file action was cancelled.');
   }
 }
+
+/**
+ * Read one stage-0 index entry with a single literal-pathspec Git process. The bundled
+ * API's getObjectDetails('') spawns two (ls-files plus an unused cat-file size lookup)
+ * and treats brackets as wildcards. Undefined means absent, conflicted or unexpected.
+ */
+export async function indexEntry(gitPath: string, repositoryRoot: string, filePath: string)
+  : Promise<{ mode: string; object: string } | undefined> {
+  const { stdout } = await execute(gitPath, ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', filePath], {
+    cwd: repositoryRoot,
+    encoding: 'utf8',
+    timeout: 10_000,
+    maxBuffer: 64 * 1024,
+  });
+  const records = stdout.split('\0').filter(value => value !== '');
+  const match = records.length === 1 ? /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) 0\t([^]*)$/.exec(records[0]) : null;
+  const expected = path.relative(repositoryRoot, filePath).split(path.sep).join('/');
+  if (!match || match[3] !== expected) {
+    return undefined;
+  }
+  return { mode: match[1], object: match[2] };
+}

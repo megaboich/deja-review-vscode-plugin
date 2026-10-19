@@ -6,7 +6,7 @@ import { BODY_MARKER, WRAPPER_LABEL, parse, scanMarkdown } from './parser';
 export function assertUtf8Text(text: string): void {
   // Unicode mode matches lone surrogate code points, not valid surrogate pairs.
   if (/[\uD800-\uDFFF]/u.test(text)) {
-    throw new Error('Review note text contains an unpaired UTF-16 surrogate and cannot be saved losslessly as UTF-8.');
+    throw new Error('Review Note text contains an unpaired UTF-16 surrogate and cannot be saved losslessly as UTF-8.');
   }
 }
 
@@ -16,7 +16,7 @@ function newline(text: string): string {
 
 function checkSnapshot(text: string, comment: ParsedNote): void {
   if (text.slice(comment.startOffset, comment.endOffset) !== comment.rawBlock) {
-    throw new Error('This review note has changed on disk; re-parse before writing');
+    throw new Error('This Review Note has changed on disk; re-parse before writing');
   }
 }
 
@@ -111,7 +111,7 @@ export function appendComment(text: string, input: ReviewComment): string {
   if (parsed.diagnostics.length || parsed.comments.length !== 1
     || parsed.comments[0].anchorText !== (comment.anchorText === undefined ? undefined : convert(comment.anchorText))
     || parsed.comments[0].body !== convert(comment.body)) {
-    throw new Error('Review note could not be serialized without changing its content');
+    throw new Error('Review Note could not be serialized without changing its content');
   }
   return appendBlock(text, block);
 }
@@ -122,19 +122,21 @@ export function appendGeneralNote(text: string, body: string): string {
   const parsed = parse(block);
   if (parsed.diagnostics.length || parsed.generalNotes.length !== 1 || parsed.comments.length
     || parsed.generalNotes[0].body !== body.replace(/\r\n|\r|\n/g, eol)) {
-    throw new Error('Review note could not be serialized without changing its content');
+    throw new Error('Review Note could not be serialized without changing its content');
   }
   return appendBlock(text, block);
 }
 
 function appendBlock(text: string, block: string): string {
   if (scanMarkdown(text).openFence) {
-    throw new Error('Cannot append after an unterminated fence; repair REVIEW-NOTES.md first');
+    throw new Error('Cannot append a Review Note after an unterminated fence in the Markdown projection.');
   }
   const eol = newline(text);
   let prefix = text;
   if (prefix && !/(?:\r\n|\r(?!\n)|\n)[\t ]*(?:\r\n|\r|\n)$/.test(prefix)) {
-    prefix += /[\r\n]$/.test(prefix) ? eol : eol + eol;
+    // An unterminated whitespace-only last line becomes the blank separator once terminated.
+    const blankTail = /(?:\r\n|\r|\n)[\t ]+$/.test(prefix);
+    prefix += /[\r\n]$/.test(prefix) || blankTail ? eol : eol + eol;
   }
   const result = prefix + block;
   assertUtf8Text(result);
@@ -170,7 +172,7 @@ export function deleteComment(text: string, comment: ParsedNote): string {
   checkSnapshot(text, comment);
   const current = parsedNotes(parse(text)).find(item => item.startOffset === comment.startOffset);
   if (!current || current.rawBlock !== comment.rawBlock || current.deleteEndOffset !== comment.deleteEndOffset) {
-    throw new Error('This review note or its separator has changed on disk; re-parse before writing');
+    throw new Error('This Review Note or its separator has changed on disk; re-parse before writing');
   }
   return text.slice(0, comment.startOffset) + text.slice(comment.deleteEndOffset);
 }
@@ -195,7 +197,7 @@ export function rewriteLinesBatch(text: string,
     checkSnapshot(text, comment);
     validateRange(start, end);
     if (index && comment.endOffset > ordered[index - 1].comment.startOffset) {
-      throw new Error('Cannot rewrite the same or overlapping review note twice');
+      throw new Error('Cannot rewrite the same or overlapping Review Note twice');
     }
   }
 
