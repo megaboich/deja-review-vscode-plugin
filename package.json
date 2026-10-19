@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "local-review",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/megaboich/deja-review-vscode-plugin.git"
+  },
   "engines": {
     "vscode": "^1.96.0"
   },
@@ -19,18 +23,23 @@
     "vscode.git"
   ],
   "scripts": {
-    "compile": "tsc -p .",
-    "check": "tsc -p . --noEmit",
+    "build:client": "node scripts/buildClient.mjs",
+    "compile": "npm run build:client && tsc -p .",
+    "check": "npm run build:client && tsc -p . --noEmit",
     "test": "npm run compile && node --test out/test/*.test.js",
     "test:integration": "npm run compile && node out/test/runIntegration.js",
-    "vscode:prepublish": "npm run compile",
+    "clean": "node -e \"fs.rmSync('out', { recursive: true, force: true })\"",
+    "vscode:prepublish": "npm run clean && npm run compile",
     "package": "vsce package --allow-missing-repository"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "1.96.0",
     "@vscode/test-electron": "^2.5.2",
-    "@vscode/vsce": "^3.6.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "happy-dom": "^20.14.5",
+    "preact": "^10.29.8",
     "typescript": "^5.9.2"
   },
   "contributes": {
@@ -93,7 +102,7 @@
       },
       {
         "command": "dejareview.restoreArchive",
-        "title": "Recover Archived Review",
+        "title": "Restore Last Copied Review Notes",
         "category": "DejaReview"
       },
       {
@@ -105,11 +114,6 @@
       {
         "command": "dejareview.reanchorAll",
         "title": "Rewrite Line Numbers from Anchors",
-        "category": "DejaReview"
-      },
-      {
-        "command": "dejareview.suggestGitignore",
-        "title": "Add REVIEW-NOTES.md to .gitignore",
         "category": "DejaReview"
       }
     ],

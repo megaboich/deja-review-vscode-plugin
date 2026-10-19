@@ -1,12 +1,16 @@
 import * as assert from "node:assert/strict";
-import { runInNewContext } from "node:vm";
+import { inspect } from "node:util";
+import { Window } from "happy-dom";
 import type { DashboardState } from "../src/dashboard";
 import { renderDashboard } from "../src/dashboardHtml";
 
-type KeyEvent = { key?: string; preventDefault(): void };
-type Listener = (event?: KeyEvent) => void;
-type Document = { activeElement?: Element; root: Element };
-
+/**
+ * Deterministic stand-in for the Web Animations API.
+ *
+ * happy-dom implements `animate()` with real timers. Exit-animation tests need to settle
+ * or cancel an animation at an exact point to exercise reappearance races, so the real
+ * implementation is replaced rather than awaited.
+ */
 class ControlledAnimation implements Pick<Animation, 'cancel'> {
   readonly finished: Promise<void>;
   private resolveFinished?: () => void;
@@ -31,150 +35,30 @@ class ControlledAnimation implements Pick<Animation, 'cancel'> {
   }
 }
 
-// Only the DOM surface consumed by the dashboard, not a browser/layout emulator.
-export class Element {
-  children: Element[] = [];
-  content?: Element;
-  parent?: Element;
-  textContent = "";
-  hidden = false;
-  disabled = false;
-  inert = false;
-  height = 64;
-  animations: ControlledAnimation[] = [];
-  dateTime = "";
-  className = "";
-  type = "";
-  title = "";
-  value = "";
-  selectionStart = 0;
-  selectionEnd = 0;
-  open = false;
-  showModalCalls = 0;
-  closeCalls = 0;
-  attributes = new Map<string, string>();
-  listeners = new Map<string, Listener>();
+/** Test affordances patched onto happy-dom elements; not part of the client's DOM contract. */
+export type Element = Omit<HTMLElement, 'children'> & {
+  /** Snapshot array rather than a live HTMLCollection, so tests can use array methods. */
+  readonly children: Element[];
+  readonly parent: Element | undefined;
+  readonly content?: Element;
+  /** Layout-free stand-in for the collapse animation's measured start height. */
+  height: number;
+  animations: ControlledAnimation[];
+  disabled: boolean;
+  value: string;
+  type: string;
+  dateTime: string;
+  open: boolean;
+  selectionStart: number;
+  selectionEnd: number;
+  readonly showModalCalls: number;
+  readonly closeCalls: number;
+  /** Dispatches a real event and reports whether a listener called preventDefault. */
+  dispatch(name: string, key?: string): boolean;
+  /** Fires click without the browser's disabled-button suppression, to reach client guards. */
+  invokeListener(name: string): void;
+};
 
-  constructor(readonly tagName: string, private readonly document: Partial<Document>) {}
-
-  getBoundingClientRect(): Pick<DOMRect, 'height'> {
-    return { height: this.height };
-  }
-
-  animate(frames: Keyframe[], options: KeyframeAnimationOptions): ControlledAnimation {
-    const animation = new ControlledAnimation(frames, options);
-    this.animations.push(animation);
-    return animation;
-  }
-
-  get isConnected(): boolean {
-    return this === this.document.root || !!this.parent?.isConnected;
-  }
-
-  contains(element: Element): boolean {
-    return this === element || this.children.some(child => child.contains(element));
-  }
-
-  closest(selector: string): Element | null {
-    assert.equal(selector, "[hidden]");
-    return this.hidden ? this : this.parent?.closest(selector) ?? null;
-  }
-
-  focus(_options?: { preventScroll: boolean }): void {
-    this.document.activeElement = this;
-  }
-
-  setAttribute(name: string, value: string): void {
-    this.attributes.set(name, value);
-  }
-
-  removeAttribute(name: string): void {
-    this.attributes.delete(name);
-  }
-
-  addEventListener(name: string, callback: Listener): void {
-    this.listeners.set(name, callback);
-  }
-
-  // Deliberately bypass native disabled-button handling to test client-side guards.
-  invokeListener(name: string): void {
-    const listener = this.listeners.get(name);
-    assert.ok(listener, `Expected ${name} listener on ${this.tagName}`);
-    listener();
-  }
-
-  showModal(): void {
-    assert.equal(this.open, false);
-    this.open = true;
-    this.showModalCalls++;
-  }
-
-  close(): void {
-    this.open = false;
-    this.closeCalls++;
-  }
-
-  dispatch(name: string, key?: string): boolean {
-    let prevented = false;
-    this.listeners.get(name)?.({ key, preventDefault() { prevented = true; } });
-    // Native button activation is intentionally left to the browser by the client.
-    const activatesButton = (name === "keydown" && key === "Enter") || (name === "keyup" && key === " ");
-    if (!prevented && this.tagName === "button" && this.document.activeElement === this && activatesButton) {
-      this.click();
-    }
-    return prevented;
-  }
-
-  append(...children: Element[]): void {
-    for (const child of children) {
-      this.insertBefore(child, null);
-    }
-  }
-
-  cloneNode(deep: boolean): Element {
-    const clone = new Element(this.tagName, this.document);
-    clone.textContent = this.textContent;
-    clone.attributes = new Map(this.attributes);
-    if (deep) {
-      clone.append(...this.children.map(child => child.cloneNode(true)));
-    }
-    return clone;
-  }
-
-  insertBefore(child: Element, before: Element | null): void {
-    if (child.tagName === "#document-fragment") {
-      for (const node of [...child.children]) {
-        this.insertBefore(node, before);
-      }
-      return;
-    }
-    child.remove();
-    this.children.splice(before ? this.children.indexOf(before) : this.children.length, 0, child);
-    child.parent = this;
-  }
-
-  remove(): void {
-    if (this.document.activeElement && this.contains(this.document.activeElement)) {
-      this.document.activeElement = this.document.root;
-    }
-    if (this.parent) {
-      this.parent.children.splice(this.parent.children.indexOf(this), 1);
-    }
-    this.parent = undefined;
-  }
-
-  click(): void {
-    if (this.disabled) {
-      return;
-    }
-    for (let node: Element | undefined = this; node; node = node.parent) {
-      node.listeners.get("click")?.();
-    }
-  }
-}
-
-// Keep raw client output rather than decoding with the production validator:
-// exact-message assertions must still catch missing or unexpected keys.
 type ClientMessage = {
   type: string;
   repoKey?: string;
@@ -192,6 +76,8 @@ export function lastMessage(messages: readonly ClientMessage[]): ClientMessage {
   return message;
 }
 
+// Keep raw client output rather than decoding with the production validator:
+// exact-message assertions must still catch missing or unexpected keys.
 function isClientMessage(message: unknown): message is ClientMessage {
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     return false;
@@ -207,11 +93,17 @@ function isClientMessage(message: unknown): message is ClientMessage {
   return true;
 }
 
+type DocumentFacade = {
+  /** Assigning focuses the element; reading reports happy-dom's real focus owner. */
+  activeElement: Element | null;
+  readonly root: Element;
+};
+
 type ClientFixture = {
   elements: Map<string, Element>;
   element(id: string): Element;
   messages: ClientMessage[];
-  document: Document;
+  document: DocumentFacade;
   receive(message: unknown): void;
   showArchives(): void;
   update(next: DashboardState): void;
@@ -220,65 +112,116 @@ type ClientFixture = {
 
 let clientSequence = 0;
 
+/** Installs the test affordances declared on `Element` onto this window's prototype. */
+function patchElementPrototype(window: Window): void {
+  // Patch the shared Element prototype, not HTMLElement: the icons the client clones are SVG
+  // elements, which inherit from SVGElement and would otherwise miss these affordances.
+  const proto = window.Element.prototype as unknown as Element & Record<string, unknown>;
+  // happy-dom shares prototypes between Window instances; wrapping twice would
+  // double-count dialog calls and re-wrap the original methods.
+  if (proto.__dejareviewPatched) {
+    return;
+  }
+  proto.__dejareviewPatched = true;
+
+  Object.defineProperty(proto, 'height', {
+    configurable: true,
+    get(this: Record<string, unknown>) { return (this.__height as number | undefined) ?? 64; },
+    set(this: Record<string, unknown>, value: number) { this.__height = value; },
+  });
+  Object.defineProperty(proto, 'animations', {
+    configurable: true,
+    get(this: Record<string, unknown>) {
+      this.__animations ??= [];
+      return this.__animations;
+    },
+  });
+  // The client only indexes and spreads children; an array also gives tests find/filter.
+  const liveChildren = Object.getOwnPropertyDescriptor(window.Element.prototype, 'children');
+  assert.ok(liveChildren?.get, 'Expected happy-dom to expose a children getter');
+  Object.defineProperty(proto, 'children', {
+    configurable: true,
+    get(this: Element) { return Array.from(liveChildren.get!.call(this) as ArrayLike<Element>); },
+  });
+  Object.defineProperty(proto, 'parent', {
+    configurable: true,
+    get(this: Element) { return this.parentElement ?? undefined; },
+  });
+
+  const dialog = window.HTMLDialogElement.prototype as unknown as Record<string, unknown>;
+  const showModal = dialog.showModal as (this: unknown) => void;
+  const close = dialog.close as (this: unknown) => void;
+  for (const [name, original] of [['showModal', showModal], ['close', close]] as const) {
+    const counter = `__${name}Calls`;
+    Object.defineProperty(dialog, `${name}Calls`, {
+      configurable: true,
+      get(this: Record<string, unknown>) { return (this[counter] as number | undefined) ?? 0; },
+    });
+    dialog[name] = function (this: Record<string, unknown>) {
+      this[counter] = ((this[counter] as number | undefined) ?? 0) + 1;
+      original.call(this);
+    };
+  }
+
+  proto.getBoundingClientRect = function (this: Element) {
+    // happy-dom has no layout engine; the client only reads height for its keyframes.
+    return { height: this.height } as DOMRect;
+  };
+  proto.animate = function (this: Element, frames: Keyframe[], options: KeyframeAnimationOptions) {
+    const animation = new ControlledAnimation(frames, options);
+    this.animations.push(animation);
+    return animation as unknown as Animation;
+  };
+
+  proto.dispatch = function (this: Element, name: string, key?: string): boolean {
+    const event = key === undefined
+      ? new window.Event(name, { bubbles: true, cancelable: true })
+      : new window.KeyboardEvent(name, { key, bubbles: true, cancelable: true });
+    // dispatchEvent reports "not cancelled"; tests assert on preventDefault having run.
+    const prevented = !this.dispatchEvent(event as unknown as Event);
+    // The client leaves button activation to the browser, which happy-dom does not
+    // synthesize. Reproduce it so keyboard-activation tests exercise the real path.
+    const activatesButton = (name === 'keydown' && key === 'Enter') || (name === 'keyup' && key === ' ');
+    if (!prevented && activatesButton && this.tagName === 'BUTTON'
+      && this.ownerDocument.activeElement === (this as unknown as globalThis.Element)) {
+      this.click();
+    }
+    return prevented;
+  };
+  proto.invokeListener = function (this: Element, name: string): void {
+    assert.equal(name, 'click', 'Only click bypasses native disabled handling');
+    this.dispatchEvent(new window.MouseEvent('click', { bubbles: true }) as unknown as Event);
+  };
+  // `click()` is defined on HTMLElement, so SVG icons lack it. Tests click icons to prove the
+  // event reaches the enclosing button; HTMLElement's own implementation still takes priority.
+  proto.click ??= function (this: Element): void {
+    this.dispatchEvent(new window.MouseEvent('click', { bubbles: true }) as unknown as Event);
+  };
+
+  // An element inspects into its whole window/document graph: one failed assertion involving
+  // an element costs ~74s and a ~2MB message. Report a short identity instead.
+  Object.defineProperty(proto, inspect.custom, {
+    configurable: true,
+    value(this: Element) {
+      const id = this.id ? `#${this.id}` : '';
+      const classes = this.className ? `.${this.className.trim().split(/\s+/).join('.')}` : '';
+      return `<${this.tagName.toLowerCase()}${id}${classes}>`;
+    },
+  });
+}
+
 export function scriptFixture(cache: { value?: unknown } = {}, instanceKey = "test-instance"): ClientFixture {
   const fixtureSequence = ++clientSequence;
   const html = renderDashboard("test-nonce", instanceKey);
-  const elements = new Map<string, Element>();
-  const document: Partial<Document> = {};
-  const root = new Element("body", document);
-  const completeDocument = Object.assign(document, { root });
+  const window = new Window();
+  patchElementPrototype(window);
 
-  function element(id: string): Element {
-    const node = elements.get(id);
-    assert.ok(node, `Expected dashboard element #${id}`);
-    return node;
-  }
-
-  for (const match of html.matchAll(/<([a-z0-9]+) id="([^"]+)"([^>]*)>/g)) {
-    const node = new Element(match[1], document);
-    node.hidden = /\bhidden\b/.test(match[3]);
-    node.disabled = /\bdisabled\b/.test(match[3]);
-    for (const attribute of match[3].matchAll(/([\w-]+)="([^"]*)"/g)) {
-      node.setAttribute(attribute[1], attribute[2]);
-    }
-    elements.set(match[2], node);
-  }
-  for (const template of html.matchAll(/<template id="([^"]+)">([\s\S]*?)<\/template>/g)) {
-    const icon = element(template[1]);
-    icon.content = new Element("#document-fragment", document);
-    let parent = icon.content;
-    for (const match of template[2].matchAll(/<(svg|path)\b([^>]*)>/g)) {
-      const node = new Element(match[1], document);
-      for (const attribute of match[2].matchAll(/([\w-]+)="([^"]*)"/g)) {
-        node.setAttribute(attribute[1], attribute[2]);
-      }
-      parent.append(node);
-      parent = node;
-    }
-  }
-  root.append(element("dashboard"));
-  for (const [id, node] of elements) {
-    if (id !== "dashboard") {
-      element("dashboard").append(node);
-    }
-  }
-  for (const id of ["history-title", "close-history", "no-archives", "archives"]) {
-    element("history").append(element(id));
-  }
-  for (const id of ["files-title", "files-error", "no-files", "files"]) {
-    element("files-section").append(element(id));
-  }
-  for (const id of ["add-general", "more", "more-menu"]) {
-    element("toolbar").append(element(id));
-  }
-  element("more-menu").append(element("show-archives"));
-  root.append(element("note-editor"));
-  for (const id of ["editor-title", "editor-label", "editor-body", "editor-error", "close-editor", "cancel-edit", "save-edit"]) {
-    element("note-editor").append(element(id));
-  }
+  const script = html.match(/<script nonce="test-nonce">([\s\S]*?)<\/script>/);
+  assert.ok(script, "Expected a nonce-protected dashboard client script");
+  // Parse the real shell so element structure comes from the shipped HTML, not a stub tree.
+  window.document.write(html.replace(script[0], ""));
 
   const messages: ClientMessage[] = [];
-  let receive: ((event: { data: unknown }) => void) | undefined;
   let requestSequence = 0;
   let motionChange: (() => void) | undefined;
   const motion = {
@@ -288,47 +231,61 @@ export function scriptFixture(cache: { value?: unknown } = {}, instanceKey = "te
       motionChange = listener;
     },
   };
-  const script = html.match(/<script nonce="test-nonce">([\s\S]*?)<\/script>/);
-  assert.ok(script, "Expected a nonce-protected dashboard client script");
-  runInNewContext(script[1], {
+
+  Object.assign(window, {
     acquireVsCodeApi: () => ({
       postMessage(message: unknown) {
         assert.ok(isClientMessage(message), "Expected string fields in client transport output");
-        messages.push(message);
+        messages.push(message as ClientMessage);
       },
       getState: () => cache.value,
       setState: (value: unknown) => { cache.value = value; },
     }),
-    document: Object.assign(document, {
-      getElementById: element,
-      createElement: (tag: string) => new Element(tag, document),
-      addEventListener: root.addEventListener.bind(root),
-    }),
-    window: {
-      addEventListener: (_name: string, listener: typeof receive) => { receive = listener; },
-      matchMedia(query: string) {
-        assert.equal(query, '(prefers-reduced-motion: reduce)');
-        return motion;
-      },
-      getComputedStyle: () => ({
-        paddingTop: '10px', paddingBottom: '10px', marginTop: '0px', marginBottom: '0px',
-        borderTopWidth: '0px', borderBottomWidth: '1px',
-      } satisfies Pick<CSSStyleDeclaration, 'paddingTop' | 'paddingBottom' | 'marginTop' | 'marginBottom' | 'borderTopWidth' | 'borderBottomWidth'>),
+    matchMedia(query: string) {
+      assert.equal(query, '(prefers-reduced-motion: reduce)');
+      return motion;
     },
+    getComputedStyle: () => ({
+      paddingTop: '10px', paddingBottom: '10px', marginTop: '0px', marginBottom: '0px',
+      borderTopWidth: '0px', borderBottomWidth: '1px',
+    }),
     crypto: { randomUUID: () => instanceKey + ":" + ++requestSequence + ":" + fixtureSequence },
   });
-  assert.equal(messages[0]?.type, "ready");
-  assert.ok(receive, "Expected the dashboard client to register its host-message listener");
-  const receiveMessage = receive;
+
+  window.eval(script[1]);
+  assert.equal(messages[0]?.type, "ready", "Expected the client to announce readiness");
+
+  function element(id: string): Element {
+    const node = window.document.getElementById(id);
+    assert.ok(node, `Expected dashboard element #${id}`);
+    return node as unknown as Element;
+  }
+
+  const elements = new Map<string, Element>();
+  for (const node of window.document.querySelectorAll('[id]')) {
+    elements.set(node.id, node as unknown as Element);
+  }
+
+  const post = (message: unknown): void => {
+    const event = new window.MessageEvent('message', { data: message });
+    (window.dispatchEvent as (value: unknown) => void)(event);
+  };
 
   return {
-    elements, element, messages, document: completeDocument,
-    receive: (message: unknown) => receiveMessage({ data: message }),
+    elements,
+    element,
+    messages,
+    document: {
+      get activeElement() { return window.document.activeElement as unknown as Element | null; },
+      set activeElement(node: Element | null) { node?.focus(); },
+      get root() { return window.document.body as unknown as Element; },
+    },
+    receive: post,
     showArchives() {
       element("more").click();
       element("show-archives").click();
     },
-    update: (next: DashboardState) => receiveMessage({ data: { type: "state", state: next } }),
+    update: (next: DashboardState) => post({ type: "state", state: next }),
     setReducedMotion(reduced: boolean) {
       motion.matches = reduced;
       motionChange?.();

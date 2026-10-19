@@ -8,6 +8,16 @@ import { isDashboardHostMessage } from "../src/dashboardClient";
 import { viewFixture } from "./dashboardViewFixture";
 import { scriptFixture, lastMessage, type Element } from "./dashboardClientFixture";
 
+/**
+ * Attribute name/value pairs.
+ *
+ * Comparing live `NamedNodeMap`s instead would walk each `Attr`'s owner element, document and
+ * window, which exhausts the heap.
+ */
+function attributePairs(node: Element): [string, string][] {
+  return Array.from(node.attributes, (attribute) => [attribute.name, attribute.value]);
+}
+
 function note(overrides: Partial<Extract<DashboardNote, { path: string }>> = {}): Extract<DashboardNote, { path: string }> {
   return {
     id: "projection:0", path: "src/example.ts", startLine: 4, endLine: 6,
@@ -364,9 +374,17 @@ test("static shell has nonce-only CSP, accessible full-text copy button and resp
   assert.match(html, /default-src 'none'; script-src 'nonce-test-nonce'; style-src 'nonce-test-nonce'/);
   assert.match(html, /base-uri 'none'; form-action 'none'/);
   assert.equal((html.match(/nonce="test-nonce"/g) || []).length, 2);
-  assert.doesNotMatch(html, /https?:|<script[^>]+src=|<link|unsafe-inline|innerHTML|outerHTML|eval\(/i);
+  // Preact bundles the XML namespace URIs it passes to createElementNS. They are identifiers
+  // rather than fetched resources, so only they are exempt; any other URL still fails.
+  const withoutNamespaces = html.replace(/http:\/\/www\.w3\.org\/(?:1998\/Math\/MathML|1999\/xhtml|2000\/svg)/g, '');
+  assert.doesNotMatch(withoutNamespaces, /https?:|<script[^>]+src=|<link|unsafe-inline|outerHTML|eval\(/i);
+  // Preact's bundled dangerouslySetInnerHTML support puts `innerHTML` in the shipped script, so
+  // the shell can no longer ban the string outright. The client itself must still never write
+  // markup: every value it renders is untrusted review prose.
+  const client = readFileSync(resolve(__dirname, "../../src/dashboardClient.tsx"), "utf8");
+  assert.doesNotMatch(client, /innerHTML|outerHTML|dangerouslySetInnerHTML|insertAdjacentHTML/);
   assert.match(html, /<button id="copy"[^>]+hidden disabled>Copy Review Notes &amp; Clear<\/button>/);
-  const explanation = "Copies your review notes to the clipboard, archives this batch, and clears the current review notes.";
+  const explanation = "Copies your Review Notes to the clipboard, archives this batch, and clears the current Review Notes.";
   const copy = matchedText(html, /<button id="copy"[^>]*>/);
   assert.ok(copy.includes(`title="${explanation}"`));
   assert.ok(copy.includes(`aria-description="${explanation}"`));
@@ -375,7 +393,7 @@ test("static shell has nonce-only CSP, accessible full-text copy button and resp
     assert.ok(!paragraph[0].includes(explanation));
   }
   assert.doesNotMatch(html, /select-repository|<header\b|<h1\b|id="repository"|repoName/);
-  assert.match(html, /<button id="copy"[^>]*>[^<]*<\/button>\s*<section id="files-section"[^>]*>[\s\S]*?<\/section>\s*<p id="count"[^>]*>0 review notes<\/p>/);
+  assert.match(html, /<button id="copy"[^>]*>[^<]*<\/button>\s*<section id="files-section"[^>]*>[\s\S]*?<\/section>\s*<p id="count"[^>]*>0 Review Notes<\/p>/);
   assert.match(html, /<h2 id="files-title">Files to Review \(0\)<\/h2>/);
   assert.match(html, /<p id="no-files" class="muted">No files to review\.<\/p>/);
   assert.match(html, /\.file-insertions \{ color: var\(--vscode-gitDecoration-addedResourceForeground,/);
@@ -693,10 +711,10 @@ test("settled counts and unavailable rows retain keyed display while only new ro
     assert.equal(known.children[2].textContent, "-1");
     assert.equal(known.children[3].hidden, true);
     assert.equal(unavailable.children[3].textContent, "Stats unavailable");
-    assert.equal(unavailable.attributes.get("aria-label"), "Open file: image.png, Stats unavailable");
+    assert.equal(unavailable.getAttribute("aria-label"), "Open file: image.png, Stats unavailable");
     const added = client.element("files").children[2].children[0];
     assert.equal(added.children[3].textContent, "Loading stats");
-    assert.equal(added.attributes.get("aria-label"), "Open file: new.ts, Loading stats");
+    assert.equal(added.getAttribute("aria-label"), "Open file: new.ts, Loading stats");
   }
 
   client.update(state({ files: [
@@ -708,7 +726,7 @@ test("settled counts and unavailable rows retain keyed display while only new ro
   assert.equal(known.children[1].hidden, true);
   assert.equal(known.children[2].hidden, true);
   assert.equal(known.children[3].textContent, "Stats unavailable");
-  assert.equal(known.attributes.get("aria-label"), "Open file: src/known.ts, Stats unavailable");
+  assert.equal(known.getAttribute("aria-label"), "Open file: src/known.ts, Stats unavailable");
   assert.equal(client.element("files").children[2].children[0].children[1].textContent, "+3");
 });
 
@@ -1785,14 +1803,14 @@ test("archives are discoverable only through More actions, with keyboard opening
   update(empty);
   assert.equal(element("history").hidden, true);
   assert.equal(element("more-menu").hidden, true);
-  assert.equal(element("more").attributes.get("aria-label"), "More actions");
+  assert.equal(element("more").getAttribute("aria-label"), "More actions");
   element("show-archives").click();
   element("archives").children[0].children[1].click();
   assert.equal(element("history").hidden, true);
   assert.equal(messages.length, 1);
   assert.equal(element("more").dispatch("keydown", "ArrowDown"), true);
   assert.equal(element("more-menu").hidden, false);
-  assert.equal(element("more").attributes.get("aria-expanded"), "true");
+  assert.equal(element("more").getAttribute("aria-expanded"), "true");
   assert.equal(document.activeElement, element("show-archives"));
   assert.equal(element("more-menu").dispatch("keydown", "End"), true);
   assert.equal(document.root.dispatch("keydown", "Escape"), true);
@@ -1826,7 +1844,7 @@ test("archives are discoverable only through More actions, with keyboard opening
   assert.equal(element("history").hidden, true, "meaningful raw feedback blocks history even with zero parsed notes");
   showArchives();
   assert.equal(element("show-archives").disabled, false);
-  assert.equal(element("show-archives").attributes.get("aria-disabled"), "true");
+  assert.equal(element("show-archives").getAttribute("aria-disabled"), "true");
   assert.equal(element("history").hidden, true);
   document.root.dispatch("keydown", "Escape");
   update(empty);
@@ -1856,20 +1874,20 @@ for (const activation of ["click", "Enter", " "]) test(`unavailable archives exp
   const archives = element("show-archives");
   update(current);
   assert.equal(unavailable.hidden, true);
-  assert.equal(unavailable.attributes.get("role"), "status");
+  assert.equal(unavailable.getAttribute("role"), "status");
   assert.equal(archives.disabled, false, "unavailable is not natively disabled, so its explanation is reachable");
-  assert.equal(archives.attributes.get("aria-disabled"), "true");
-  assert.equal(archives.attributes.get("role"), "menuitem");
+  assert.equal(archives.getAttribute("aria-disabled"), "true");
+  assert.equal(archives.getAttribute("role"), "menuitem");
   assert.equal(element("more").dispatch("keydown", "ArrowDown"), true);
   assert.equal(document.activeElement, archives);
   assert.equal(element("more-menu").hidden, false);
   if (activation === "click") archives.click();
   else { archives.dispatch("keydown", activation); archives.dispatch("keyup", activation); }
   assert.equal(element("more-menu").hidden, true);
-  assert.equal(element("more").attributes.get("aria-expanded"), "false");
+  assert.equal(element("more").getAttribute("aria-expanded"), "false");
   assert.equal(document.activeElement, element("more"));
   assert.equal(unavailable.hidden, false);
-  assert.equal(unavailable.textContent, "Recent Archives are available when there are no current saved Review Notes. Finish your review, then use Copy Review Notes & Clear to view or recover an earlier batch.");
+  assert.equal(unavailable.textContent, "Restore Last Copied Review Notes is available when there are no current Review Notes in this checkout. Finish your review, then use Copy Review Notes & Clear.");
   assert.equal(unavailable.children.length, 0);
   assert.equal(element("history").hidden, true);
   assert.equal(element("copy").hidden, false);
@@ -1883,7 +1901,7 @@ for (const activation of ["click", "Enter", " "]) test(`unavailable archives exp
     assert.equal(unavailable.hidden, true);
     assert.equal(unavailable.textContent, "", "hiding clears the live status text");
     assert.equal(element("history").hidden, true);
-    if (!reset.hasFeedback) assert.equal(archives.attributes.get("aria-disabled"), "false");
+    if (!reset.hasFeedback) assert.equal(archives.getAttribute("aria-disabled"), "false");
     update(current);
     assert.equal(unavailable.hidden, true, "returning to feedback or the old scope must not revive the explanation");
     element("more").click(); archives.click();
@@ -1932,9 +1950,9 @@ test("general cards edit rather than navigate and toolbar opens an explicit gene
   assert.equal(open.children[0].textContent, "General Review Note");
   assert.equal(open.title, "Edit Review Note: General Review Note");
   assert.equal(edit.title, "Edit Review Note");
-  assert.equal(edit.attributes.get("aria-label"), "Edit Review Note");
+  assert.equal(edit.getAttribute("aria-label"), "Edit Review Note");
   assert.equal(remove.title, "Delete Review Note");
-  assert.equal(remove.attributes.get("aria-label"), "Delete Review Note");
+  assert.equal(remove.getAttribute("aria-label"), "Delete Review Note");
   open.click();
   edit.click();
   element("add-general").click();
@@ -2088,7 +2106,7 @@ test("modal cancel buttons, busy guards, new session initialization and cross-fo
   element("editor-body").dispatch("input");
   assert.equal(element("note-editor").dispatch("cancel"), true);
   for (const row of [...element("files").children, ...element("notes").children]) {
-    for (const button of row.children.filter(child => child.tagName === 'button')) {
+    for (const button of row.children.filter(child => child.tagName === 'BUTTON')) {
       assert.equal(button.disabled, true);
       button.invokeListener("click");
     }
@@ -2118,13 +2136,13 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   update(current);
   assert.equal(elements.has("repository"), false);
   assert.equal(elements.has("select-repository"), false);
-  assert.equal([...elements.values()].some((node) => node.tagName === "h1"), false);
+  assert.equal([...elements.values()].some((node) => node.tagName === "H1"), false);
   assert.equal(element("error").textContent, unsafe);
   assert.equal(element("note-error").textContent, unsafe);
   assert.equal(element("note-error").hidden, false);
   assert.equal(element("error").children.length, 0);
   assert.equal(element("note-error").children.length, 0);
-  assert.equal(element("count").textContent, "2 review notes");
+  assert.equal(element("count").textContent, "2 Review Notes");
   assert.equal(element("copy").hidden, false);
   assert.equal(elements.has("explanation"), false);
   assert.equal(element("copy").disabled, false);
@@ -2146,11 +2164,11 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   const row = element("archives").children[0];
   const date = row.children[0].children[0];
   const recover = row.children[1];
-  assert.equal(date.tagName, "time");
+  assert.equal(date.tagName, "TIME");
   assert.equal(date.dateTime, new Date(empty.archives[0].createdAt).toISOString());
   assert.equal(date.textContent, new Date(empty.archives[0].createdAt).toLocaleString());
-  assert.equal(row.children[0].children[1].textContent, "3 review notes");
-  assert.equal(recover.textContent, "Recover");
+  assert.equal(row.children[0].children[1].textContent, "3 Review Notes");
+  assert.equal(recover.textContent, "Restore");
   recover.click();
   assert.deepEqual({ ...lastMessage(messages) }, { type: "restore", repoKey: "/repo", archiveId: "batch" });
   update({ ...empty, historyVisible: true, busy: true });
@@ -2159,9 +2177,9 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   assert.equal(recover.disabled, true);
   recover.click();
   assert.equal(messages.length, 4);
-  assert.equal(element("dashboard").attributes.get("aria-busy"), "true");
+  assert.equal(element("dashboard").getAttribute("aria-busy"), "true");
   update(state({ commentCount: 1, busy: true }));
-  assert.equal(element("count").textContent, "1 review note");
+  assert.equal(element("count").textContent, "1 Review Note");
   assert.equal(element("copy").hidden, false);
   assert.equal(element("copy").disabled, true);
   element("copy").click();
@@ -2179,7 +2197,7 @@ test("webview script safely updates text, dates, buttons and archive nodes witho
   for (const count of [0, 1]) {
     update({ ...empty, archives: [{ ...empty.archives[0], commentCount: count }] });
     assert.equal(element("archives").children[0].children[0].children[1].textContent,
-      count === 1 ? "1 review note" : "0 review notes");
+      count === 1 ? "1 Review Note" : "0 Review Notes");
   }
   update({ ...empty, archives: [] });
   assert.equal(element("no-archives").hidden, false);
@@ -2213,7 +2231,7 @@ test('file status labels accompany counts and omit redundant zeroes without gues
     const [, additions, deletions, unavailable, kind] = open.children;
     assert.deepEqual([kind, additions, deletions, unavailable].filter(node => !node.hidden).map(node => node.textContent), expected);
     if (file.changeKind) {
-      assert.ok(open.attributes.get('aria-label')?.includes(expected[0]));
+      assert.ok(open.getAttribute('aria-label')?.includes(expected[0]));
     }
   }
   assert.equal(isDashboardHostMessage({ type: 'state', state: state({ files: [{ id: 'a', path: 'a', changeKind: 'renamed' }] }) }), true);
@@ -2235,11 +2253,11 @@ test("busy transitions reuse keyed rows and all descendants while disabling cont
   };
   capture(element("dashboard"));
   const controls = [element("copy"), element("add-general"), element("more"), element("show-archives"),
-    ...element("files").children.flatMap(row => row.children.filter(child => child.tagName === 'button')),
+    ...element("files").children.flatMap(row => row.children.filter(child => child.tagName === 'BUTTON')),
     ...element("notes").children.flatMap(row => row.children)];
   for (const busy of [true, false, true, false]) {
     update({ ...current, busy });
-    assert.equal(element("dashboard").attributes.get("aria-busy"), String(busy));
+    assert.equal(element("dashboard").getAttribute("aria-busy"), String(busy));
     for (const { node, children } of nodes) {
       assert.equal(node.isConnected, true);
       assert.equal(node.children.length, children.length);
@@ -2271,13 +2289,13 @@ test("file heading counts confirmed candidates and visible/pending metadata upda
   assert.equal(fileLabel.children.length, 1);
   assert.equal(fileLabel.children[0].className, 'file-name');
   assert.equal(first.className, 'file-row file-in-editor');
-  assert.match(first.children[0].attributes.get('aria-label') || '', /Visible in editor/);
+  assert.match(first.children[0].getAttribute('aria-label') || '', /Visible in editor/);
   for (const pending of ['stage', 'revert'] as const) {
     client.update(state({ files: [{ ...files[0], pending }, files[1]], busy: true }));
     assert.equal(client.element('files').children[0], first);
     assert.equal(first.className, 'file-row file-in-editor file-pending');
-    assert.equal(first.attributes.get('aria-busy'), 'true');
-    assert.equal(first.children[4].attributes.get('role'), 'status');
+    assert.equal(first.getAttribute('aria-busy'), 'true');
+    assert.equal(first.children[4].getAttribute('role'), 'status');
     assert.equal(first.children[4].hidden, false);
     assert.equal(first.children[4].textContent, pending === 'stage' ? 'Staging file' : 'Reverting file');
     assert.equal(second.className, 'file-row');
@@ -2297,7 +2315,7 @@ test("file heading counts confirmed candidates and visible/pending metadata upda
   client.update(state({ files: [{ ...files[0], visible: false }, files[1]] }));
   assert.equal(first.className, 'file-row');
   assert.equal(first.children[4].hidden, true);
-  assert.doesNotMatch(first.children[0].attributes.get('aria-label') || '', /Visible in editor/);
+  assert.doesNotMatch(first.children[0].getAttribute('aria-label') || '', /Visible in editor/);
   assert.equal(first.children[0].disabled, false);
   client.update(state({ files: [] }));
   assert.equal(client.element('files-title').textContent, 'Files to Review (0)');
@@ -2316,7 +2334,7 @@ test("confirmed removals collapse actual row boxes, stay inert and clean up on a
   client.update(state({ files: [] }));
   assert.equal(row.isConnected, true);
   assert.equal(row.inert, true);
-  assert.equal(row.attributes.get('aria-hidden'), 'true');
+  assert.equal(row.getAttribute('aria-hidden'), 'true');
   assert.equal(client.element('files-title').textContent, 'Files to Review (0)');
   assert.equal(client.element('no-files').hidden, false);
   for (const button of row.children.slice(0, 3)) {
@@ -2354,7 +2372,7 @@ test("concurrent exits survive reorder, reappearing rows cancel and reuse, and o
   client.update(state({ files: [c, a, b] }));
   assert.equal(rowB.animations[0].cancelled, true);
   assert.equal(rowB.inert, false);
-  assert.equal(rowB.attributes.has('aria-hidden'), false);
+  assert.equal(rowB.hasAttribute('aria-hidden'), false);
   assert.equal(rowB.children[0].disabled, false);
   assert.deepEqual(client.element('files').children.filter(row => !row.inert), [rowC, rowA, rowB]);
   assert.equal(client.element('files-title').textContent, 'Files to Review (3)');
@@ -2431,14 +2449,14 @@ test("files without feedback render text-only stats and sibling accessible rever
   for (const [index, row] of rows.entries()) {
     assert.equal(row.className, "file-row");
     assert.deepEqual(row.children.map(node => [node.tagName, node.className, node.type]), [
-      ["button", "file-open", "button"], ["button", "file-action file-revert", "button"],
-      ["button", "file-action file-note", "button"],
-      ["button", "file-action file-stage", "button"],
-      ["span", "file-progress", ""],
+      ["BUTTON", "file-open", "button"], ["BUTTON", "file-action file-revert", "button"],
+      ["BUTTON", "file-action file-note", "button"],
+      ["BUTTON", "file-action file-stage", "button"],
+      ["SPAN", "file-progress", undefined],
     ]);
     const [open, revert, addNote, stage] = row.children;
     assert.equal(addNote.title, 'Add File Review Note');
-    assert.equal(addNote.attributes.get('aria-label'), 'Add File Review Note');
+    assert.equal(addNote.getAttribute('aria-label'), 'Add File Review Note');
     addNote.click();
     assert.deepEqual({ ...lastMessage(messages) }, { type: 'addFileNote', repoKey: '/repo', fileId: files[index].id });
     assert.equal(open.title, files[index].path);
@@ -2451,22 +2469,22 @@ test("files without feedback render text-only stats and sibling accessible rever
       assert.ok(template);
       const templateSvg = template.children[0];
       assert.equal(button.title, label);
-      assert.equal(button.attributes.get("aria-label"), label);
+      assert.equal(button.getAttribute("aria-label"), label);
       assert.equal(button.textContent, "", `${action} is icon-only`);
       assert.equal(button.hidden, false, "opacity must not remove the button from keyboard navigation");
       assert.equal(button.disabled, false);
-      assert.equal(button.attributes.has("tabindex"), false, "native buttons stay in the tab order");
+      assert.equal(button.hasAttribute("tabindex"), false, "native buttons stay in the tab order");
       assert.equal(button.children.length, 1);
       const svg = button.children[0];
       assert.equal(svg.tagName, "svg");
       assert.notEqual(svg, templateSvg);
-      assert.deepEqual(svg.attributes, templateSvg.attributes);
-      assert.equal(svg.attributes.get("aria-hidden"), "true");
-      assert.equal(svg.attributes.get("focusable"), "false");
+      assert.deepEqual(attributePairs(svg), attributePairs(templateSvg));
+      assert.equal(svg.getAttribute("aria-hidden"), "true");
+      assert.equal(svg.getAttribute("focusable"), "false");
       assert.equal(svg.children.length, 1);
       assert.equal(svg.children[0].tagName, "path");
       assert.notEqual(svg.children[0], templateSvg.children[0]);
-      assert.deepEqual(svg.children[0].attributes, templateSvg.children[0].attributes);
+      assert.deepEqual(attributePairs(svg.children[0]), attributePairs(templateSvg.children[0]));
       if (index > 0) assert.notEqual(svg, rows[0].children[action === "revert" ? 1 : 3].children[0]);
       button.focus();
       assert.equal(document.activeElement, button);
@@ -2489,16 +2507,16 @@ test("files without feedback render text-only stats and sibling accessible rever
   assert.equal(known.children[2].textContent, "-1");
   assert.equal(known.children[2].className, "file-deletions");
   assert.equal(known.children[3].hidden, true);
-  assert.equal(known.attributes.get("aria-label"), `Open file: src/${unsafe}.ts, 2 insertions, 1 deletion`);
+  assert.equal(known.getAttribute("aria-label"), `Open file: src/${unsafe}.ts, 2 insertions, 1 deletion`);
   const unknown = rows[1].children[0];
   assert.equal(unknown.children[1].hidden, true);
   assert.equal(unknown.children[2].hidden, true);
   assert.equal(unknown.children[3].hidden, false);
   assert.equal(unknown.children[3].textContent, "Stats unavailable");
-  assert.equal(unknown.attributes.get("aria-label"), "Open file: assets/image.png, Stats unavailable");
+  assert.equal(unknown.getAttribute("aria-label"), "Open file: assets/image.png, Stats unavailable");
   update({ ...current, files: files.map(file => ({ ...file, statisticsPending: true })) });
   assert.equal(unknown.children[3].textContent, "Loading stats");
-  assert.equal(unknown.attributes.get("aria-label"), "Open file: assets/image.png, Loading stats");
+  assert.equal(unknown.getAttribute("aria-label"), "Open file: assets/image.png, Loading stats");
   assert.equal(rows[1].children[1].disabled, false, "background stats do not block file actions");
   assert.equal(rows[1].children[2].disabled, false);
   update(current);
@@ -2511,7 +2529,7 @@ test("files without feedback render text-only stats and sibling accessible rever
   update({ ...current, busy: true });
   for (const row of rows) {
     assert.equal(row.isConnected, true);
-    for (const button of row.children.filter(child => child.tagName === 'button')) {
+    for (const button of row.children.filter(child => child.tagName === 'BUTTON')) {
       assert.equal(button.disabled, true);
       button.click();
       button.invokeListener("click");
@@ -2522,7 +2540,7 @@ test("files without feedback render text-only stats and sibling accessible rever
   assert.equal(element("files-error").textContent, "File action failed");
   assert.equal(element("files").children.length, 3);
   assert.equal(element("files").children[0], rows[0]);
-  for (const button of rows[0].children.filter(child => child.tagName === 'button')) assert.equal(button.disabled, false, "actions can be retried after busy clears");
+  for (const button of rows[0].children.filter(child => child.tagName === 'BUTTON')) assert.equal(button.disabled, false, "actions can be retried after busy clears");
   update({ ...current, files: [], filesError: undefined });
   assert.equal(element("files-section").hidden, false);
   assert.equal(element("files").children.length, 0);
@@ -2556,8 +2574,12 @@ for (const [buttonIndex, type] of ["openFile", "revertFile", "addFileNote", "sta
   assert.equal(open.children[1].textContent, "");
   assert.equal(open.children[1].hidden, true);
   assert.equal(open.children[3].hidden, false);
+  // Keyed diffing relocates the minimum number of rows: the row at index 0 moves, so the focus
+  // guard is exercised through that row rather than one that happened to stay put.
+  const movingButton = element("files").children[0].children[buttonIndex];
+  movingButton.focus();
   update({ ...current, busy: true });
-  assert.notEqual(document.activeElement, button, "moved disabled controls must not regain focus");
+  assert.notEqual(document.activeElement, movingButton, "moved disabled controls must not regain focus");
   update(current);
   button.focus();
   update({ ...current, files: [second] });
@@ -2609,10 +2631,10 @@ test("note cards contain only title and two-line text preview plus sibling acces
   for (const [index, card] of cards.entries()) {
     assert.equal(card.className, "note-card");
     assert.deepEqual(card.children.map(node => [node.tagName, node.className, node.type]), [
-      ["button", "note-open", "button"], ["button", "note-action note-edit", "button"], ["button", "note-action note-delete", "button"],
+      ["BUTTON", "note-open", "button"], ["BUTTON", "note-action note-edit", "button"], ["BUTTON", "note-action note-delete", "button"],
     ], "no action container or extra comparison button");
     assert.deepEqual(card.children[0].children.map(node => [node.tagName, node.className]), [
-      ["span", "note-title"], ["span", "note-preview"],
+      ["SPAN", "note-title"], ["SPAN", "note-preview"],
     ], "no directory, context or status DOM");
     for (const node of card.children[0].children) assert.equal(node.children.length, 0, "preview and title are text-only");
     const deleteButton = card.children[2];
@@ -2621,38 +2643,38 @@ test("note cards contain only title and two-line text preview plus sibling acces
     const svg = deleteButton.children[0];
     assert.equal(svg.tagName, "svg");
     assert.notEqual(svg, templateSvg);
-    assert.deepEqual(svg.attributes, templateSvg.attributes);
-    assert.equal(svg.attributes.get("aria-hidden"), "true");
-    assert.equal(svg.attributes.get("focusable"), "false");
+    assert.deepEqual(attributePairs(svg), attributePairs(templateSvg));
+    assert.equal(svg.getAttribute("aria-hidden"), "true");
+    assert.equal(svg.getAttribute("focusable"), "false");
     assert.equal(svg.children.length, 1);
     assert.equal(svg.children[0].tagName, "path");
     assert.notEqual(svg.children[0], templateSvg.children[0]);
-    assert.deepEqual(svg.children[0].attributes, templateSvg.children[0].attributes);
+    assert.deepEqual(attributePairs(svg.children[0]), attributePairs(templateSvg.children[0]));
     if (index > 0) assert.notEqual(svg, cards[0].children[2].children[0]);
     assert.equal(deleteButton.title, "Delete Review Note");
-    assert.equal(deleteButton.attributes.get("aria-label"), deleteButton.title);
+    assert.equal(deleteButton.getAttribute("aria-label"), deleteButton.title);
     const editButton = card.children[1];
     assert.equal(editButton.title, "Edit Review Note");
-    assert.equal(editButton.attributes.get("aria-label"), editButton.title);
-    assert.deepEqual(editButton.children[0].attributes, editTemplate.children[0].attributes);
+    assert.equal(editButton.getAttribute("aria-label"), editButton.title);
+    assert.deepEqual(attributePairs(editButton.children[0]), attributePairs(editTemplate.children[0]));
     for (const button of [editButton, deleteButton]) {
       assert.equal(button.hidden, false);
-      assert.equal(button.attributes.has("tabindex"), false);
+      assert.equal(button.hasAttribute("tabindex"), false);
     }
   }
   assert.equal(title.textContent, `${unsafe}.ts:4-6`);
   assert.equal(preview.textContent, unsafe + "\n**second line**");
   assert.equal(preview.hidden, false);
-  assert.equal(open.attributes.get("aria-description"), "Go to code");
+  assert.equal(open.getAttribute("aria-description"), "Go to code");
   assert.equal(open.title, `Go to code: unsafe/${unsafe}.ts:4-6`);
 
   const comparisonOpen = cards[1].children[0];
   assert.equal(comparisonOpen.children[0].textContent, "compare.ts:8");
-  assert.equal(comparisonOpen.attributes.get("aria-description"), "Open code comparison");
+  assert.equal(comparisonOpen.getAttribute("aria-description"), "Open code comparison");
   assert.equal(comparisonOpen.title, "Open code comparison: compare.ts:8");
   const staleOpen = cards[2].children[0];
   assert.equal(staleOpen.children[1].hidden, true);
-  assert.equal(staleOpen.attributes.get("aria-description"), "Open saved Review Note");
+  assert.equal(staleOpen.getAttribute("aria-description"), "Open saved Review Note");
   assert.equal(staleOpen.title, "Open saved Review Note: missing.ts:4-6");
   assert.equal(staleOpen.disabled, false);
   open.click();
@@ -2712,14 +2734,20 @@ test("keyed note cards reuse and reorder nodes, update metadata and preserve onl
   assert.equal(open.children[1].hidden, false);
   assert.equal(document.activeElement, open);
   assert.equal(remove.title, "Delete Review Note");
-  assert.equal(remove.attributes.get("aria-label"), remove.title);
+  assert.equal(remove.getAttribute("aria-label"), remove.title);
   assert.equal(remove.disabled, false);
-  remove.focus();
+  // Keyed diffing relocates the minimum number of nodes: in a two-card swap the card at index 0
+  // moves. Focus assertions target that card so they exercise a real move rather than a row that
+  // happened to stay put.
+  const movingDelete = (): Element => element("notes").children[0].children[2];
+  let moved = movingDelete();
+  moved.focus();
   update(state({ notes: [changed, second] }));
-  assert.equal(document.activeElement, remove, "moving the focused row restores delete focus");
-  update(state({ notes: [second, changed] }));
-  update(state({ notes: [changed, second], busy: true }));
-  assert.notEqual(document.activeElement, remove, "a moved disabled control must not regain focus");
+  assert.equal(document.activeElement, moved, "moving the focused row restores delete focus");
+  moved = movingDelete();
+  moved.focus();
+  update(state({ notes: [second, changed], busy: true }));
+  assert.notEqual(document.activeElement, moved, "a moved disabled control must not regain focus");
   update(state({ notes: [second, changed] }));
   remove.focus();
   update(state({ notes: [first, second] }));

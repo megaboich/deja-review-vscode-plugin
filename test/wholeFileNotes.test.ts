@@ -9,7 +9,7 @@ test('whole-file notes round-trip explicit scope and arbitrary bodies without an
     const text = appendComment('', {
       wholeFile: true, path: 'src/a.ts', startLine: 1, endLine: 1, origin: 'changed', side: 'document', body,
     });
-    assert.ok(text.startsWith('## `src/a.ts`:file\nSelected: Working tree\n'));
+    assert.ok(text.startsWith('## `src/a.ts`:file (Working tree)\n'));
     const parsed = parse(text);
     assert.deepEqual(parsed.diagnostics, []);
     assert.equal(parsed.comments.length, 1);
@@ -36,9 +36,9 @@ test('whole-file body edits and deletion preserve BOM, CRLF, siblings and scope'
 
 test('whole-file notes reject anchors, elision and comparison metadata rather than guessing', () => {
   for (const block of [
-    '## `a`:file; Snippet: elided\nSelected: Working tree\n\nBody\n',
-    '## `a`:file\nSelected: Working tree\n\n```\nanchor\n```\nBody\n',
-    '## `a`:file\nComparison: HEAD -> Working tree\nSelected: Modified (Working tree)\nBody\n',
+    '## `a`:file (Working tree); Snippet: elided\n\n💬 Body\n',
+    '## `a`:file (Working tree)\n\n```\nanchor\n```\n💬 Body\n',
+    '## `a`:file (Modified: Working tree vs HEAD)\n💬 Body\n',
   ]) {
     const parsed = parse(block);
     assert.equal(parsed.comments.length, 0);

@@ -1,16 +1,22 @@
 import { normalizeComment, normalizeResource } from './model';
 import type { Comparison, Origin, ParseResult, ReviewComment, Side } from './model';
 
-const HEADER = /^##\s+`(?<path>[^`]+)`\s*:\s*(?<range>(?<wholeFile>file)|(?<start>\d+)(?:\s*-\s*(?<end>\d+))?)(?:\s*;\s*Snippet\s*:\s*(?<elided>elided))?\s*$/di;
+/** Saved-file marker introducing a note body. The model and UI body never include it. */
+export const BODY_MARKER = '💬';
+/** Exact label following BODY_MARKER when the body needs a protective fenced wrapper. */
+export const WRAPPER_LABEL = 'Body: fenced';
+
+// `path`:range (context) with an optional trailing elision marker. The greedy context
+// capture stops at the last `)` on the line, so paths may contain parentheses.
+const HEADER = /^##\s+`(?<path>[^`]+)`\s*:\s*(?<range>(?<wholeFile>file)|(?<start>\d+)(?:\s*-\s*(?<end>\d+))?)\s+\((?<context>[^\r\n]*)\)(?:\s*;\s*Snippet\s*:\s*(?<elided>elided))?\s*$/di;
 const ORIGIN_LABEL = '(?:Working\\s+tree|Staging\\s+area|HEAD|Commit\\s+(?:[0-9a-f]{40}|[0-9a-f]{64}))';
-const DOCUMENT_SELECTION = new RegExp(`^\\s*Selected\\s*:\\s*(?<origin>${ORIGIN_LABEL})\\s*$`, 'i');
-const COMPARISON_SELECTION = new RegExp(
-  `^\\s*Selected\\s*:\\s*(?<side>Original|Modified)\\s*\\(\\s*(?<origin>${ORIGIN_LABEL})\\s*\\)\\s*$`, 'i');
-const SAME_FILE_COMPARISON = new RegExp(
-  `^\\s*Comparison\\s*:\\s*(?<leftOrigin>${ORIGIN_LABEL})\\s*->\\s*(?<rightOrigin>${ORIGIN_LABEL})\\s*$`, 'i');
-const NAMED_FILE_COMPARISON = new RegExp(
-  `^\\s*Comparison\\s*:\\s*\`(?<leftPath>[^\`]+)\`\\s*\\((?<leftOrigin>${ORIGIN_LABEL})\\)\\s*->\\s*`
-  + `\`(?<rightPath>[^\`]+)\`\\s*\\((?<rightOrigin>${ORIGIN_LABEL})\\)\\s*$`, 'i');
+const DOCUMENT_CONTEXT = new RegExp(`^\\s*(?<origin>${ORIGIN_LABEL})\\s*$`, 'i');
+const COMPARISON_CONTEXT = new RegExp(
+  `^\\s*(?<side>Original|Modified)\\s*:\\s*(?<origin>${ORIGIN_LABEL})\\s+vs\\s+`
+  + `(?:\`(?<oppositePath>[^\`]+)\`\\s*@\\s*)?(?<oppositeOrigin>${ORIGIN_LABEL})\\s*$`, 'i');
+// Matches only a marker that ends the line or is followed by one separating space,
+// so `💬Body: fenced` stays malformed rather than decoding as a wrapper.
+const BODY_MARKER_PREFIX = new RegExp(`^${BODY_MARKER}(?: |$)`);
 
 function parseOrigin(label: string): Origin {
   const value = label.toLowerCase().replace(/\s+/g, ' ');
@@ -24,18 +30,6 @@ function parseOrigin(label: string): Origin {
     default:
       return `commit:${value.slice('commit '.length)}`;
   }
-}
-
-function parseComparison(text: string, path: string): Comparison {
-  const endpoints = (SAME_FILE_COMPARISON.exec(text) ?? NAMED_FILE_COMPARISON.exec(text))?.groups;
-  if (!endpoints) {
-    throw new Error('invalid Comparison metadata');
-  }
-
-  return {
-    left: normalizeResource({ path: endpoints.leftPath ?? path, origin: parseOrigin(endpoints.leftOrigin) }),
-    right: normalizeResource({ path: endpoints.rightPath ?? path, origin: parseOrigin(endpoints.rightOrigin) }),
-  };
 }
 
 interface MarkdownLine {
@@ -91,23 +85,24 @@ export function scanMarkdown(text: string): { lines: MarkdownLine[]; openFence: 
 }
 
 function decodeBody(text: string, lines: MarkdownLine[], first: number, last: number): string {
-  if (first > last) {
-    return '';
+  const marker = first <= last ? BODY_MARKER_PREFIX.exec(lines[first].text) : null;
+  if (!marker) {
+    throw new Error(`expected ${BODY_MARKER} before the Review Note body`);
   }
-  if (lines[first].text !== 'Body: fenced') {
-    return text.slice(lines[first].start, lines[last].end);
+  if (lines[first].text.slice(marker[0].length) !== WRAPPER_LABEL) {
+    return text.slice(lines[first].start + marker[0].length, lines[last].end);
   }
 
   const opening = first + 1;
   if (opening >= last || !lines[opening].fenceOpen || !/^`{3,}markdown$/.test(lines[opening].text)) {
-    throw new Error('expected a fenced review note body');
+    throw new Error('expected a fenced Review Note body');
   }
   let closing = opening + 1;
   while (closing <= last && !lines[closing].fenceClose) {
     closing++;
   }
   if (closing !== last) {
-    throw new Error('fenced review note body must end at its closing fence');
+    throw new Error('fenced Review Note body must end at its closing fence');
   }
 
   // Decode once, removing only the structural newline before the closing fence.
@@ -119,20 +114,16 @@ export function parse(text: string): ParseResult {
   const { lines, openFence } = scanMarkdown(text);
   const headings = lines.flatMap((line, index) => line.heading ? [index] : []);
 
-  const preambleEnd = headings[0] ?? lines.length;
-  for (const line of lines.slice(0, preambleEnd)) {
-    const base = line.outsideFence && /^#\s+Review\s+\u00b7\s+base\s+([0-9a-f]{4,64})\s*$/i.exec(line.text);
-    if (base) {
-      result.base = base[1].toLowerCase();
-      break;
-    }
-  }
-
   for (let block = 0; block < headings.length; block++) {
     const first = headings[block];
     const limit = headings[block + 1] ?? lines.length;
     const header = lines[first];
     const general = header.text === '## General Review Note';
+    if (!general && /^##\s+general\s+review\s+notes?[\s:\d]*$/i.test(header.text)) {
+      // Near misses stay opaque, but silently ignoring them would hide the feedback from every view.
+      result.diagnostics.push({ line: first + 1, message: 'unparseable review block: a general note heading must be exactly "## General Review Note"' });
+      continue;
+    }
     if (!general && !/^##\s+`/.test(header.text)) {
       continue;
     }
@@ -143,7 +134,7 @@ export function parse(text: string): ParseResult {
       const fields = match?.groups;
       const range = match?.indices?.groups?.range;
       if (!general && (!fields || !range)) {
-        throw new Error('expected `path`:range and optional Snippet suffix');
+        throw new Error('expected `path`:range (context) and optional Snippet suffix');
       }
       if (limit === lines.length && openFence) {
         for (let index = first + 1; index < limit; index++) {
@@ -165,28 +156,23 @@ export function parse(text: string): ParseResult {
       // File grammar consumes context and an optional anchor; general notes start at the body.
       let file: (Omit<ReviewComment, 'body'> & { rangeStartOffset: number; rangeEndOffset: number }) | undefined;
       if (!general && fields && range) {
-        const { path, start, end, elided, wholeFile } = fields;
-        diagnosticLine = cursor < limit ? cursor : first;
-        let comparison: Comparison | undefined;
-        if (cursor < limit && /^\s*Comparison\s*:/i.test(lines[cursor].text)) {
-          comparison = parseComparison(lines[cursor].text, path);
-          cursor++;
-          skipBlanks();
-          diagnosticLine = cursor < limit ? cursor : diagnosticLine;
-        }
-
-        const selection = (comparison ? COMPARISON_SELECTION : DOCUMENT_SELECTION)
-          .exec(cursor < limit ? lines[cursor].text : '')?.groups;
+        const { path, start, end, elided, wholeFile, context } = fields;
+        const selection = (COMPARISON_CONTEXT.exec(context) ?? DOCUMENT_CONTEXT.exec(context))?.groups;
         if (!selection) {
-          throw new Error('invalid or missing Selected metadata');
+          throw new Error('invalid note context; use an origin or Original/Modified: selected origin vs opposite revision');
         }
         const origin = parseOrigin(selection.origin);
         let side: Side = 'document';
-        if (comparison) {
+        let comparison: Comparison | undefined;
+        if (selection.side) {
           side = selection.side.toLowerCase() === 'original' ? 'left' : 'right';
+          const selected = normalizeResource({ path, origin });
+          const opposite = normalizeResource({
+            path: selection.oppositePath ?? path,
+            origin: parseOrigin(selection.oppositeOrigin),
+          });
+          comparison = side === 'left' ? { left: selected, right: opposite } : { left: opposite, right: selected };
         }
-        cursor++;
-        skipBlanks();
 
         let anchorText: string | undefined;
         if (cursor < limit && lines[cursor].fenceOpen) {
@@ -227,9 +213,8 @@ export function parse(text: string): ParseResult {
       const endOffset = lines[last].next;
       const bodyStartOffset = cursor <= last ? lines[cursor].start : endOffset;
       const bodyEndOffset = cursor <= last ? lines[last].end : bodyStartOffset;
-      if (cursor <= last && lines[cursor].text === 'Body: fenced') {
-        diagnosticLine = cursor;
-      }
+      // A missing or malformed body marker belongs to the body line, not the heading.
+      diagnosticLine = cursor < limit ? cursor : first;
       const body = decodeBody(text, lines, cursor, last);
       const splice = {
         startOffset: header.start,
@@ -241,8 +226,10 @@ export function parse(text: string): ParseResult {
         rawBlock: text.slice(header.start, endOffset),
       };
       if (file) {
-        const { rangeStartOffset, rangeEndOffset, ...context } = file;
-        const comment = normalizeComment({ ...context, body });
+        const { rangeStartOffset, rangeEndOffset, ...commentFields } = file;
+        // normalizeComment rejects ranges, elision shape and comparison endpoints: heading errors.
+        diagnosticLine = first;
+        const comment = normalizeComment({ ...commentFields, body });
         result.comments.push({
           ...comment,
           ...splice,
@@ -256,7 +243,7 @@ export function parse(text: string): ParseResult {
     } catch (error) {
       result.diagnostics.push({
         line: diagnosticLine + 1,
-        message: `unparseable review block: ${error instanceof Error ? error.message : 'invalid review note'}`,
+        message: `unparseable review block: ${error instanceof Error ? error.message : 'invalid Review Note'}`,
       });
     }
   }

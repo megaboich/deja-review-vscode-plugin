@@ -72,7 +72,6 @@ export interface ParseResult {
   comments: ParsedComment[];
   generalNotes: ParsedGeneralNote[];
   diagnostics: { line: number; message: string }[];
-  base?: string;
 }
 
 export function parsedNotes(result: ParseResult): ParsedNote[] {
@@ -89,7 +88,7 @@ function isOrigin(value: string): value is Origin {
   return /^(?:changed|staged|head|commit:(?:[0-9a-f]{40}|[0-9a-f]{64}))$/.test(value);
 }
 
-export function normalizeResource(resource: Resource): Resource {
+export function normalizeResource(resource: { path: string; origin: string }): Resource {
   const path = resource.path.replace(/\\/g, '/');
   if (!path || path.startsWith('/') || /^[a-z]:/i.test(path)
     || /[\x00-\x1f\x7f`]/.test(path)

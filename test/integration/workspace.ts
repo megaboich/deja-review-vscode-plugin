@@ -14,8 +14,8 @@ import type { ReviewTestAPI } from './index';
 export async function testWorkspaceScope(git: GitResources, root: vscode.Uri, api: ReviewTestAPI, store: ReviewStore): Promise<void> {
   assert.equal(vscode.workspace.workspaceFolders?.[0]?.uri.toString(), root.toString());
   assert.equal(api.getState().repo, root.fsPath);
-  assert.equal(path.basename(store.uri.fsPath), 'REVIEW-NOTES.md');
-  assert.equal(store.uri.toString(), vscode.Uri.joinPath(root, 'REVIEW-NOTES.md').toString());
+  assert.equal(path.basename(store.uri.fsPath), 'notes.json');
+  assert.ok(!store.uri.fsPath.startsWith(root.fsPath + path.sep), 'Storage stays outside the project');
   assert.ok(!(await vscode.commands.getCommands()).includes('dejareview.selectRepository'));
   const extension = vscode.extensions.getExtension('local-review.dejareview');
   assert.ok(extension);
@@ -139,7 +139,11 @@ export async function run(): Promise<void> {
     assert.equal(api.getState().hasFeedback, false);
     const repo = await git.workspaceRepository();
     assert.ok(repo);
-    store = new ReviewStore(repo, new ReviewArchives(vscode.Uri.joinPath(root, '.test-archive-storage'), root));
+    await api.refresh();
+    const storagePath = api.getState().storagePath;
+    assert.ok(storagePath);
+    const storageUri = vscode.Uri.file(path.dirname(path.dirname(path.dirname(storagePath))));
+    store = new ReviewStore(repo, new ReviewArchives(storageUri, repo.checkoutUri ?? repo.rootUri, root));
     await within('subfolder workspace scope', () => testWorkspaceScope(git, root, api, store!));
     console.log('PASS subfolder startup without an editor and parent Git adapter');
 
@@ -156,7 +160,7 @@ export async function run(): Promise<void> {
     });
     console.log('PASS outside parent editor leaves subfolder scope unchanged');
 
-    await within('persist current-document feedback in subfolder REVIEW-NOTES.md', async () => {
+    await within('persist subfolder feedback in shared central checkout storage', async () => {
       const working = vscode.Uri.joinPath(root, 'sample.ts');
       const editor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(working), { preview: false });
       editor.selection = new vscode.Selection(0, 0, 1, 0);
@@ -168,7 +172,8 @@ export async function run(): Promise<void> {
       const body = 'Feedback scoped to the opened project folder';
       await vscode.commands.executeCommand('dejareview.submitComment', { thread: draft, text: body });
       await api.refresh();
-      const parsed = parse(await fs.readFile(path.join(root.fsPath, 'REVIEW-NOTES.md'), 'utf8'));
+      assert.ok(store);
+      const parsed = parse(await store.read() ?? '');
       assert.deepEqual(parsed.diagnostics, []);
       assert.equal(parsed.comments.length, 1);
       assert.equal(parsed.comments[0].path, 'sample.ts');
@@ -181,7 +186,7 @@ export async function run(): Promise<void> {
       assert.ok(api.getThreads().some(thread => thread.uri.toString() === working.toString()));
       assert.deepEqual(await readParentNotes(), parentBefore, 'Subfolder feedback must not change parent-root notes');
     });
-    console.log('PASS current-document command persists project-relative notes only in the subfolder');
+    console.log('PASS current-document command persists folder-projected notes in central checkout storage');
   } finally {
     store?.dispose();
     git.dispose();

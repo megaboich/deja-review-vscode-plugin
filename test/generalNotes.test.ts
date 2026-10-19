@@ -12,6 +12,7 @@ const fileNote: ReviewComment = {
 };
 
 const bodies = [
+  '💬 Literal emoji', '💬 Body: fenced', '💼 Literal feedback',
   '', 'Plain prose  ', '### Heading\n\nMore prose', '## General Review Note',
   '##', 'Before\n##\nAfter', 'Before\n##', 'Prose\n\n~~~markdown\n##\n~~~',
   '## `fake.ts`:1\nSelected: HEAD\n\nFake file note',
@@ -30,7 +31,7 @@ const bodies = [
 test('general notes serialize the exact header without synthetic file fields or metadata', () => {
   const input: GeneralReviewNote = { kind: 'general', body: 'Project-wide feedback' };
   const text = appendGeneralNote('', input.body);
-  assert.equal(text, '## General Review Note\n\nProject-wide feedback\n');
+  assert.equal(text, '## General Review Note\n\n💬 Project-wide feedback\n');
   const result = parse(text);
   assert.deepEqual(result.comments, []);
   assert.deepEqual(result.diagnostics, []);
@@ -49,11 +50,13 @@ test('only the exact unfenced general header is recognized; general bodies have 
   for (const header of ['## general review note', '## General Review Notes', '## General Review Note ',
     '##  General Review Note', '## General Review Note:1', '### General Review Note']) {
     assert.deepEqual(parsedNotes(parse(`${header}\n\nOpaque prose\n`)), [], header);
+    assert.equal(parse(`${header}\n\nOpaque prose\n`).diagnostics.length, header.startsWith('###') ? 0 : 1, header);
   }
+  assert.deepEqual(parse('## General review notes for this sprint\n\nOpaque prose\n').diagnostics, []);
   assert.deepEqual(parsedNotes(parse('```markdown\n## General Review Note\n```')), []);
   for (const body of ['Selected: HEAD', 'Comparison: arbitrary prose\nSelected: arbitrary prose',
     '```ts\nnot an anchor\n```', '~~~ts\nnot an anchor\n~~~']) {
-    const result = parse(`## General Review Note\n\n${body}\n`);
+    const result = parse(appendGeneralNote('', body));
     assert.deepEqual(result.diagnostics, []);
     assert.equal(result.generalNotes[0].body, body);
     assert.equal('anchorText' in result.generalNotes[0], false);
@@ -61,15 +64,16 @@ test('only the exact unfenced general header is recognized; general bodies have 
   }
 });
 
-test('general append preserves existing bytes, base semantics and destination newlines', () => {
-  assert.equal(appendGeneralNote('', 'Feedback', 'ABCDEF1'),
-    '# Review \u00b7 base ABCDEF1\n\n## General Review Note\n\nFeedback\n');
-  assert.equal(parse(appendGeneralNote('', 'Feedback', 'ABCDEF1')).base, 'abcdef1');
-  assert.throws(() => appendGeneralNote('', 'Feedback', 'invalid'), /invalid base SHA/);
+test('general append starts at the note and preserves existing bytes and destination newlines', () => {
+  assert.equal(appendGeneralNote('', 'Feedback'), '## General Review Note\n\n💬 Feedback\n');
+  for (const eol of ['\n', '\r\n', '\r']) {
+    assert.equal(appendGeneralNote(`Preamble${eol} \t`, 'Feedback'),
+      `Preamble${eol} \t${eol}## General Review Note${eol}${eol}💬 Feedback${eol}`);
+  }
   for (const eol of ['\n', '\r\n', '\r']) {
     for (const prefix of ['', '\uFEFF', 'Preamble', `Preamble${eol}`, `Preamble${eol}${eol}`,
       `\uFEFF# Review \u00b7 base ABCDEF1${eol}${eol}## Unknown${eol}Opaque  ${eol}`]) {
-      const text = appendGeneralNote(prefix, 'Feedback\r\nsecond\rthird', prefix ? 'ignored' : undefined);
+      const text = appendGeneralNote(prefix, 'Feedback\r\nsecond\rthird');
       assert.ok(text.startsWith(prefix));
       const result = parse(text);
       assert.deepEqual(result.diagnostics, []);
@@ -94,7 +98,7 @@ test('arbitrary general bodies round-trip and edit losslessly beside duplicate g
         const result = parse(text);
         const notes = parsedNotes(result);
         assert.deepEqual(result.diagnostics, [], label);
-        assert.equal(result.base, 'abcdef1', label);
+        assert.ok(text.startsWith(prefix), label);
         assert.deepEqual(result.comments.map(note => note.index), [0, 1], label);
         assert.deepEqual(result.generalNotes.map(note => note.index), [0, 1], label);
         assert.deepEqual(notes.map(isGeneralNote), [true, false, true, false], label);
@@ -137,18 +141,18 @@ test('arbitrary general bodies round-trip and edit losslessly beside duplicate g
 
 test('general notes preserve BOM-aware offsets and remove exactly one blank separator', () => {
   for (const eol of ['\n', '\r\n', '\r']) {
-    const block = ['## General Review Note', '', 'Feedback', ''].join(eol);
+    const block = ['## General Review Note', '', '💬 Feedback', ''].join(eol);
     const suffix = `${eol}${eol}${eol}## Unknown${eol}Keep${eol}`;
     const text = '\uFEFF' + block + suffix;
     const note = parse(text).generalNotes[0];
     assert.equal(note.startOffset, 1);
     assert.equal(text.slice(note.startOffset, note.headerEndOffset), '## General Review Note');
-    assert.equal(text.slice(note.bodyStartOffset, note.bodyEndOffset), 'Feedback');
+    assert.equal(text.slice(note.bodyStartOffset, note.bodyEndOffset), '💬 Feedback');
     assert.equal(editComment(text, note, 'Updated'), text.replace('Feedback', 'Updated'));
     assert.equal(deleteComment(text, note), '\uFEFF' + suffix.slice(eol.length));
     assert.equal(deleteComment('\uFEFF' + block, parse('\uFEFF' + block).generalNotes[0]), '\uFEFF');
     for (const ending of ['', eol, eol + eol]) {
-      let empty = '\uFEFF## General Review Note' + ending;
+      let empty = '\uFEFF## General Review Note' + eol + eol + '💬' + ending;
       for (const body of ['Plain', '', 'Body: fenced', '\n\n', '', 'Restored']) {
         empty = editComment(empty, parse(empty).generalNotes[0], body);
         assert.equal(parse(empty).generalNotes[0].body, body.replace(/\n/g, /\r\n|\r|\n/.exec(empty)?.[0] ?? '\n'));
@@ -162,16 +166,16 @@ test('general body wrappers decode once, include splice bytes and leave marker l
   for (const eol of ['\n', '\r\n', '\r']) {
     const body = 'Body: fenced\n```markdown\n## General Review Note\n```\n'.replace(/\n/g, eol);
     const prefix = `\uFEFF## General Review Note${eol}${eol}`;
-    const wrapper = `Body: fenced${eol}\`\`\`\`markdown${eol}${body}${eol}\`\`\`\``;
+    const wrapper = `💬 Body: fenced${eol}\`\`\`\`markdown${eol}${body}${eol}\`\`\`\``;
     const suffix = `${eol}${eol}## Unknown${eol}Keep${eol}`;
     const text = prefix + wrapper + suffix;
     const note = parse(text).generalNotes[0];
     assert.equal(note.body, body);
     assert.equal(text.slice(note.bodyStartOffset, note.bodyEndOffset), wrapper);
-    assert.equal(editComment(text, note, 'Plain'), prefix + 'Plain' + suffix);
+    assert.equal(editComment(text, note, 'Plain'), prefix + '💬 Plain' + suffix);
     for (const marker of ['body: fenced', 'Body: Fenced', ' Body: fenced', 'Body: fenced ', 'Prose\nBody: fenced']) {
       const literal = `${marker}\n\`\`\`markdown\n## General Review Note\n\`\`\``.replace(/\n/g, eol);
-      assert.equal(parse(prefix + literal + eol).generalNotes[0].body, literal);
+      assert.equal(parse(prefix + '💬 ' + literal + eol).generalNotes[0].body, literal);
     }
   }
 });
@@ -180,17 +184,17 @@ test('malformed general wrappers remain opaque through sibling writes and append
   for (const eol of ['\n', '\r\n', '\r']) {
     for (const bom of ['', '\uFEFF']) {
       for (const [wrapper, open, message] of [
-        ['Body: fenced', false, /expected a fenced review note body/],
-        ['Body: fenced\nnot a fence\nKeep feedback', false, /expected a fenced review note body/],
-        ['Body: fenced\n~~~markdown\nKeep feedback\n~~~', false, /expected a fenced review note body/],
-        ['Body: fenced\n```text\nKeep feedback\n```', false, /expected a fenced review note body/],
-        ['Body: fenced\n\n```markdown\nKeep feedback\n```', false, /expected a fenced review note body/],
+        ['Body: fenced', false, /expected a fenced Review Note body/],
+        ['Body: fenced\nnot a fence\nKeep feedback', false, /expected a fenced Review Note body/],
+        ['Body: fenced\n~~~markdown\nKeep feedback\n~~~', false, /expected a fenced Review Note body/],
+        ['Body: fenced\n```text\nKeep feedback\n```', false, /expected a fenced Review Note body/],
+        ['Body: fenced\n\n```markdown\nKeep feedback\n```', false, /expected a fenced Review Note body/],
         ['Body: fenced\n```markdown\nKeep feedback\n```\nDo not drop this', false, /must end at its closing fence/],
         ['Body: fenced\n```markdown\nKeep feedback', true, /unterminated/],
         ['Body: fenced\n````markdown\nKeep feedback\n```', true, /unterminated/],
       ] as const) {
         const prefix = bom + appendGeneralNote('', 'Before').replace(/\n/g, eol) + eol;
-        const block = `## General Review Note\n\n${wrapper}\n`.replace(/\n/g, eol);
+        const block = `## General Review Note\n\n💬 ${wrapper}\n`.replace(/\n/g, eol);
         const text = prefix + block;
         const result = parse(text);
         assert.equal(result.generalNotes.length, 1, wrapper);

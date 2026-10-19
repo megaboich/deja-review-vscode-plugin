@@ -337,7 +337,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
       blobs.set(`${resolvedRef}:${file.path}`, 'same first line\nnew tail');
       window.tabGroups.activeTabGroup.activeTab.input = new TabInputText(uri);
       assert.equal(await captureAt(uri), undefined);
-      assert.match(warnings[0], /revision or review base changed/);
+      assert.match(warnings[0], /Git revision changed since capture/);
     }
   });
 
@@ -417,7 +417,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
         assert.equal(lookups, buffered ? 3 : 0);
         assert.deepEqual(reads, []);
         repository.state.HEAD = { commit: shaB };
-        await assert.rejects(captured.validate(), /revision or review base changed/);
+        await assert.rejects(captured.validate(), /Git revision changed since capture/);
       }
     }
   });
@@ -439,10 +439,10 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
         assert.ok(captured, warnings.join('\n'));
         await captured.validate();
         blobs.set(`:${file.path}`, 'new staged content');
-        await assert.rejects(captured.validate(), /revision or review base changed/);
+        await assert.rejects(captured.validate(), /Git revision changed since capture/);
       } else {
         assert.equal(captured, undefined);
-        assert.match(warnings[0], /revision or review base changed/);
+        assert.match(warnings[0], /Git revision changed since capture/);
       }
     }
   });
@@ -466,7 +466,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
     await captured.validate();
     assert.equal(details, 3, 'a successful empty read needs no missing-path lookup');
     blobs.set(`:${file.path}`, 'new staged source');
-    await assert.rejects(captured.validate(), /revision or review base changed/);
+    await assert.rejects(captured.validate(), /Git revision changed since capture/);
   });
 
   await t.test('empty opposite read errors require structured UnknownPath from object details', async () => {
@@ -547,7 +547,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
       await captured.validate();
       assert.deepEqual(reads, [], 'the deleted working file is never requested');
       blobs.set(`HEAD:${file.path}`, 'changed revision');
-      await assert.rejects(captured.validate(), /revision or review base changed/);
+      await assert.rejects(captured.validate(), /Git revision changed since capture/);
     }
   });
 
@@ -595,7 +595,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
       assert.ok(captured, warnings.join('\n'));
       if (change === 'membership') {
         repository.state.indexChanges = [{ uri: asUri(oppositeFile) }];
-        await assert.rejects(captured.validate(), /revision or review base changed/);
+        await assert.rejects(captured.validate(), /Git revision changed since capture/);
       } else if (change === 'boundary') {
         markers.set('/repo/other/.git', 2);
         await assert.rejects(captured.validate(), /boundary/);
@@ -619,7 +619,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
     const captured = await captureAt(file);
     assert.ok(captured, warnings.join('\n'));
     blobs.set(`HEAD:${file.path}`, 'different original');
-    await assert.rejects(captured.validate(), /revision or review base changed/);
+    await assert.rejects(captured.validate(), /Git revision changed since capture/);
   });
 
   await t.test('unsupported candidate tabs do not block document capture or native confirmation', async () => {
@@ -672,7 +672,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
       await captured.validate();
       for (const changed of ['first\nsecond', 'first\nsecond \n', 'first\nsecond\n\n']) {
         blobs.set(`HEAD:${file.path}`, changed);
-        await assert.rejects(captured.validate(), /revision or review base changed/);
+        await assert.rejects(captured.validate(), /Git revision changed since capture/);
       }
     }
   });
@@ -714,7 +714,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
     assert.equal(captured.comment.origin, 'changed');
     assert.equal(captured.comment.side, 'right');
     repository.state.HEAD = { commit: shaB };
-    await assert.rejects(captured.validate(), /revision or review base changed/);
+    await assert.rejects(captured.validate(), /Git revision changed since capture/);
   });
 
   await t.test('both endpoints resolve before picker and named refs stay pinned across picker', async () => {
@@ -786,7 +786,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
         return choices[0];
       };
       assert.equal(await captureAt(uri, true), undefined);
-      assert.match(warnings[0], /revision or review base changed/);
+      assert.match(warnings[0], /Git revision changed since capture/);
     }
   });
 
@@ -827,7 +827,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
         assert.ok(captured, 'pinned commits are not invalidated by unrelated mutable Git events');
       } else {
         assert.equal(captured, undefined);
-        assert.match(warnings[0], /revision or review base changed/);
+        assert.match(warnings[0], /Git revision changed since capture/);
       }
       assert.equal(gitChanged.listeners.size, 0);
     }
@@ -870,7 +870,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
       }
       resume.resolve();
 
-      await assert.rejects(validation, /revision or review base changed/);
+      await assert.rejects(validation, /Git revision changed since capture/);
       assert.equal(captured.comment.anchorText, 'original');
       assert.equal(gitChanged.listeners.size, 0);
     }
@@ -889,7 +889,7 @@ test('Git ownership and capture with an in-memory VS Code host', async t => {
       return 'source';
     };
 
-    await assert.rejects(captured.validate(), /revision or review base changed/);
+    await assert.rejects(captured.validate(), /Git revision changed since capture/);
     assert.equal(gitChanged.listeners.size, 0);
   });
 

@@ -1,4 +1,4 @@
-import { dashboardClient, isDashboardHostMessage } from "./dashboardClient";
+import { DASHBOARD_CLIENT_BUNDLE } from "./generated/dashboardClientBundle";
 
 /** Static shell only: metadata and explicit editor text arrive over postMessage, never inside script source. */
 export function renderDashboard(nonce: string, instanceKey = nonce): string {
@@ -214,30 +214,30 @@ export function renderDashboard(nonce: string, instanceKey = nonce): string {
       <button id="add-general" type="button" disabled>Add General Review Note</button>
       <button id="more" type="button" title="More actions" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" aria-controls="more-menu" disabled>...</button>
       <div id="more-menu" role="menu" aria-label="More actions" hidden>
-        <button id="show-archives" type="button" role="menuitem" aria-controls="history">Recent Archives</button>
+        <button id="show-archives" type="button" role="menuitem" aria-controls="history">Restore Last Copied Review Notes</button>
       </div>
     </div>
     <p id="archive-unavailable" class="muted" role="status" hidden></p>
-    <button id="copy" type="button" title="Copies your review notes to the clipboard, archives this batch, and clears the current review notes." aria-description="Copies your review notes to the clipboard, archives this batch, and clears the current review notes." hidden disabled>Copy Review Notes &amp; Clear</button>
+    <button id="copy" type="button" title="Copies your Review Notes to the clipboard, archives this batch, and clears the current Review Notes." aria-description="Copies your Review Notes to the clipboard, archives this batch, and clears the current Review Notes." hidden disabled>Copy Review Notes &amp; Clear</button>
     <section id="files-section" aria-labelledby="files-title" hidden>
       <h2 id="files-title">Files to Review (0)</h2>
       <p id="files-error" role="alert" hidden></p>
       <p id="no-files" class="muted">No files to review.</p>
       <ul id="files" aria-label="Files to Review"></ul>
     </section>
-    <p id="count" role="status" aria-live="polite">0 review notes</p>
+    <p id="count" role="status" aria-live="polite">0 Review Notes</p>
     <p id="empty" class="muted">Open a local project folder in VS Code to start reviewing.</p>
     <p id="note-error" role="alert" hidden></p>
     <ul id="notes" aria-label="Review Notes"></ul>
     <p id="error" role="alert" hidden></p>
     <section id="history" aria-labelledby="history-title" hidden>
       <div class="section-heading">
-        <h2 id="history-title">Recent Archives</h2>
-        <button id="close-history" type="button" aria-label="Close archives" title="Close archives">Close</button>
+        <h2 id="history-title">Last Copied Review Notes</h2>
+        <button id="close-history" type="button" aria-label="Close recovery" title="Close recovery">Close</button>
       </div>
-      <p class="muted">Recover a batch to make its review notes active again.</p>
-      <p id="no-archives" class="muted">No archived batches yet.</p>
-      <ul id="archives" aria-label="Archived review note batches"></ul>
+      <p class="muted">Restore the last copied batch for this local checkout.</p>
+      <p id="no-archives" class="muted">No copied Review Notes yet.</p>
+      <ul id="archives" aria-label="Last copied Review Notes"></ul>
     </section>
   </main>
   <dialog id="note-editor" aria-labelledby="editor-title">
@@ -259,7 +259,8 @@ export function renderDashboard(nonce: string, instanceKey = nonce): string {
   <template id="stage-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></svg></template>
   <template id="note-icon"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 2h12v9H6l-4 3V2zm1 1v9l2.7-2H13V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7z"/></svg></template>
   <script nonce="${nonce}">
-    (${dashboardClient.toString()})(acquireVsCodeApi, "${instanceKey}", ${isDashboardHostMessage.toString()});
+${DASHBOARD_CLIENT_BUNDLE}
+    __dejareviewDashboard(acquireVsCodeApi, "${instanceKey}");
   </script>
 </body>
 </html>`;

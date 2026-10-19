@@ -1,16 +1,17 @@
 /// <reference lib="dom" />
+import { render as renderInto, type VNode } from "preact";
 import type { DashboardHostMessage, DashboardMessage, DashboardNote, DashboardState } from "./dashboard";
 
 type PendingInput = { repoKey: string; editorId: string; body: string; requestId: string };
 type PendingSubmission = PendingInput & { type: 'saveEdit' | 'cancelEdit' };
 type TransportCache = { instanceKey: string; input?: PendingInput; submission?: PendingSubmission };
-type WebviewApi = {
+export type WebviewApi = {
   postMessage(message: DashboardMessage): void;
   getState(): unknown;
   setState(state: TransportCache | undefined): void;
 };
 
-/** Runtime boundary for host publications; serialized alongside the client without imports. */
+/** Runtime boundary for host publications. */
 export function isDashboardHostMessage(value: unknown): value is DashboardHostMessage {
   function record(data: unknown): data is Record<string, unknown> {
     return !!data && typeof data === 'object' && !Array.isArray(data);
@@ -88,7 +89,10 @@ export function isDashboardHostMessage(value: unknown): value is DashboardHostMe
   }
 }
 
-/** Serialized after TypeScript compilation; keep all runtime dependencies inside this function. */
+/**
+ * Bundled into the inline webview script by `scripts/buildClient.mjs`. Ordinary imports
+ * are permitted here; the host message validator is injected so tests can substitute it.
+ */
 export function dashboardClient(
   acquireVsCodeApi: () => WebviewApi,
   instanceKey: string,
@@ -96,39 +100,7 @@ export function dashboardClient(
 ): void {
   type File = DashboardState["files"][number];
   type Archive = DashboardState["archives"][number];
-  type FileRow = {
-    item: HTMLLIElement;
-    open: HTMLButtonElement;
-    revert: HTMLButtonElement;
-    addNote: HTMLButtonElement;
-    stage: HTMLButtonElement;
-    name: HTMLSpanElement;
-    insertions: HTMLSpanElement;
-    deletions: HTMLSpanElement;
-    unknown: HTMLSpanElement;
-    changeKind: HTMLSpanElement;
-    status: HTMLSpanElement;
-    current: File;
-    repoKey: string | undefined;
-  };
-  type NoteRow = {
-    item: HTMLLIElement;
-    open: HTMLButtonElement;
-    edit: HTMLButtonElement;
-    remove: HTMLButtonElement;
-    title: HTMLSpanElement;
-    preview: HTMLSpanElement;
-    current: DashboardNote;
-    repoKey: string | undefined;
-  };
-  type ArchiveRow = {
-    item: HTMLLIElement;
-    date: HTMLTimeElement;
-    count: HTMLSpanElement;
-    recover: HTMLButtonElement;
-    current: Archive;
-    repoKey: string | undefined;
-  };
+  type ExitingFile = { file: File; index: number; animation?: Animation };
 
   const vscode = acquireVsCodeApi();
   function byId(id: string): HTMLElement {
@@ -141,15 +113,54 @@ export function dashboardClient(
   // These casts describe the static shell, not untrusted message data.
   const button = (id: string): HTMLButtonElement => byId(id) as HTMLButtonElement;
   const icon = (id: string): Node => (byId(id) as HTMLTemplateElement).content.cloneNode(true);
+  /**
+   * Attaches a cloned icon template to a button Preact renders without children.
+   *
+   * The callbacks are cached so their identity is stable across renders, which stops Preact
+   * from detaching and reattaching them; the guard covers a node reused by keyed diffing.
+   */
+  const iconRefs = new Map<string, (node: HTMLElement | null) => void>();
+  function iconRef(id: string): (node: HTMLElement | null) => void {
+    let attach = iconRefs.get(id);
+    if (!attach) {
+      attach = (node) => {
+        if (node && !node.firstChild) {
+          node.append(icon(id));
+        }
+      };
+      iconRefs.set(id, attach);
+    }
+    return attach;
+  }
   const copy = button('copy');
   const more = button('more');
   const dialog = byId('note-editor') as HTMLDialogElement;
   const body = byId('editor-body') as HTMLTextAreaElement;
-  const noteRows = new Map<string, NoteRow>();
-  const fileRows = new Map<string, FileRow>();
-  const exitingFiles = new Map<string, { row: FileRow; animation: Animation }>();
+  const exitingFiles = new Map<string, ExitingFile>();
+  /** Live file rows from the last render, so the next one can tell which rows left. */
+  let renderedFiles: readonly File[] = [];
+  const fileNodes = new Map<string, HTMLLIElement>();
+  const fileNodeRefs = new Map<string, (node: HTMLLIElement | null) => void>();
+  /**
+   * Records each row's element for exit measurement; identities are stable across renders.
+   * Keyed by id, not folder: when a folder switch replaces a same-id row, Preact detaches the
+   * old row's ref before attaching the new one, so the map ends at the new node.
+   */
+  function fileNodeRef(id: string): (node: HTMLLIElement | null) => void {
+    let ref = fileNodeRefs.get(id);
+    if (!ref) {
+      ref = (node) => {
+        if (node) {
+          fileNodes.set(id, node);
+        } else {
+          fileNodes.delete(id);
+        }
+      };
+      fileNodeRefs.set(id, ref);
+    }
+    return ref;
+  }
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
-  const archiveRows = new Map<string, ArchiveRow>();
   let state: DashboardState | undefined;
   let renderedRepoKey: string | undefined;
   let editorId: string | undefined;
@@ -210,7 +221,18 @@ export function dashboardClient(
   }
 
   function countLabel(count: number): string {
-    return count + (count === 1 ? ' review note' : ' review notes');
+    return count + (count === 1 ? ' Review Note' : ' Review Notes');
+  }
+
+  /**
+   * Keyed-list identity for a projection row.
+   *
+   * Projection ids are scoped to one publication, so the same id names a different row in
+   * another folder. Folding the folder into the key replaces nodes across folders instead of
+   * reusing them, which would carry focus and animation state into unrelated content.
+   */
+  function rowKey(repoKey: string | undefined, id: string): string {
+    return (repoKey ?? '') + '\u0000' + id;
   }
 
   function send(type: 'copy' | 'addGeneral' | 'openHistory' | 'closeHistory'): void {
@@ -220,21 +242,23 @@ export function dashboardClient(
     vscode.postMessage({ type, repoKey: state.repoKey });
   }
 
-  function sendNote(type: 'open' | 'edit' | 'delete', row: NoteRow, invoker?: HTMLElement): void {
-    if (!state?.repoKey || state.busy || state.editor || !state.hasFeedback || row.repoKey !== state.repoKey) {
+  function sendNote(type: 'open' | 'edit' | 'delete', note: DashboardNote, repoKey: string | undefined,
+    node: HTMLElement, invoker?: HTMLElement): void {
+    if (!state?.repoKey || state.busy || state.editor || !state.hasFeedback || repoKey !== state.repoKey) {
       return;
     }
-    if (!row.item.isConnected || noteRows.get(row.current.id) !== row) {
+    // A detached node belongs to a superseded projection or folder; its handler outlives removal.
+    if (!node.isConnected) {
       return;
     }
-    if (!state.notes.some(note => note.id === row.current.id)) {
+    if (!state.notes.some(entry => entry.id === note.id)) {
       return;
     }
     if (type === 'edit') {
       editorInvoker = invoker;
       editorRepoKey = state.repoKey;
     }
-    vscode.postMessage({ type, repoKey: state.repoKey, noteId: row.current.id });
+    vscode.postMessage({ type, repoKey: state.repoKey, noteId: note.id });
   }
 
   function closeMenu(): void {
@@ -284,7 +308,7 @@ export function dashboardClient(
       closeMenu();
       more.focus();
       if (state.hasFeedback) {
-        byId('archive-unavailable').textContent = 'Recent Archives are available when there are no current saved Review Notes. Finish your review, then use Copy Review Notes & Clear to view or recover an earlier batch.';
+        byId('archive-unavailable').textContent = 'Restore Last Copied Review Notes is available when there are no current Review Notes in this checkout. Finish your review, then use Copy Review Notes & Clear.';
         byId('archive-unavailable').hidden = false;
         return;
       }
@@ -374,161 +398,131 @@ export function dashboardClient(
     });
   }
 
-  function sendFile(type: 'openFile' | 'revertFile' | 'addFileNote' | 'stageFile', row: FileRow): void {
-    if (!state?.repoKey || state.busy || state.editor || row.current.pending || row.repoKey !== state.repoKey) {
+  function sendFile(type: 'openFile' | 'revertFile' | 'addFileNote' | 'stageFile', file: File,
+    repoKey: string | undefined, node: HTMLElement): void {
+    if (!state?.repoKey || state.busy || state.editor || file.pending || repoKey !== state.repoKey) {
       return;
     }
-    if (!row.item.isConnected || fileRows.get(row.current.id) !== row) {
+    // A detached node belongs to a superseded projection or folder; its handler outlives removal.
+    if (!node.isConnected) {
       return;
     }
-    if (!state.files.some(file => file.id === row.current.id)) {
+    if (!state.files.some(entry => entry.id === file.id)) {
       return;
     }
-    vscode.postMessage({ type, repoKey: state.repoKey, fileId: row.current.id });
+    vscode.postMessage({ type, repoKey: state.repoKey, fileId: file.id });
   }
 
-  function createFileRow(file: File, repoKey: string | undefined): FileRow {
-    const item = document.createElement('li');
-    item.className = 'file-row';
-    const open = document.createElement('button');
-    open.type = 'button';
-    open.className = 'file-open';
-    const name = document.createElement('span');
-    name.className = 'file-name';
-    const insertions = document.createElement('span');
-    insertions.className = 'file-insertions';
-    const deletions = document.createElement('span');
-    deletions.className = 'file-deletions';
-    const unknown = document.createElement('span');
-    unknown.className = 'muted';
-    unknown.textContent = 'Stats unavailable';
-    const status = document.createElement('span');
-    status.className = 'file-progress';
-    status.setAttribute('role', 'status');
-    const label = document.createElement('span');
-    label.className = 'file-label';
-    label.append(name);
-    const changeKind = document.createElement('span');
-    changeKind.className = 'file-change-kind';
-    open.append(label, insertions, deletions, unknown, changeKind);
-
-    const revert = document.createElement('button');
-    revert.type = 'button';
-    revert.className = 'file-action file-revert';
-    revert.title = 'Revert File';
-    revert.setAttribute('aria-label', 'Revert File');
-    revert.append(icon('revert-icon'));
-    const addNote = document.createElement('button');
-    addNote.type = 'button';
-    addNote.className = 'file-action file-note';
-    addNote.title = 'Add File Review Note';
-    addNote.setAttribute('aria-label', 'Add File Review Note');
-    addNote.append(icon('note-icon'));
-    const stage = document.createElement('button');
-    stage.type = 'button';
-    stage.className = 'file-action file-stage';
-    stage.title = 'Stage File';
-    stage.setAttribute('aria-label', 'Stage File');
-    stage.append(icon('stage-icon'));
-    item.append(open, revert, addNote, stage, status);
-
-    const row: FileRow = {
-      item, open, revert, addNote, stage, name, insertions, deletions, unknown, changeKind, status, current: file, repoKey,
-    };
-    open.addEventListener('click', () => sendFile('openFile', row));
-    revert.addEventListener('click', () => sendFile('revertFile', row));
-    addNote.addEventListener('click', () => sendFile('addFileNote', row));
-    stage.addEventListener('click', () => sendFile('stageFile', row));
-    return row;
-  }
-
-  function updateFileRow(row: FileRow, file: File, blocked: boolean): void {
-    row.current = file;
-    row.name.textContent = file.path.slice(file.path.lastIndexOf('/') + 1);
-    row.open.title = file.path;
-    row.status.hidden = !file.pending;
-    row.status.textContent = file.pending === 'stage' ? 'Staging file' : '';
-    if (file.pending === 'revert') {
-      row.status.textContent = 'Reverting file';
-    }
-    row.item.className = 'file-row';
-    if (file.visible) {
-      row.item.className += ' file-in-editor';
-    }
-    if (file.pending) {
-      row.item.className += ' file-pending';
-    }
-    row.item.setAttribute('aria-busy', String(!!file.pending));
-    blocked = blocked || !!file.pending;
-
-    const labels: string[] = [];
-    let kindLabel = '';
-    switch (file.changeKind) {
-      case 'added':
-        kindLabel = 'Added';
-        break;
-      case 'removed':
-        kindLabel = 'Removed';
-        break;
-      case 'renamed':
-        kindLabel = 'Renamed';
-        break;
-    }
-    row.changeKind.textContent = kindLabel;
-    row.changeKind.hidden = !kindLabel;
-    if (kindLabel) {
-      labels.push(kindLabel);
-    }
+  /** Change-kind label, per-side counts and the assembled accessible description for a row. */
+  function fileLabels(file: File): {
+    kind: string;
+    counts: { hidden: boolean; text: string }[];
+    unknown: { hidden: boolean; text: string };
+    description: string;
+  } {
+    const kind = file.changeKind === 'added' ? 'Added'
+      : file.changeKind === 'removed' ? 'Removed'
+        : file.changeKind === 'renamed' ? 'Renamed' : '';
+    const labels: string[] = kind ? [kind] : [];
     let knownCounts = 0;
-    for (const key of ['insertions', 'deletions'] as const) {
+    const counts = (['insertions', 'deletions'] as const).map(key => {
       const count = file[key];
       const known = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
-      // Omit redundant zeroes for status-labelled rows, but keep nonzero counts
-      // on both sides when a labelled change also modifies content.
-      row[key].hidden = !known || (!!kindLabel && count === 0);
-      if (known) {
-        knownCounts++;
-        const sign = key === 'insertions' ? '+' : '-';
-        row[key].textContent = sign + count;
-        labels.push(count + ' ' + (count === 1 ? key.slice(0, -1) : key));
-      } else {
-        row[key].textContent = '';
+      if (!known) {
+        return { hidden: true, text: '' };
       }
-    }
-    row.unknown.textContent = file.statisticsPending ? 'Loading stats' : 'Stats unavailable';
-    row.unknown.hidden = knownCounts === 2;
-    if (!row.unknown.hidden) {
-      labels.push(row.unknown.textContent);
+      knownCounts++;
+      labels.push(count + ' ' + (count === 1 ? key.slice(0, -1) : key));
+      return {
+        // Omit redundant zeroes for status-labelled rows, but keep nonzero counts on both
+        // sides when a labelled change also modifies content.
+        hidden: !!kind && count === 0,
+        text: (key === 'insertions' ? '+' : '-') + count,
+      };
+    });
+    const unknown = {
+      hidden: knownCounts === 2,
+      text: file.statisticsPending ? 'Loading stats' : 'Stats unavailable',
+    };
+    if (!unknown.hidden) {
+      labels.push(unknown.text);
     }
     if (file.visible) {
       labels.push('Visible in editor');
     }
-    row.open.setAttribute('aria-label', 'Open file: ' + file.path + ', ' + labels.join(', '));
-    row.open.disabled = blocked;
-    row.revert.disabled = blocked;
-    row.addNote.disabled = blocked;
-    row.stage.disabled = blocked;
+    return { kind, counts, unknown, description: 'Open file: ' + file.path + ', ' + labels.join(', ') };
   }
 
-  function removeFileRow(id: string, row: FileRow): void {
-    fileRows.delete(id);
-    row.item.inert = true;
-    row.item.setAttribute('aria-hidden', 'true');
-    row.open.disabled = true;
-    row.revert.disabled = true;
-    row.addNote.disabled = true;
-    row.stage.disabled = true;
-    if (reducedMotion.matches) {
-      row.item.remove();
-      return;
+  function FileRow({ file, repoKey, blocked, exiting }: {
+    file: File; repoKey: string | undefined; blocked: boolean; exiting: boolean;
+  }): VNode {
+    const { kind, counts, unknown, description } = fileLabels(file);
+    const disabled = blocked || !!file.pending || exiting;
+    const pending = file.pending === 'stage' ? 'Staging file' : file.pending === 'revert' ? 'Reverting file' : '';
+    let className = 'file-row';
+    if (file.visible) {
+      className += ' file-in-editor';
     }
+    if (file.pending) {
+      className += ' file-pending';
+    }
+    if (exiting) {
+      className += ' file-exiting';
+    }
+    const action = (type: 'revertFile' | 'addFileNote' | 'stageFile', style: string, label: string, template: string): VNode => (
+      <button
+        type="button"
+        class={'file-action ' + style}
+        title={label}
+        aria-label={label}
+        disabled={disabled}
+        ref={iconRef(template)}
+        onClick={(event) => sendFile(type, file, repoKey, event.currentTarget)}
+      />
+    );
+    return (
+      <li
+        class={className}
+        aria-busy={!!file.pending}
+        inert={exiting}
+        aria-hidden={exiting ? 'true' : undefined}
+        ref={fileNodeRef(file.id)}
+      >
+        <button
+          type="button"
+          class="file-open"
+          title={file.path}
+          aria-label={description}
+          disabled={disabled}
+          onClick={(event) => sendFile('openFile', file, repoKey, event.currentTarget)}
+        >
+          <span class="file-label"><span class="file-name">{file.path.slice(file.path.lastIndexOf('/') + 1)}</span></span>
+          <span class="file-insertions" hidden={counts[0].hidden}>{counts[0].text}</span>
+          <span class="file-deletions" hidden={counts[1].hidden}>{counts[1].text}</span>
+          <span class="muted" hidden={unknown.hidden}>{unknown.text}</span>
+          <span class="file-change-kind" hidden={!kind}>{kind}</span>
+        </button>
+        {action('revertFile', 'file-revert', 'Revert File', 'revert-icon')}
+        {action('addFileNote', 'file-note', 'Add File Review Note', 'note-icon')}
+        {action('stageFile', 'file-stage', 'Stage File', 'stage-icon')}
+        <span class="file-progress" role="status" hidden={!file.pending}>{pending}</span>
+      </li>
+    );
+  }
 
-    const height = row.item.getBoundingClientRect().height;
-    const style = window.getComputedStyle(row.item);
+  /**
+   * Collapses a row that left the list, then drops it.
+   *
+   * The row stays rendered and inert until the animation settles so the list does not jump. A
+   * row that reappears meanwhile cancels its animation and is reused, which is why the entry —
+   * not the node — decides whether a settlement may still remove anything.
+   */
+  function collapseFileRow(id: string, entry: ExitingFile, node: HTMLLIElement): void {
+    const height = node.getBoundingClientRect().height;
+    const style = window.getComputedStyle(node);
     // Border-box height alone cannot collapse padding/borders. Block layout keeps
     // the content from recentering or shrinking while the outer row is clipped.
-    row.item.className += ' file-exiting';
-    const animation = row.item.animate([
+    const animation = node.animate([
       {
         height: height + 'px', opacity: 1,
         paddingTop: style.paddingTop, paddingBottom: style.paddingBottom,
@@ -540,208 +534,202 @@ export function dashboardClient(
         marginTop: '0px', marginBottom: '0px', borderTopWidth: '0px', borderBottomWidth: '0px',
       },
     ], { duration: 160, easing: 'ease-out', fill: 'forwards' });
-    exitingFiles.set(id, { row, animation });
+    entry.animation = animation;
     const cleanup = (): void => {
       if (exitingFiles.get(id)?.animation !== animation) {
         return;
       }
       exitingFiles.delete(id);
-      row.item.remove();
       animation.cancel();
+      refreshFiles();
     };
     void animation.finished.then(cleanup, cleanup);
   }
 
+  /** Re-renders the file list alone, for exits that settle between host publications. */
+  function refreshFiles(): void {
+    if (state) {
+      renderFiles(state, state.busy || !!state.editor);
+    }
+  }
+
   function renderFiles(current: DashboardState, blocked: boolean): void {
-    const list = byId('files');
     byId('files-section').hidden = !current.repoKey;
     byId('files-error').textContent = current.filesError || '';
     byId('files-error').hidden = !current.filesError;
     const files = current.repoKey ? current.files : [];
     byId('files-title').textContent = 'Files to Review (' + files.length + ')';
     byId('no-files').hidden = files.length > 0;
-    const ids = new Set(files.map(file => file.id));
-    for (const [id, row] of fileRows) {
-      if (!ids.has(id)) {
-        removeFileRow(id, row);
+
+    const live = new Set(files.map(file => file.id));
+    for (const [id, entry] of exitingFiles) {
+      // A row that came back cancels its exit and is reused, keeping focus and identity.
+      if (live.has(id)) {
+        entry.animation?.cancel();
+        exitingFiles.delete(id);
       }
     }
-    files.forEach((file, index) => {
-      let row = fileRows.get(file.id);
-      const exiting = exitingFiles.get(file.id);
-      if (exiting) {
-        exitingFiles.delete(file.id);
-        exiting.animation.cancel();
-        row = exiting.row;
-        row.item.inert = false;
-        row.item.removeAttribute('aria-hidden');
-        fileRows.set(file.id, row);
-      }
-      if (!row) {
-        row = createFileRow(file, current.repoKey);
-        fileRows.set(file.id, row);
-      }
-      updateFileRow(row, file, blocked);
-      const active = Array.from(list.children).filter(item => !(item as HTMLElement).inert);
-      if (active[index] !== row.item) {
-        list.insertBefore(row.item, active[index] || null);
-      }
-    });
-  }
+    if (!reducedMotion.matches) {
+      renderedFiles.forEach((file, index) => {
+        if (!live.has(file.id) && !exitingFiles.has(file.id)) {
+          exitingFiles.set(file.id, { file, index });
+        }
+      });
+    }
+    renderedFiles = files;
 
-  function createNoteRow(note: DashboardNote, repoKey: string | undefined): NoteRow {
-    const item = document.createElement('li');
-    item.className = 'note-card';
-    const open = document.createElement('button');
-    open.type = 'button';
-    open.className = 'note-open';
-    const title = document.createElement('span');
-    title.className = 'note-title';
-    const preview = document.createElement('span');
-    preview.className = 'note-preview';
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'note-action note-delete';
-    remove.title = 'Delete Review Note';
-    remove.setAttribute('aria-label', 'Delete Review Note');
-    remove.append(icon('delete-icon'));
-    const edit = document.createElement('button');
-    edit.type = 'button';
-    edit.className = 'note-action note-edit';
-    edit.title = 'Edit Review Note';
-    edit.setAttribute('aria-label', 'Edit Review Note');
-    edit.append(icon('edit-icon'));
-    open.append(title, preview);
-    item.append(open, edit, remove);
+    const rows = files.map(file => ({ file, exiting: false }));
+    for (const entry of [...exitingFiles.values()].sort((a, b) => a.index - b.index)) {
+      rows.splice(Math.min(entry.index, rows.length), 0, { file: entry.file, exiting: true });
+    }
+    renderInto(
+      <>
+        {rows.map(row => (
+          <FileRow
+            key={rowKey(current.repoKey, row.file.id)}
+            file={row.file}
+            repoKey={current.repoKey}
+            blocked={blocked}
+            exiting={row.exiting}
+          />
+        ))}
+      </>,
+      byId('files'),
+    );
 
-    const row: NoteRow = { item, open, title, preview, edit, remove, current: note, repoKey };
-    open.addEventListener('click', () => sendNote(row.current.general ? 'edit' : 'open', row, open));
-    edit.addEventListener('click', () => sendNote('edit', row, edit));
-    remove.addEventListener('click', () => sendNote('delete', row));
-    return row;
-  }
-
-  function updateNoteRow(row: NoteRow, note: DashboardNote, blocked: boolean): void {
-    row.current = note;
-    let label = 'General Review Note';
-    let target = label;
-    let destination = 'Edit Review Note';
-    if (!note.general) {
-      const range = note.startLine === note.endLine ? String(note.startLine) : note.startLine + '-' + note.endLine;
-      label = note.path.slice(note.path.lastIndexOf('/') + 1) + ':' + range;
-      target = note.path + ':' + range;
-      if (note.wholeFile) {
-        label = note.path.slice(note.path.lastIndexOf('/') + 1);
-        target = note.path;
-      }
-      destination = 'Go to code';
-      if (note.comparison) {
-        destination = 'Open code comparison';
-      }
-      if (note.stale && !note.wholeFile) {
-        destination = 'Open saved Review Note';
+    // Animations start after the render that marks a row inert, so the collapse measures the
+    // row as the user last saw it.
+    for (const [id, entry] of exitingFiles) {
+      const node = fileNodes.get(id);
+      if (!entry.animation && node) {
+        collapseFileRow(id, entry, node);
       }
     }
+  }
+  /** Display strings for a note card: list label, full target and what opening it does. */
+  function noteLabels(note: DashboardNote): { label: string; target: string; destination: string } {
+    if (note.general) {
+      return { label: 'General Review Note', target: 'General Review Note', destination: 'Edit Review Note' };
+    }
+    const range = note.startLine === note.endLine ? String(note.startLine) : note.startLine + '-' + note.endLine;
+    const name = note.path.slice(note.path.lastIndexOf('/') + 1);
+    let destination = note.comparison ? 'Open code comparison' : 'Go to code';
+    if (note.stale && !note.wholeFile) {
+      destination = 'Open saved Review Note';
+    }
+    return note.wholeFile
+      ? { label: name, target: note.path, destination }
+      : { label: name + ':' + range, target: note.path + ':' + range, destination };
+  }
 
-    row.title.textContent = label;
-    row.preview.textContent = note.preview.split(/\r\n|\r|\n/, 2).join('\n');
-    row.preview.hidden = !row.preview.textContent;
-    row.open.title = destination + ': ' + target;
-    row.open.setAttribute('aria-description', destination);
-    row.open.disabled = blocked;
-    row.edit.disabled = blocked;
-    row.remove.disabled = blocked;
+  function NoteCard({ note, repoKey, blocked }: {
+    note: DashboardNote; repoKey: string | undefined; blocked: boolean;
+  }): VNode {
+    const { label, target, destination } = noteLabels(note);
+    const preview = note.preview.split(/\r\n|\r|\n/, 2).join('\n');
+    return (
+      <li class="note-card">
+        <button
+          type="button"
+          class="note-open"
+          title={destination + ': ' + target}
+          aria-description={destination}
+          disabled={blocked}
+          onClick={(event) => sendNote(note.general ? 'edit' : 'open', note, repoKey,
+            event.currentTarget, event.currentTarget)}
+        >
+          <span class="note-title">{label}</span>
+          <span class="note-preview" hidden={!preview}>{preview}</span>
+        </button>
+        <button
+          type="button"
+          class="note-action note-edit"
+          title="Edit Review Note"
+          aria-label="Edit Review Note"
+          disabled={blocked}
+          ref={iconRef('edit-icon')}
+          onClick={(event) => sendNote('edit', note, repoKey, event.currentTarget, event.currentTarget)}
+        />
+        <button
+          type="button"
+          class="note-action note-delete"
+          title="Delete Review Note"
+          aria-label="Delete Review Note"
+          disabled={blocked}
+          ref={iconRef('delete-icon')}
+          onClick={(event) => sendNote('delete', note, repoKey, event.currentTarget)}
+        />
+      </li>
+    );
   }
 
   function renderNotes(current: DashboardState, blocked: boolean): void {
-    const list = byId('notes');
     const notes = current.repoKey && current.hasFeedback ? current.notes : [];
-    const ids = new Set(notes.map(note => note.id));
-    for (const [id, row] of noteRows) {
-      if (!ids.has(id)) {
-        row.item.remove();
-        noteRows.delete(id);
-      }
+    renderInto(
+      <>
+        {notes.map(note => (
+          <NoteCard key={rowKey(current.repoKey, note.id)} note={note} repoKey={current.repoKey} blocked={blocked} />
+        ))}
+      </>,
+      byId('notes'),
+    );
+  }
+
+  function restoreArchive(archive: Archive, repoKey: string | undefined, node: HTMLElement): void {
+    if (!state?.repoKey || state.busy || state.editor || !state.historyVisible || state.hasFeedback) {
+      return;
     }
-    notes.forEach((note, index) => {
-      let row = noteRows.get(note.id);
-      if (!row) {
-        row = createNoteRow(note, current.repoKey);
-        noteRows.set(note.id, row);
-      }
-      updateNoteRow(row, note, blocked);
-      if (list.children[index] !== row.item) {
-        list.insertBefore(row.item, list.children[index] || null);
-      }
-    });
+    // A detached node is a row from a superseded projection or folder; its handler survives
+    // removal, so reachability is checked rather than assumed.
+    if (byId('history').hidden || repoKey !== state.repoKey || !node.isConnected) {
+      return;
+    }
+    if (!state.archives.slice(0, 10).some(entry => entry.id === archive.id)) {
+      return;
+    }
+    vscode.postMessage({ type: 'restore', repoKey: state.repoKey, archiveId: archive.id });
   }
 
-  function createArchiveRow(archive: Archive, repoKey: string | undefined): ArchiveRow {
-    const item = document.createElement('li');
-    const details = document.createElement('div');
-    details.className = 'archive-details';
-    const date = document.createElement('time');
-    const count = document.createElement('span');
-    count.className = 'archive-count muted';
-    const recover = document.createElement('button');
-    recover.type = 'button';
-    recover.textContent = 'Recover';
-
-    const row: ArchiveRow = { item, date, count, recover, current: archive, repoKey };
-    recover.addEventListener('click', () => {
-      if (!state?.repoKey || state.busy || state.editor || !state.historyVisible || state.hasFeedback) {
-        return;
-      }
-      if (byId('history').hidden || row.repoKey !== state.repoKey || archiveRows.get(row.current.id) !== row) {
-        return;
-      }
-      if (!state.archives.slice(0, 10).some(entry => entry.id === row.current.id)) {
-        return;
-      }
-      vscode.postMessage({ type: 'restore', repoKey: state.repoKey, archiveId: row.current.id });
-    });
-    details.append(date, count);
-    item.append(details, recover);
-    return row;
-  }
-
-  function updateArchiveRow(row: ArchiveRow, archive: Archive, current: DashboardState, blocked: boolean): void {
-    row.current = archive;
+  function ArchiveItem({ archive, repoKey, current, blocked }: {
+    archive: Archive; repoKey: string | undefined; current: DashboardState; blocked: boolean;
+  }): VNode {
     const date = new Date(archive.createdAt);
-    const validDate = !Number.isNaN(date.getTime());
-    row.date.textContent = validDate ? date.toLocaleString() : 'Unknown date';
-    if (validDate) {
-      row.date.dateTime = date.toISOString();
-    } else {
-      row.date.removeAttribute('datetime');
-    }
-    row.count.textContent = countLabel(archive.commentCount);
-    row.recover.disabled = blocked || !current.historyVisible || current.hasFeedback || !current.repoKey;
-    row.recover.setAttribute('aria-label', 'Recover ' + countLabel(archive.commentCount) + ' from ' + row.date.textContent);
+    const valid = !Number.isNaN(date.getTime());
+    const label = valid ? date.toLocaleString() : 'Unknown date';
+    const count = countLabel(archive.commentCount);
+    return (
+      <li>
+        <div class="archive-details">
+          <time datetime={valid ? date.toISOString() : undefined}>{label}</time>
+          <span class="archive-count muted">{count}</span>
+        </div>
+        <button
+          type="button"
+          disabled={blocked || !current.historyVisible || current.hasFeedback || !current.repoKey}
+          aria-label={'Restore ' + count + ' from ' + label}
+          onClick={(event) => restoreArchive(archive, repoKey, event.currentTarget)}
+        >Restore</button>
+      </li>
+    );
   }
 
   function renderArchives(current: DashboardState, blocked: boolean): void {
-    const list = byId('archives');
     const archives = current.repoKey ? current.archives.slice(0, 10) : [];
     byId('no-archives').hidden = archives.length > 0;
-    const ids = new Set(archives.map(archive => archive.id));
-    for (const [id, row] of archiveRows) {
-      if (!ids.has(id)) {
-        row.item.remove();
-        archiveRows.delete(id);
-      }
-    }
-    archives.forEach((archive, index) => {
-      let row = archiveRows.get(archive.id);
-      if (!row) {
-        row = createArchiveRow(archive, current.repoKey);
-        archiveRows.set(archive.id, row);
-      }
-      updateArchiveRow(row, archive, current, blocked);
-      if (list.children[index] !== row.item) {
-        list.insertBefore(row.item, list.children[index] || null);
-      }
-    });
+    renderInto(
+      <>
+        {archives.map(archive => (
+          <ArchiveItem
+            key={rowKey(current.repoKey, archive.id)}
+            archive={archive}
+            repoKey={current.repoKey}
+            current={current}
+            blocked={blocked}
+          />
+        ))}
+      </>,
+      byId('archives'),
+    );
   }
 
   function focusable(element: Element | null | undefined): element is HTMLElement {
@@ -865,7 +853,7 @@ export function dashboardClient(
   function renderFeedbackStatus(current: DashboardState): void {
     byId('empty').hidden = current.hasFeedback;
     byId('empty').textContent = current.repoKey
-      ? 'No current review notes. Add a general review note or a review note in the editor.'
+      ? 'No current Review Notes. Add a general Review Note or a Review Note in the editor.'
       : 'Open a local project folder in VS Code to start reviewing.';
     byId('error').textContent = current.error || '';
     byId('error').hidden = !current.error;
@@ -877,23 +865,13 @@ export function dashboardClient(
     if (renderedRepoKey === repoKey) {
       return;
     }
-    for (const row of archiveRows.values()) {
-      row.item.remove();
-    }
-    archiveRows.clear();
-    for (const row of noteRows.values()) {
-      row.item.remove();
-    }
-    noteRows.clear();
-    for (const row of fileRows.values()) {
-      row.item.remove();
-    }
-    fileRows.clear();
-    for (const { row, animation } of exitingFiles.values()) {
-      row.item.remove();
-      animation.cancel();
+    // Rows themselves are replaced by the folder-scoped keys; only the exit bookkeeping, which
+    // would otherwise resurrect a previous folder's row, has to be dropped explicitly.
+    for (const { animation } of exitingFiles.values()) {
+      animation?.cancel();
     }
     exitingFiles.clear();
+    renderedFiles = [];
     renderedRepoKey = repoKey;
   }
 
@@ -961,11 +939,11 @@ export function dashboardClient(
     if (!reducedMotion.matches) {
       return;
     }
-    for (const { row, animation } of exitingFiles.values()) {
-      row.item.remove();
-      animation.cancel();
+    for (const { animation } of exitingFiles.values()) {
+      animation?.cancel();
     }
     exitingFiles.clear();
+    refreshFiles();
   });
   window.addEventListener('message', receiveHostMessage);
   vscode.postMessage({ type: 'ready' });

@@ -4,11 +4,12 @@ src/**
 test/**
 out/test/**
 out/**/*.map
+out/src/dashboardClient.js
+out/src/dashboardClientEntry.js
 node_modules/**
 tsconfig.json
 AGENTS.md
-REVIEW-NOTES.md
-.REVIEW-NOTES.md.*.tmp
 .gitignore
 package-lock.json
 *.vsix
+scripts/**

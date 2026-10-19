@@ -36,11 +36,11 @@ test('resource origin normalization preserves the existing runtime string schema
 });
 
 test('append round-trips multiline comments and keeps duplicate identities', () => {
-  const first = appendComment('', comment(), 'abcdef1');
+  const first = appendComment('', comment());
   const text = appendComment(first, comment());
   assert.ok(text.startsWith(first));
   const parsed = parse(text);
-  assert.equal(parsed.base, 'abcdef1');
+  assert.ok(first.startsWith('## `src/example.ts`:2-3 (Working tree)'));
   assert.deepEqual(parsed.diagnostics, []);
   assert.equal(parsed.comments.length, 2);
   assert.equal(parsed.comments[0].body, comment().body);
@@ -53,10 +53,7 @@ test('append round-trips multiline comments and keeps duplicate identities', () 
   assert.equal(parse(edited).comments[1].body, 'Only the second');
 });
 
-test('UTF-8 BOM preserves base recognition and exact comment splice offsets', () => {
-  const withBase = '\uFEFF' + appendComment('', comment(), 'abcdef1');
-  assert.equal(parse(withBase).base, 'abcdef1');
-  assert.equal(parse(withBase).comments.length, 1);
+test('UTF-8 BOM preserves exact comment splice offsets', () => {
   const text = '\uFEFF' + appendComment('', comment());
   const parsed = parse(text).comments[0];
   assert.equal(parsed.startOffset, 1);
@@ -67,9 +64,9 @@ test('UTF-8 BOM preserves base recognition and exact comment splice offsets', ()
   assert.equal(deleteComment(text, parsed), '\uFEFF');
 });
 
-test('semantic base SHA is lowercase without rewriting the preamble', () => {
-  const text = '\uFEFF' + appendComment('', comment(), 'ABCDEF1');
-  assert.equal(parse(text).base, 'abcdef1');
+test('old base-like preambles are opaque and preserved by targeted edits', () => {
+  const text = appendComment('\uFEFF# Review \u00b7 base ABCDEF1\n\n', comment());
+  assert.equal('base' in parse(text), false);
   assert.ok(editComment(text, parse(text).comments[0], 'new').startsWith('\uFEFF# Review \u00b7 base ABCDEF1\n'));
 });
 
@@ -107,15 +104,15 @@ test('longer fences safely contain markdown snippets and nested heading text', (
 });
 
 test('tilde anchor accepts a longer close and ignores shorter fences', () => {
-  const text = '## `a`:1\nSelected: HEAD\n\n~~~~js\n~~~\n## inside\n~~~~~\n\nbody\n';
+  const text = '## `a`:1 (HEAD)\n\n~~~~js\n~~~\n## inside\n~~~~~\n\n💬 body\n';
   assert.equal(parse(text).comments[0].anchorText, '~~~\n## inside');
   assert.equal(parse(text).comments[0].body, 'body');
 });
 
 test('CRLF metadata and unknown blocks survive targeted body edits and range rewriting', () => {
   const prefix = '# Notes\r\n\r\nKeep these bytes \u2603\r\n\r\n';
-  const header = '## `src\\example.ts` : 2 - 3\r\n';
-  const metadata = '\r\nCOMPARISON : `old.ts` (HEAD) -> `src\\example.ts` (WORKING TREE)\r\n\r\nSELECTED : MODIFIED (WORKING TREE)\r\n\r\n```ts\r\n  first();\r\n  second();\r\n```\r\n\r\n';
+  const header = '## `src\\example.ts` : 2 - 3 (MODIFIED: WORKING TREE vs `old.ts` @ HEAD)\r\n';
+  const metadata = '\r\n```ts\r\n  first();\r\n  second();\r\n```\r\n\r\n💬 ';
   const suffix = '\r\n\r\n## Unknown section\r\nOpaque text  \r\n';
   const text = prefix + header + metadata + 'old\r\nbody' + suffix;
   const parsed = parse(text).comments[0];
@@ -131,15 +128,14 @@ test('CRLF metadata and unknown blocks survive targeted body edits and range rew
 });
 
 test('bare CR lines preserve Markdown offsets and normalize source and anchor splits', () => {
-  const text = '\uFEFF' + appendComment('', comment(), 'ABCDEF1').replace(/\n/g, '\r');
+  const text = '\uFEFF' + appendComment('', comment()).replace(/\n/g, '\r');
   const parsed = parse(text);
   assert.deepEqual(parsed.diagnostics, []);
-  assert.equal(parsed.base, 'abcdef1');
   assert.equal(parsed.comments[0].anchorText, '  first();\r  second();');
   const edited = editComment(text, parsed.comments[0], 'new\r\nbody\nend');
   assert.equal(edited, text.replace('First paragraph.\r\rSecond paragraph.', 'new\rbody\rend'));
   assert.equal(rewriteLines(text, parsed.comments[0], 8, 9), text.replace('`:2-3', '`:8-9'));
-  assert.equal(deleteComment(text, parsed.comments[0]), '\uFEFF# Review \u00b7 base ABCDEF1\r\r');
+  assert.equal(deleteComment(text, parsed.comments[0]), '\uFEFF');
   const appended = appendComment(text, comment({ anchorText: 'one\rtwo' }));
   assert.equal(appended.includes('\n'), false);
   assert.equal(parse(appended).comments[1].anchorText, 'one\rtwo');
@@ -192,28 +188,24 @@ test('writer rejects lone surrogates in new bodies, paths, anchors and edited bo
 });
 
 test('invalid fields and comparison metadata remain opaque', () => {
-  const good = '## `a`:1\nSelected: Working tree';
+  const good = '## `a`:1 (Working tree)';
   const invalid = [
     good.replace(':1', ':nope'), good.replace(':1', ':0'),
     good.replace(':1', ':4-2'), good.replace(':1', ':9007199254740992'),
-    good.replace('\nSelected: Working tree', ''), good.replace('Working tree', 'Original'),
+    good.replace(' (Working tree)', ''), good.replace('Working tree', 'Original'),
     good.replace('Working tree', 'Commit abc'),
     good.replace('`a`', '`../secret`'), good.replace('`a`', '`/absolute`'),
     good.replace('`a`', '`C:\\absolute`'), good.replace('`a`', '`a\\..\\secret`'),
     good.replace('`a`', '`a//b`'), good.replace('`a`', '`./a`'),
     good + '; Original',
     good + '; nonsense',
-    good.replace('Selected: Working tree', 'Working tree'),
-    good.replace('Selected: Working tree', 'Working tree; HEAD -> Working tree'),
-    good.replace('Selected: Working tree', 'Comparison: HEAD -> Staging area'),
-    good.replace('Selected: Working tree', 'Comparison: HEAD -> Staging area\nSelected: Original'),
-    good.replace('Selected: Working tree', 'Comparison: HEAD -> Staging area\nSelected: HEAD'),
-    good.replace('Selected: Working tree', 'Comparison: HEAD -> Staging area\nSelected: Modified (HEAD)'),
-    good.replace('Selected: Working tree', 'Comparison: `b` (Working tree) -> `a` (Working tree)\nSelected: Original (Working tree)'),
-    good.replace('Selected: Working tree', 'Comparison: `../bad` (HEAD) -> `a` (Working tree)\nSelected: Modified (Working tree)'),
+    good.replace('Working tree', 'Working tree vs HEAD'),
+    good.replace('Working tree', 'Modified: Working tree vs Index'),
+    good.replace('Working tree', 'Left: HEAD vs Working tree'),
+    good.replace('Working tree', 'Modified: Working tree vs `../bad` @ HEAD'),
   ];
   for (const block of invalid) {
-    const text = block + '\n\nKeep me\n\n';
+    const text = block + '\n\n💬 Keep me\n\n';
     const parsed = parse(text);
     assert.equal(parsed.comments.length, 0, block);
     assert.equal(parsed.diagnostics.length, 1, block);
@@ -240,13 +232,13 @@ test('both comparison sides and full SHA origins are distinct and validated', ()
 
 test('only a fence immediately after context has anchor meaning', () => {
   const body = 'Prose first\n\n```md\n## inside\n```\n\nComparison: ordinary prose\nSelected: ordinary prose';
-  const text = `## \`src/example.ts\`:2-3\nSelected: Working tree\n\n${body}\n`;
+  const text = `## \`src/example.ts\`:2-3 (Working tree)\n\n💬 ${body}\n`;
   const parsed = parse(text);
   assert.deepEqual(parsed.diagnostics, []);
   assert.equal(parsed.comments[0].anchorText, undefined);
   assert.equal(parsed.comments[0].body, body);
   assert.equal(parsed.comments[0].comparison, undefined);
-  const bare = '## `a`:100\nSelected: HEAD';
+  const bare = '## `a`:100 (HEAD)\n\n💬';
   assert.equal(parse(bare).comments.length, 1);
   assert.equal(parse(editComment(bare, parse(bare).comments[0], 'new')).comments[0].body, 'new');
 });
@@ -269,7 +261,7 @@ test('writer rejects stale offsets and preexisting unterminated fences, not comp
       assert.equal(result.comments[0].body, body);
     }
   }
-  const malformed = '## `a`:1\nSelected: HEAD\n\n```\nnot closed';
+  const malformed = '## `a`:1 (HEAD)\n\n```\nnot closed';
   assert.equal(parse(malformed).comments.length, 0);
   assert.match(parse(malformed).diagnostics[0].message, /unterminated/);
   const unclosedBody = text + '\nProse\n\n~~~\n## still fenced';
@@ -350,7 +342,7 @@ test('arbitrary bodies survive append, targeted edit/delete and range rewrites w
           const text = appendComment(second, comment({ anchorText, body })) + suffix;
           const parsed = parse(text);
           assert.deepEqual(parsed.diagnostics, [], label);
-          assert.equal(parsed.base, 'abcdef1', label);
+          assert.ok(text.startsWith(prefix), label);
           assert.equal(parsed.comments.length, 3, label);
           const expectedBody = body.replace(/\r\n|\r|\n/g, eol);
           const expectedAnchor = anchorText?.replace(/\n/g, eol);
@@ -486,7 +478,7 @@ test('Snippet metadata is case-insensitive, shape-validated and only accepted at
   for (const invalid of [
     text.replace('Snippet: elided', 'Snippet: literal'),
     text.replace('Snippet: elided', 'Snippet: elided; Snippet: elided'),
-    text.replace('; Snippet: elided\nSelected: Working tree', '\nSelected: Working tree; Snippet: elided'),
+    text.replace('(Working tree); Snippet: elided', '(Working tree; Snippet: elided)'),
     text.replace('\n...\n', '\n ...\n'),
     text.replace('first\n', ''),
     text.replace(anchorText, 'first\n...\nlast'),
@@ -502,9 +494,8 @@ test('Snippet metadata is case-insensitive, shape-validated and only accepted at
 
 test('explicit elision batch preserves metadata, BOM, CRLF, path and sibling bytes', () => {
   const anchorText = [...Array<string>(10).fill('  first();'), '...', ...Array<string>(5).fill('  last();')].join('\r\n');
-  const header = '## `src\\a; Lines: 999; Snippet: elided.ts` : 1 - 30 ; Snippet : ELIDED  \t';
-  const metadata = '\r\n\r\nComparison: `old.ts` (HEAD) -> `src\\a; Lines: 999; Snippet: elided.ts` (Working tree)\r\n\r\nSelected: Modified (Working tree)';
-  const block = header + metadata + '\r\n\r\n```ts\r\n' + anchorText + '\r\n```\r\n\r\nbody  \r\n';
+  const header = '## `src\\a; Lines: 999; Snippet: elided.ts` : 1 - 30 (Modified: Working tree vs `old.ts` @ HEAD); Snippet : ELIDED  \t';
+  const block = header + '\r\n\r\n```ts\r\n' + anchorText + '\r\n```\r\n\r\n💬 body  \r\n';
   const suffix = '\r\n## Unknown\r\nKeep these bytes\r\n';
   for (const prefix of ['\uFEFF', '\uFEFF# Review \u00b7 base ABCDEF1\r\n\r\n']) {
     const text = prefix + block + '\r\n' + block + suffix;
