@@ -190,7 +190,8 @@ test('handoff keeps one recovery batch, uses checkout paths, and preserves unrel
   const child = f.make('checkout', 'packages/app');
   await root.store.mutate(() => line('outside'));
   await child.store.mutate(() => line('inside'));
-  assert.equal((await child.store.handoff()).status, 'copied');
+  assert.deepEqual(await child.store.handoff(), { status: 'copied', count: 1, clipboardCopied: true, archived: true },
+    'Only notes visible in the subfolder are copied and counted');
   assert.match(f.copies[0], /packages\/app\/src\/a\.ts/);
   assert.equal(parse(await root.store.read() ?? '').comments.length, 1);
   const [first] = await root.archives.list();

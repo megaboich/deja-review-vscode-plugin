@@ -90,8 +90,8 @@ export async function run(): Promise<void> {
     console.log(`PASS ${name}`);
   };
   try {
-    const extension = vscode.extensions.getExtension<ReviewTestAPI>('local-review.dejareview');
-    assert.ok(extension, 'Development extension local-review.dejareview must be installed');
+    const extension = vscode.extensions.getExtension<ReviewTestAPI>('OleksandrBoiko.dejareview');
+    assert.ok(extension, 'Development extension OleksandrBoiko.dejareview must be installed');
     const api = await within('extension activation', () => extension.activate());
     assert.ok(api, 'activate() must return the integration test API');
     for (const method of ['refresh', 'getState', 'getDrafts', 'getThreads'] as const) {

@@ -50,7 +50,7 @@ These are behavioural rules for coding agents, not code style.
 
 ## Architecture
 
-VS Code 1.96+ extension. Package `dejareview`, ID `local-review.dejareview`, command and
+VS Code 1.96+ extension. Package `dejareview`, ID `OleksandrBoiko.dejareview`, command and
 settings prefix `dejareview.`. Requires the bundled `vscode.git` extension and a containing
 local Git repository. **Zero runtime npm dependencies** — Preact and esbuild are development
 dependencies bundled into the generated webview script, never installed alongside the extension.

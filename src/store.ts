@@ -149,7 +149,7 @@ export class ReviewStore implements vscode.Disposable {
         const copied = new Set(notes.map(note => note.id));
         await this.archives.storage.write('notes.json', { ...document, notes: document.notes.filter(note => !copied.has(note.id)) });
         this.fireChange();
-        return { status: 'copied', clipboardCopied: true, archived: true };
+        return { status: 'copied', count: notes.length, clipboardCopied: true, archived: true };
       } catch (error) { return { status: 'deleteFailed', error, clipboardCopied: true, archived: true }; }
     });
   }

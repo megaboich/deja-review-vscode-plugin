@@ -193,11 +193,11 @@ test('Files to Review through activation in a synthetic VS Code host', { timeout
       if (!snapshot?.trim()) { return { status: 'empty' as const }; }
       assert.equal(this.text, snapshot);
       clipboard.push(snapshot);
-      batches.set('copied', { id: 'copied', createdAt: '2026-01-01T00:00:00.000Z',
-        commentCount: parsedNotes(parse(snapshot)).length, text: snapshot });
+      const count = parsedNotes(parse(snapshot)).length;
+      batches.set('copied', { id: 'copied', createdAt: '2026-01-01T00:00:00.000Z', commentCount: count, text: snapshot });
       check();
       this.save(undefined);
-      return { status: 'copied' as const };
+      return { status: 'copied' as const, count };
     }
     async restore(id: string, validateInput?: () => void): ReturnType<SavedStore['restore']> {
       restores++;

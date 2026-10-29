@@ -17,7 +17,7 @@ export async function testWorkspaceScope(git: GitResources, root: vscode.Uri, ap
   assert.equal(path.basename(store.uri.fsPath), 'notes.json');
   assert.ok(!store.uri.fsPath.startsWith(root.fsPath + path.sep), 'Storage stays outside the project');
   assert.ok(!(await vscode.commands.getCommands()).includes('dejareview.selectRepository'));
-  const extension = vscode.extensions.getExtension('local-review.dejareview');
+  const extension = vscode.extensions.getExtension('OleksandrBoiko.dejareview');
   assert.ok(extension);
   const commands: { command: string }[] = extension.packageJSON.contributes.commands;
   assert.ok(!commands.some(command => command.command === 'dejareview.selectRepository'));
@@ -127,7 +127,7 @@ export async function run(): Promise<void> {
   let store: ReviewStore | undefined;
   try {
     assert.equal(vscode.window.activeTextEditor, undefined, 'Subfolder host must start without an active editor');
-    const extension = vscode.extensions.getExtension<ReviewTestAPI>('local-review.dejareview');
+    const extension = vscode.extensions.getExtension<ReviewTestAPI>('OleksandrBoiko.dejareview');
     assert.ok(extension);
     const api = await within('subfolder extension activation', () => extension.activate());
     await within('parent Git repository discovery', async () => {

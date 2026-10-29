@@ -3,8 +3,18 @@
   "displayName": "DejaReview",
   "description": "Review code locally, then copy contextual feedback into any AI tool.",
   "version": "0.1.0",
-  "publisher": "local-review",
+  "preview": true,
+  "publisher": "OleksandrBoiko",
   "license": "MIT",
+  "icon": "resources/icon.png",
+  "galleryBanner": {
+    "color": "#3b5bdb",
+    "theme": "dark"
+  },
+  "homepage": "https://github.com/megaboich/deja-review-vscode-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/megaboich/deja-review-vscode-plugin/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/megaboich/deja-review-vscode-plugin.git"
@@ -13,7 +23,17 @@
     "vscode": "^1.96.0"
   },
   "categories": [
+    "AI",
     "Other"
+  ],
+  "keywords": [
+    "code review",
+    "review notes",
+    "ai agent",
+    "git",
+    "staging",
+    "diff",
+    "feedback"
   ],
   "main": "./out/src/extension.js",
   "activationEvents": [
@@ -30,7 +50,7 @@
     "test:integration": "npm run compile && node out/test/runIntegration.js",
     "clean": "node -e \"fs.rmSync('out', { recursive: true, force: true })\"",
     "vscode:prepublish": "npm run clean && npm run compile",
-    "package": "vsce package --allow-missing-repository"
+    "package": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

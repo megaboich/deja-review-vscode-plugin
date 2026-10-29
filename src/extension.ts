@@ -1807,7 +1807,8 @@ class ReviewExtension implements vscode.Disposable {
         } catch (error) {
           refreshFailure = ` The Review Notes display could not be refreshed: ${error instanceof Error ? error.message : String(error)}`;
         }
-        const message = 'Review Notes copied and cleared. Restore Last Copied Review Notes is available if you need them again.';
+        const copiedLabel = result.count + (result.count === 1 ? ' Review Note' : ' Review Notes');
+        const message = `${copiedLabel} copied and cleared. Restore Last Copied Review Notes is available if you need them again.`;
         if (refreshFailure) {
           void vscode.window.showWarningMessage(message + refreshFailure);
         } else {

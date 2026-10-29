@@ -4,7 +4,7 @@ export type HandoffResult =
   | { status: "empty" }
   | { status: "dirty" }
   | { status: "changed" }
-  | { status: "copied" }
+  | { status: "copied"; count: number }
   | { status: "copyFailed"; error: unknown }
   | { status: "archiveFailed"; error: unknown }
   | { status: "deleteFailed"; error: unknown }

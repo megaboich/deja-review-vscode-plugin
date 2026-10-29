@@ -73,7 +73,8 @@ This is a files-only aid, **not approval or completion tracking**. An empty list
 2. Select **Copy Review Notes & Clear** in the panel, or use the command with that name.
 3. Paste into your AI tool. The clipboard contains Markdown notes, captured code context,
    checkout-relative paths, and: "Please address these review notes and summarize your
-   changes here. Leave staging to me."
+   changes here. Leave staging to me." A notification confirms how many Review Notes
+   were copied, so you can check that nothing was left out.
 4. Review the resulting changes and begin the next pass. The last copied batch remains
    available for recovery until another successful copy replaces it.
 

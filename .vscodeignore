@@ -13,3 +13,5 @@ AGENTS.md
 package-lock.json
 *.vsix
 scripts/**
+docs/**
+resources/marketplace-icon.svg

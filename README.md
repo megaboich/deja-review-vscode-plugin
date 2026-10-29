@@ -11,11 +11,14 @@ DejaReview brings your feedback together in a single **Review Notes** panel in V
 
 The loop is simple: **review changes, stage what you approve, leave notes for what needs work, copy the review, repeat.** DejaReview does not run an AI or require an account.
 
+![DejaReview demo](docs/images/review-demo.gif)
+
 ## Install
 
-1. In VS Code, open **Extensions** and choose **Install from VSIX...** from its menu.
-2. Select `dejareview-0.1.0.vsix`.
-3. Open a local folder inside a Git repository, then open the **Review Notes** panel.
+1. In VS Code, open **Extensions** (**Cmd+Shift+X** on macOS, **Ctrl+Shift+X** elsewhere), search for **DejaReview**, and select **Install**. Or run `code --install-extension OleksandrBoiko.dejareview`.
+2. Open a local folder inside a Git repository, then open the **Review Notes** panel.
+
+To install from a `.vsix` file instead, choose **Install from VSIX...** from the **...** menu in the Extensions view.
 
 Requires **VS Code 1.96+**, Git, and VS Code's bundled Git extension. Notes are remembered per project folder automatically. In a multi-root workspace, only the first folder is used.
 
